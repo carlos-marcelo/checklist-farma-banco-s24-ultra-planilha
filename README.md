@@ -1,25 +1,28 @@
-# Checklist Farma - Deploy Online com Banco Local
+# Checklist Farma - Migracao para Google Drive e Planilhas
 
-Este projeto esta configurado para publicar o frontend no GitHub Pages.
+Esta e uma copia independente do projeto original. O backend legado baseado em
+Termux, PostgreSQL, PostgREST e Cloudflare esta intencionalmente desativado.
 
-## Como deixar online usando banco local
+## Estado atual
 
-1. Mantenha seu PostgREST local ativo em `http://localhost:3000`.
-2. Abra um tunel publico para essa porta (exemplo com `cloudflared`):
+- Nenhuma URL, proxy ou credencial do backend legado e usada em runtime.
+- O cliente de dados antigo responde localmente com `LEGACY_BACKEND_DISABLED`.
+- O servidor de desenvolvimento aceita conexoes apenas em `127.0.0.1`.
+- A publicacao automatica esta pausada durante a migracao.
+- A nova camada de Google Drive/Planilhas sera implementada nesta copia.
+
+## Desenvolvimento local
 
 ```bash
-cloudflared tunnel --url http://localhost:3000
+npm install
+npm run check:offline
+npm run dev
 ```
 
-3. Preferencialmente use um host fixo do tunel (exemplo: `https://checklist-api.marcelo.far.br`) em vez de `trycloudflare` temporario.
-4. No GitHub do repositorio, configure os Secrets em:
-   `Settings > Secrets and variables > Actions`
-   - `VITE_SUPABASE_URL` = URL fixa do tunel (`https://checklist-api.marcelo.far.br`)
-   - `VITE_SUPABASE_ANON_KEY` = `local-key-to-bypass-auth`
-5. Faça push na branch `main`. O workflow `.github/workflows/deploy.yml` fara o build e deploy automaticamente.
+Enquanto a migracao nao estiver concluida, operacoes que dependiam do banco
+remoto podem usar apenas caches locais ou exibir indisponibilidade.
 
-## Observacoes importantes
+## Seguranca
 
-- O site so acessa o banco enquanto seu computador local, PostgREST e tunel estiverem ligados.
-- Se usar `trycloudflare`, a URL expira e voce precisara atualizar o secret `VITE_SUPABASE_URL` a cada troca.
-- Para producao estavel, o ideal e migrar o banco/API para um host publico fixo.
+Nao adicione variaveis `VITE_SUPABASE_*`, URLs do tunel antigo, dumps, tokens ou
+arquivos `.env` ao repositorio. O projeto original permanece separado.

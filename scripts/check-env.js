@@ -1,21 +1,18 @@
-// Check if Supabase environment variables are set
-const url = process.env.VITE_SUPABASE_URL;
-const key = process.env.VITE_SUPABASE_ANON_KEY;
+const forbiddenVariables = [
+  'VITE_SUPABASE_URL',
+  'VITE_SUPABASE_URL_PROXY',
+  'VITE_SUPABASE_ANON_KEY',
+  'VITE_SUPABASE_DIRECT_POSTGREST',
+  'VITE_SUPABASE_STRIP_AUTH_HEADERS'
+];
 
-console.log('\n🔍 Verificando variáveis de ambiente Supabase...\n');
+const configured = forbiddenVariables.filter(name =>
+  String(process.env[name] || '').trim().length > 0
+);
 
-if (!url || url.includes('placeholder')) {
-    console.error('❌ VITE_SUPABASE_URL não está configurada ou está usando placeholder!');
-    console.log('   Valor atual:', url || '(vazio)');
-    process.exit(1);
+if (configured.length > 0) {
+  console.error(`Legacy backend configuration is still present: ${configured.join(', ')}`);
+  process.exit(1);
 }
 
-if (!key || key.includes('placeholder')) {
-    console.error('❌ VITE_SUPABASE_ANON_KEY não está configurada ou está usando placeholder!');
-    console.log('   Valor atual:', key ? key.substring(0, 20) + '...' : '(vazio)');
-    process.exit(1);
-}
-
-console.log('✅ VITE_SUPABASE_URL:', url);
-console.log('✅ VITE_SUPABASE_ANON_KEY:', key.substring(0, 30) + '...');
-console.log('\n✅ Variáveis de ambiente OK!\n');
+console.log('Legacy Termux/PostgREST environment is disabled.');

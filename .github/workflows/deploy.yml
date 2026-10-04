@@ -1,8 +1,6 @@
 name: Deploy to GitHub Pages
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -33,8 +31,6 @@ jobs:
         run: npm run build
         env:
           VITE_BASE_PATH: /
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://checklist-api.marcelo.far.br' }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'local-key-to-bypass-auth' }}
 
       - name: Create 404.html for SPA routing
         run: cp dist/index.html dist/404.html

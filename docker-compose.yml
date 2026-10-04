@@ -5,9 +5,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        - VITE_SUPABASE_URL=http://localhost:3000
-        - VITE_SUPABASE_ANON_KEY=local-key-to-bypass-auth
     container_name: checklist_farma_app
     ports:
       # Mapeia a porta do servidor home (8081) para a porta interna do container Nginx (80)

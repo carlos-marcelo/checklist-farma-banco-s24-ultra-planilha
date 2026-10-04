@@ -2,12 +2,8 @@
 FROM node:18-alpine AS builder
 
 # Declara os argumentos de build que serão passados pelo docker-compose
-ARG VITE_SUPABASE_URL=http://localhost:3000
-ARG VITE_SUPABASE_ANON_KEY=local-key-to-bypass-auth
 
 # Exporta os args como variáveis de ambiente para o Vite ler durante o build
-ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
-ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
 
 # Define o diretório de trabalho dentro do contêiner
 WORKDIR /app
