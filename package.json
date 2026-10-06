@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:connected": "node scripts/start-connected.mjs",
+    "auth:google": "node server/googleOAuthServer.mjs",
     "check:offline": "node scripts/check-env.js",
     "check:runtime": "node --max-old-space-size=3072 scripts/check-runtime-references.cjs",
+    "check:google-data": "node scripts/check-google-data.mjs",
     "typecheck": "node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit --pretty false",
     "build": "vite build",
     "postbuild": "node scripts/postbuild.cjs",

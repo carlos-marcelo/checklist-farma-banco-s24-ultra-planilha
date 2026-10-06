@@ -25,6 +25,8 @@ import {
     stabilizeCompanyAreas
 } from './src/branchDirectory';
 import { encodeFileForStorage } from './src/filePayload';
+import { GoogleDriveConnectionPanel } from './components/GoogleDriveConnectionPanel';
+import { googleWorkspaceService } from './src/googleWorkspace';
 
 
 const mergeAccessMatrixWithDefaults = (incoming: Partial<Record<AccessLevelId, Record<string, boolean>>>) => {
@@ -3139,6 +3141,31 @@ const getPostgrestRetryDelay = (failures: number): number =>
     Math.min(2 * 60_000, 15_000 * (2 ** Math.max(0, Math.min(failures, 4) - 1)));
 
 const App: React.FC = () => {
+    useEffect(() => {
+        googleWorkspaceService.connectAndInitialize(false)
+            .then(async () => {
+                const sheetUsers = await SupabaseService.fetchUsers();
+                if (sheetUsers.length === 0) {
+                    const localUsers = loadInitialUsersFromLocalCache();
+                    window.localStorage.setItem('APP_USERS', JSON.stringify(localUsers));
+                    const migration = await SupabaseService.migrateLocalStorageToSupabase();
+                    if (!migration || migration.users === 0) {
+                        throw new Error('Não foi possível criar a conta inicial no Google Sheets.');
+                    }
+                }
+                const url = new URL(window.location.href);
+                if (url.searchParams.has('google_connected')) {
+                    url.searchParams.delete('google_connected');
+                    window.history.replaceState({}, '', url);
+                }
+            })
+            .catch(error => {
+                if (error instanceof Error && error.name !== 'GoogleAuthorizationRequiredError') {
+                    console.error('[GoogleWorkspace] Falha na inicialização automática:', error);
+                }
+            });
+    }, []);
+
     // Migration State
     const [showMigrationPanel, setShowMigrationPanel] = useState(false);
     const [isMigrating, setIsMigrating] = useState(false);
@@ -11057,6 +11084,8 @@ const App: React.FC = () => {
                                     <span className="text-xs font-black text-gray-400 uppercase tracking-widest px-2">Ajustes do Sistema</span>
                                 </div>
                             </div>
+
+                            {currentUser.role === 'MASTER' && <GoogleDriveConnectionPanel />}
 
                             {/* Appearance & Company (Primary Card) */}
                             <div className="bg-white/80 backdrop-blur-2xl rounded-[48px] shadow-card border border-white/60 overflow-hidden">

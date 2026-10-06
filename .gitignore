@@ -25,6 +25,8 @@ scripts/*
 !scripts/check-env.js
 !scripts/check-runtime-references.cjs
 !scripts/postbuild.cjs
+!scripts/start-connected.mjs
+!scripts/check-google-data.mjs
 
 # Python caches
 __pycache__/
