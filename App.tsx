@@ -1995,6 +1995,48 @@ const formatFullDateTime = (value?: string | null) => {
     return datePart + ' às ' + timePart;
 };
 
+const GoogleDriveSyncIndicator = ({
+    lastUpdated,
+    isLoading,
+    error
+}: {
+    lastUpdated?: string | null;
+    isLoading: boolean;
+    error?: string | null;
+}) => {
+    const connected = googleWorkspaceService.getStatus().connected && !error;
+    const statusLabel = error
+        ? 'Google Drive indisponível'
+        : connected
+            ? 'Google Drive conectado'
+            : 'Conectando ao Google Drive';
+    return (
+        <div
+            className={`flex min-w-[220px] items-center gap-2 rounded-xl border px-3 py-2 ${
+                error
+                    ? 'border-red-200 bg-red-50 text-red-700'
+                    : connected
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                        : 'border-amber-200 bg-amber-50 text-amber-700'
+            }`}
+            title={error || 'Leitura automática da planilha Google a cada 30 segundos'}
+        >
+            <Clock size={15} className={isLoading ? 'animate-pulse' : ''} />
+            <div className="min-w-0 leading-tight">
+                <p className="text-[10px] font-black uppercase tracking-widest">{statusLabel}</p>
+                <p className="text-[9px] font-bold opacity-80">
+                    {isLoading && !lastUpdated
+                        ? 'Sincronizando agora...'
+                        : lastUpdated
+                            ? `Última atualização: ${formatFullDateTime(lastUpdated)}`
+                            : 'Aguardando primeira leitura'}
+                </p>
+                <p className="text-[8px] font-bold uppercase tracking-wider opacity-60">Automático a cada 30s</p>
+            </div>
+        </div>
+    );
+};
+
 const formatFileSize = (bytes?: number | null) => {
     if (!bytes || bytes <= 0) return '—';
     if (bytes < 1024) return `${bytes} B`;
@@ -2546,7 +2588,6 @@ const StockConferenceReportViewer = ({ report, onClose, currentUser }: StockConf
     );
 };
 
-const PROTECTED_MASTER_EMAILS = new Set(['asconavietagestor@gmail.com', 'contato@marcelo.far.br']);
 const AUDIT_MANUAL_BRANCH_SELECTION_KEY = 'APP_AUDIT_MANUAL_BRANCH_SELECTION_REQUIRED';
 const AREA_PARTIAL_WHATSAPP_HISTORY_KEY = 'APP_AUDIT_AREA_PARTIAL_WHATSAPP_HISTORY';
 
@@ -2562,40 +2603,6 @@ type AreaPartialWhatsappHistoryItem = {
 };
 
 const normalizeUserEmail = (email?: string | null) => String(email || '').trim().toLowerCase();
-
-const isProtectedMasterEmail = (email?: string | null) => PROTECTED_MASTER_EMAILS.has(normalizeUserEmail(email));
-
-const normalizeProtectedMasterUser = <T extends { email?: string | null; role?: UserRole; approved?: boolean; rejected?: boolean }>(user: T): T => {
-    if (!isProtectedMasterEmail(user.email)) return user;
-    return {
-        ...user,
-        role: 'MASTER',
-        approved: true,
-        rejected: false
-    };
-};
-
-const normalizeProtectedMasterUsers = <T extends { email?: string | null; role?: UserRole; approved?: boolean; rejected?: boolean }>(items: T[] = []): T[] =>
-    items.map(normalizeProtectedMasterUser);
-
-// --- FALLBACK USERS (usado apenas se Supabase falhar) ---
-const INITIAL_USERS: User[] = normalizeProtectedMasterUsers([
-    { email: 'asconavietagestor@gmail.com', password: 'marcelo1508', name: 'Marcelo Asconavieta', phone: '99999999999', role: 'MASTER', approved: true, rejected: false },
-    { email: 'contato@marcelo.far.br', password: 'marcelo1508', name: 'Contato Marcelo', phone: '99999999999', role: 'MASTER', approved: true, rejected: false },
-]);
-
-const loadInitialUsersFromLocalCache = (): User[] => {
-    if (typeof window === 'undefined') return INITIAL_USERS;
-    try {
-        const raw = window.localStorage.getItem('APP_USERS');
-        if (!raw) return INITIAL_USERS;
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed) || parsed.length === 0) return INITIAL_USERS;
-        return normalizeProtectedMasterUsers(parsed);
-    } catch {
-        return INITIAL_USERS;
-    }
-};
 
 const scheduleBackgroundTask = (task: () => void, timeout = 800) => {
     if (typeof window === 'undefined') {
@@ -2850,10 +2857,10 @@ const LoginScreen = ({
                 const result = await SupabaseService.authenticateUser(email, password);
 
                 if (result.status === 'success') {
-                    onLogin(normalizeProtectedMasterUser({
+                    onLogin({
                         ...result.user,
                         preferredTheme: result.user.preferred_theme as ThemeColor | undefined
-                    }));
+                    });
                     return;
                 }
 
@@ -3122,7 +3129,7 @@ const LoginScreen = ({
 
 // --- MAIN APP ---
 
-const isTransientPostgrestError = (error: unknown): boolean => {
+const isTransientGoogleSheetsError = (error: unknown): boolean => {
     const candidate = (error || {}) as Record<string, unknown>;
     const status = Number(candidate.status || candidate.statusCode || 0);
     const code = String(candidate.code || '').toUpperCase();
@@ -3137,7 +3144,7 @@ const isTransientPostgrestError = (error: unknown): boolean => {
         message.includes('failed to fetch');
 };
 
-const getPostgrestRetryDelay = (failures: number): number =>
+const getGoogleSheetsRetryDelay = (failures: number): number =>
     Math.min(2 * 60_000, 15_000 * (2 ** Math.max(0, Math.min(failures, 4) - 1)));
 
 const App: React.FC = () => {
@@ -3146,12 +3153,7 @@ const App: React.FC = () => {
             .then(async () => {
                 const sheetUsers = await SupabaseService.fetchUsers();
                 if (sheetUsers.length === 0) {
-                    const localUsers = loadInitialUsersFromLocalCache();
-                    window.localStorage.setItem('APP_USERS', JSON.stringify(localUsers));
-                    const migration = await SupabaseService.migrateLocalStorageToSupabase();
-                    if (!migration || migration.users === 0) {
-                        throw new Error('Não foi possível criar a conta inicial no Google Sheets.');
-                    }
+                    throw new Error('A planilha Google não possui usuários cadastrados.');
                 }
                 const url = new URL(window.location.href);
                 if (url.searchParams.has('google_connected')) {
@@ -3166,15 +3168,11 @@ const App: React.FC = () => {
             });
     }, []);
 
-    // Migration State
-    const [showMigrationPanel, setShowMigrationPanel] = useState(false);
-    const [isMigrating, setIsMigrating] = useState(false);
-    const [migrationStatus, setMigrationStatus] = useState('');
     // Loading State
     const [isLoadingData, setIsLoadingData] = useState(true);
 
     // Auth State
-    const [users, setUsers] = useState<User[]>(loadInitialUsersFromLocalCache);
+    const [users, setUsers] = useState<User[]>([]);
     const [currentUser, setCurrentUser] = useState<User | null>(null);
     const [showBranchSelectionModal, setShowBranchSelectionModal] = useState(false);
     const [branchSelectionMode, setBranchSelectionMode] = useState<'required' | 'confirm'>('required');
@@ -3275,7 +3273,7 @@ const App: React.FC = () => {
     const dashboardCompletedAuditForceRefreshQueuedRef = useRef(false);
     const dashboardAuditBackoffRef = useRef({ failures: 0, retryAt: 0, lastLoggedAt: 0 });
     const [dashboardAuditRetryAt, setDashboardAuditRetryAt] = useState(0);
-    const [dashboardClockMinute, setDashboardClockMinute] = useState(() => Date.now());
+    const [dashboardClockTick, setDashboardClockTick] = useState(() => Date.now());
     const [areaPartialActionLoading, setAreaPartialActionLoading] = useState<string | null>(null);
     const [areaPartialDialog, setAreaPartialDialog] = useState<{
         areaName: string;
@@ -3697,16 +3695,18 @@ const App: React.FC = () => {
     const CACHE_KEY_TICKETS = 'tickets_list';
     const CACHE_KEY_CHECKLIST_DEFS = 'checklist_definitions';
     const CACHE_KEY_AUDIT_DASHBOARD_PREFIX = 'audit_dashboard_sessions';
-    const AUDIT_DASHBOARD_REVALIDATE_MS = 60 * 1000;
+    const GOOGLE_DATA_CACHE_VERSION = 'google-sheets-full-import-2026-10-06-v1';
+    const GOOGLE_DATA_CACHE_VERSION_KEY = 'APP_GOOGLE_DATA_CACHE_VERSION';
+    const AUDIT_DASHBOARD_REVALIDATE_MS = 30 * 1000;
     const CACHE_KEY_USERS_META = 'users_list_meta_signature';
     const STATIC_REFERENCE_CACHE_MS = 15 * 60 * 1000;
     const HISTORY_BACKGROUND_CACHE_MS = 2 * 60 * 1000;
 
     const mapUsersForState = (items: any[] = []) =>
-        normalizeProtectedMasterUsers((items || []).map(u => ({
+        (items || []).map(u => ({
             ...u,
             preferredTheme: u.preferredTheme ?? (u.preferred_theme as ThemeColor | undefined)
-        })));
+        }));
 
     const mapAccessRowsToMatrix = (rows: any[] = []) => {
         if (!rows || rows.length === 0) return createInitialAccessMatrix();
@@ -3789,7 +3789,7 @@ const App: React.FC = () => {
             return cachedRows;
         }
 
-        const normalized = normalizeProtectedMasterUsers(dbUsers || []);
+        const normalized = mapUsersForState(dbUsers || []);
         await Promise.all([
             CacheService.set(CACHE_KEY_USERS, normalized),
             CacheService.set(CACHE_KEY_USERS_META, buildUsersMetadataSignature(dbUsers || []))
@@ -4059,6 +4059,11 @@ const App: React.FC = () => {
             try {
                 setIsLoadingData(true);
 
+                if (localStorage.getItem(GOOGLE_DATA_CACHE_VERSION_KEY) !== GOOGLE_DATA_CACHE_VERSION) {
+                    await CacheService.clear();
+                    localStorage.setItem(GOOGLE_DATA_CACHE_VERSION_KEY, GOOGLE_DATA_CACHE_VERSION);
+                }
+
                 const cached = await CacheService.getMany<any>([
                     CACHE_KEY_USERS,
                     CACHE_KEY_CONFIG,
@@ -4086,8 +4091,6 @@ const App: React.FC = () => {
 
             } catch (error) {
                 console.error('Error initializing:', error);
-                const localUsers = localStorage.getItem('APP_USERS');
-                if (localUsers) setUsers(normalizeProtectedMasterUsers(JSON.parse(localUsers)));
             } finally {
                 if (!cancelled) {
                     setIsLoadingData(false);
@@ -4255,16 +4258,15 @@ const App: React.FC = () => {
         if (currentUser) {
             const freshUser = users.find(u => u.email === currentUser.email);
             if (freshUser) {
-                const normalizedFreshUser = normalizeProtectedMasterUser(freshUser);
-                if (normalizedFreshUser.name !== currentUser.name ||
-                    normalizedFreshUser.phone !== currentUser.phone ||
-                    normalizedFreshUser.photo !== currentUser.photo ||
-                    normalizedFreshUser.preferredTheme !== currentUser.preferredTheme ||
-                    normalizedFreshUser.company_id !== currentUser.company_id ||
-                    normalizedFreshUser.area !== currentUser.area ||
-                    normalizedFreshUser.filial !== currentUser.filial ||
-                    normalizedFreshUser.role !== currentUser.role) {
-                    setCurrentUser(normalizedFreshUser);
+                if (freshUser.name !== currentUser.name ||
+                    freshUser.phone !== currentUser.phone ||
+                    freshUser.photo !== currentUser.photo ||
+                    freshUser.preferredTheme !== currentUser.preferredTheme ||
+                    freshUser.company_id !== currentUser.company_id ||
+                    freshUser.area !== currentUser.area ||
+                    freshUser.filial !== currentUser.filial ||
+                    freshUser.role !== currentUser.role) {
+                    setCurrentUser(freshUser);
                 }
             }
         }
@@ -4282,16 +4284,15 @@ const App: React.FC = () => {
                 localStorage.removeItem('APP_VIEW_HISTORY_ITEM');
                 localStorage.removeItem('APP_VIEW_STOCK_REPORT');
                 setCurrentView('dashboard');
-                const normalizedUser = normalizeProtectedMasterUser(u);
-                setCurrentUser(normalizedUser);
+                setCurrentUser(u);
                 if (!autoLoginLoggedRef.current) {
                     autoLoginLoggedRef.current = true;
                     SupabaseService.insertAppEventLog({
-                        company_id: normalizedUser.company_id || null,
-                        branch: normalizedUser.filial || null,
-                        area: normalizedUser.area || null,
-                        user_email: normalizedUser.email,
-                        user_name: normalizedUser.name,
+                        company_id: u.company_id || null,
+                        branch: u.filial || null,
+                        area: u.area || null,
+                        user_email: u.email,
+                        user_name: u.name,
                         app: 'sistema',
                         event_type: 'login_auto',
                         status: 'success',
@@ -4919,40 +4920,6 @@ const App: React.FC = () => {
 
     // --- HANDLERS ---
 
-    // Migration Handlers
-    const handleBackupDownload = () => {
-        SupabaseService.exportLocalStorageBackup();
-        alert('✅ Backup baixado com sucesso!');
-    };
-
-    const handleMigration = async () => {
-        if (!confirm('Deseja migrar todos os dados para o Supabase?\n\nIsso incluirá:\n- Usuários\n- Configurações\n- Relatórios\n- Rascunhos')) {
-            return;
-        }
-
-        setIsMigrating(true);
-        setMigrationStatus('Migrando dados...');
-
-        const results = await SupabaseService.migrateLocalStorageToSupabase();
-
-        if (results) {
-            const message = `✅ Migração concluída!\n\nUsuários: ${results.users}\nRelatórios: ${results.reports}\nRascunhos: ${results.drafts}\nConfig: ${results.config ? 'Sim' : 'Não'}`;
-            setMigrationStatus(message);
-            // Feedback explícito ao usuário
-            alert(message);
-            setTimeout(() => {
-                setShowMigrationPanel(false);
-                window.location.reload();
-            }, 3000);
-        } else {
-            const errorMsg = '❌ Erro na migração. Tente novamente.';
-            setMigrationStatus(errorMsg);
-            alert(errorMsg);
-        }
-
-        setIsMigrating(false);
-    };
-
     const handleLogin = (user: User) => {
         // Persist session so F5 doesn't log the user out
         localStorage.setItem('APP_CURRENT_EMAIL', user.email);
@@ -5002,13 +4969,8 @@ const App: React.FC = () => {
             }).catch(() => { });
         }
 
-        // Hard logout: remove active session immediately (not only via useEffect cleanup)
-        try {
-            await SupabaseService.sendSessionCommand(clientIdRef.current, null);
-            await SupabaseService.deleteActiveSession(clientIdRef.current);
-        } catch { }
-
-        // Clear persisted session on logout
+        // Clear the local session first so logout is immediate. The heartbeat
+        // cleanup removes the active Google Sheets session in the background.
         localStorage.removeItem('APP_CURRENT_EMAIL');
         localStorage.removeItem('APP_CURRENT_VIEW');
         localStorage.removeItem('APP_VIEWING_REPORT_ID');
@@ -5030,12 +4992,9 @@ const App: React.FC = () => {
         logoutInFlightRef.current = false;
     }, [clearAuditManualBranchSelectionRequired, currentUser, currentView]);
 
-    const handleRemoteForceLogoutNow = useCallback(async () => {
+    const handleRemoteForceLogoutNow = useCallback(() => {
         setRemoteForceLogoutDeadline(null);
-        try {
-            await SupabaseService.deleteActiveSession(clientIdRef.current);
-        } catch { }
-        await handleLogout();
+        void handleLogout();
     }, [handleLogout]);
 
     // --- SESSION MANAGEMENT & HEARTBEAT ---
@@ -5358,11 +5317,6 @@ const App: React.FC = () => {
 
     const handleUpdateUserProfile = async (field: keyof User, value: string | null) => {
         if (!currentUser) return;
-        if (field === 'role' && isProtectedMasterEmail(currentUser.email) && value !== 'MASTER') {
-            alert('Este usuário é Master protegido e não pode ser rebaixado.');
-            return;
-        }
-
         // Custom handling for phone in profile to limit 11 digits
         if (field === 'phone') {
             const val = (value || '').replace(/\D/g, '');
@@ -7840,8 +7794,8 @@ const App: React.FC = () => {
             if (!force && Date.now() < dashboardAuditBackoffRef.current.retryAt) {
                 setDashboardAuditsError(
                     Array.isArray(cachedRows) && cachedRows.length > 0
-                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
-                        : 'Banco temporariamente indisponível. Nova tentativa será feita automaticamente.'
+                        ? 'Google Drive temporariamente indisponível. Exibindo a última sincronização salva.'
+                        : 'Google Drive temporariamente indisponível. Nova tentativa será feita automaticamente.'
                 );
                 return;
             }
@@ -7954,23 +7908,23 @@ const App: React.FC = () => {
             setDashboardAuditsError(null);
             setDashboardAuditsFetchedAt(new Date().toISOString());
             } catch (error) {
-                const transient = isTransientPostgrestError(error);
+                const transient = isTransientGoogleSheetsError(error);
                 if (transient) {
                     const previous = dashboardAuditBackoffRef.current;
                     const failures = Math.min(previous.failures + 1, 5);
                     const now = Date.now();
-                    const retryAt = now + getPostgrestRetryDelay(failures);
+                    const retryAt = now + getGoogleSheetsRetryDelay(failures);
                     dashboardAuditBackoffRef.current = { failures, retryAt, lastLoggedAt: now };
                     setDashboardAuditRetryAt(current => Math.max(current, retryAt));
                     if (now - previous.lastLoggedAt > 10_000) {
-                        console.warn('PostgREST indisponível ao carregar auditorias abertas; usando cache local.', error);
+                        console.warn('Google Sheets indisponível ao carregar auditorias abertas; usando cache local.', error);
                     }
                 } else {
                     console.error('Erro ao carregar sessões abertas de auditoria para o dashboard:', error);
                 }
                 setDashboardAuditsError(
                     Array.isArray(cachedRows) && cachedRows.length > 0
-                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
+                        ? 'Google Drive temporariamente indisponível. Exibindo a última sincronização salva.'
                         : 'Não foi possível sincronizar auditorias abertas agora.'
                 );
             } finally {
@@ -8020,8 +7974,8 @@ const App: React.FC = () => {
             if (!force && Date.now() < dashboardAuditBackoffRef.current.retryAt) {
                 setCompletedDashboardAuditsError(
                     Array.isArray(cachedRows) && cachedRows.length > 0
-                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
-                        : 'Banco temporariamente indisponível. Nova tentativa será feita automaticamente.'
+                        ? 'Google Drive temporariamente indisponível. Exibindo a última sincronização salva.'
+                        : 'Google Drive temporariamente indisponível. Nova tentativa será feita automaticamente.'
                 );
                 return;
             }
@@ -8134,23 +8088,23 @@ const App: React.FC = () => {
             setCompletedDashboardAuditsError(null);
             setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
             } catch (error) {
-                const transient = isTransientPostgrestError(error);
+                const transient = isTransientGoogleSheetsError(error);
                 if (transient) {
                     const previous = dashboardAuditBackoffRef.current;
                     const failures = Math.min(previous.failures + 1, 5);
                     const now = Date.now();
-                    const retryAt = now + getPostgrestRetryDelay(failures);
+                    const retryAt = now + getGoogleSheetsRetryDelay(failures);
                     dashboardAuditBackoffRef.current = { failures, retryAt, lastLoggedAt: now };
                     setDashboardAuditRetryAt(current => Math.max(current, retryAt));
                     if (now - previous.lastLoggedAt > 10_000) {
-                        console.warn('PostgREST indisponível ao carregar auditorias concluídas; usando cache local.', error);
+                        console.warn('Google Sheets indisponível ao carregar auditorias concluídas; usando cache local.', error);
                     }
                 } else {
                     console.error('Erro ao carregar sessões concluídas de auditoria para o dashboard:', error);
                 }
                 setCompletedDashboardAuditsError(
                     Array.isArray(cachedRows) && cachedRows.length > 0
-                        ? 'Banco temporariamente indisponível. Exibindo a última sincronização salva.'
+                        ? 'Google Drive temporariamente indisponível. Exibindo a última sincronização salva.'
                         : 'Não foi possível sincronizar auditorias concluídas agora.'
                 );
             } finally {
@@ -8250,14 +8204,14 @@ const App: React.FC = () => {
         loadCompletedDashboardAuditSessions,
         dashboardAuditsFetchedAt,
         completedDashboardAuditsFetchedAt,
-        dashboardClockMinute
+        dashboardClockTick
     ]);
 
     useEffect(() => {
         if (currentView !== 'dashboard') return;
-        const tick = () => setDashboardClockMinute(Date.now());
+        const tick = () => setDashboardClockTick(Date.now());
         tick();
-        const intervalId = window.setInterval(tick, 60_000);
+        const intervalId = window.setInterval(tick, AUDIT_DASHBOARD_REVALIDATE_MS);
         return () => window.clearInterval(intervalId);
     }, [currentView]);
 
@@ -8487,7 +8441,7 @@ const App: React.FC = () => {
         setChecklistMobilePage(0);
     }, [historyFilterUser, historySearch, historyAreaFilter, historyDateRange]);
 
-    const dashboardAfterPartialCutoff = new Date(dashboardClockMinute).getHours() >= 18;
+    const dashboardAfterPartialCutoff = new Date(dashboardClockTick).getHours() >= 18;
 
     const dashboardAuditOverviewBase = useMemo(() => {
         type BranchMetric = DashboardAuditBranchMetric;
@@ -14701,9 +14655,11 @@ const App: React.FC = () => {
                                             </div>
                                             </div>
                                             <div className="flex flex-wrap items-center justify-end gap-3">
-                                                <span className="min-w-0 text-[10px] leading-tight font-bold text-gray-400 uppercase tracking-widest xl:max-w-[210px] xl:text-right">
-                                                    {dashboardAuditsFetchedAt ? `Atualizado: ${formatFullDateTime(dashboardAuditsFetchedAt)}` : 'Aguardando carga'}
-                                                </span>
+                                                <GoogleDriveSyncIndicator
+                                                    lastUpdated={dashboardAuditsFetchedAt}
+                                                    isLoading={isLoadingDashboardAudits}
+                                                    error={dashboardAuditsError}
+                                                />
                                                 <button
                                                     type="button"
                                                     onClick={() => void loadDashboardAuditSessions(true)}
@@ -14950,9 +14906,11 @@ const App: React.FC = () => {
                                             </div>
                                             </div>
                                             <div className="flex items-center justify-end">
-                                                <span className="min-w-0 text-[10px] leading-tight font-bold text-gray-400 uppercase tracking-widest xl:max-w-[210px] xl:text-right">
-                                                    {completedDashboardAuditsFetchedAt ? `Atualizado: ${formatFullDateTime(completedDashboardAuditsFetchedAt)}` : 'Aguardando carga'}
-                                                </span>
+                                                <GoogleDriveSyncIndicator
+                                                    lastUpdated={completedDashboardAuditsFetchedAt}
+                                                    isLoading={isLoadingCompletedDashboardAudits}
+                                                    error={completedDashboardAuditsError}
+                                                />
                                             </div>
                                         </div>
                                     </div>

@@ -6,14 +6,11 @@ Termux, PostgreSQL, PostgREST e Cloudflare esta intencionalmente desativado.
 ## Estado atual
 
 - Nenhuma URL, proxy ou credencial do backend legado e usada em runtime.
-- O cliente de dados antigo responde localmente com `LEGACY_BACKEND_DISABLED`.
 - O servidor de desenvolvimento aceita conexoes apenas em `127.0.0.1`.
-- A publicacao automatica esta pausada durante a migracao.
-- A camada isolada de Google Drive/Planilhas ja esta disponivel para preparacao.
 - Os fluxos de dados usam uma camada de compatibilidade apoiada exclusivamente
   nas abas gerenciadas do Google Sheets.
-- O arquivo de ambiente legado foi renomeado para `.env.legacy-disabled` e nao
-  e carregado pelo Vite.
+- O arquivo de ambiente legado foi removido depois da importacao unilateral.
+- A dependencia do cliente Supabase foi removida do projeto.
 - Nao existe proxy, URL ou cliente runtime para Termux/PostgREST nesta copia.
 
 ## Google Drive e Planilhas
@@ -47,9 +44,8 @@ Variaveis opcionais:
 
 As abas possuem chave estavel, revisao, data de atualizacao e payload JSON.
 Payloads maiores que uma celula sao fragmentados e reconstruidos
-automaticamente. Na primeira execucao sem usuarios, o app copia apenas seu
-cadastro/cache local para criar a conta inicial no Sheets; ele nao consulta nem
-altera o banco Termux.
+automaticamente. Usuarios, empresas, permissoes, historicos e demais registros
+sao lidos e gravados nas abas `cf_*` da planilha gerenciada.
 
 `npm run check:google-data` executa um CRUD temporario (incluindo payload grande)
 e remove o registro de teste ao final.
@@ -62,10 +58,11 @@ npm run check:offline
 npm run dev
 ```
 
-Enquanto a migracao nao estiver concluida, operacoes que dependiam do banco
-remoto podem usar apenas caches locais ou exibir indisponibilidade.
+O cache local e apenas uma copia de desempenho. Uma versao de cache e aplicada
+apos importacoes completas para obrigar a interface a reler os dados do Sheets.
 
 ## Seguranca
 
 Nao adicione variaveis `VITE_SUPABASE_*`, URLs do tunel antigo, dumps, tokens ou
-arquivos `.env` ao repositorio. O projeto original permanece separado.
+arquivos `.env` ao repositorio. `npm run check:offline` bloqueia configuracoes e
+dependencias legadas. O projeto original permanece separado.

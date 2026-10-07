@@ -27,6 +27,7 @@ scripts/*
 !scripts/postbuild.cjs
 !scripts/start-connected.mjs
 !scripts/check-google-data.mjs
+!scripts/import-legacy-readonly.mjs
 
 # Python caches
 __pycache__/

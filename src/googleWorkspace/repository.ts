@@ -3,6 +3,8 @@ import { GoogleWorkspaceTable, isGoogleWorkspaceTable, quoteSheetTitle } from '.
 
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 const MAX_PAYLOAD_CELL_CHARS = 40_000;
+const MAX_WRITE_BATCH_ROWS = 500;
+const MAX_WRITE_BATCH_CHARS = 1_500_000;
 const CHUNK_PREFIX = '__CF_CHUNKED_V1__';
 const CHUNK_KEY_PREFIX = '__cf_chunk__:';
 
@@ -56,6 +58,31 @@ const serializeRecordRows = <T>(record: StoredSheetRecord<T>): unknown[][] => {
         record.updatedAt,
         index === 0 ? `${CHUNK_PREFIX}${chunks.length}__${chunk}` : chunk,
     ]);
+};
+
+const createWriteBatches = (rows: unknown[][]): Array<{ start: number; rows: unknown[][] }> => {
+    const batches: Array<{ start: number; rows: unknown[][] }> = [];
+    let current: unknown[][] = [];
+    let currentChars = 0;
+    let start = 0;
+
+    rows.forEach((row, index) => {
+        const rowChars = JSON.stringify(row).length;
+        if (current.length > 0 && (
+            current.length >= MAX_WRITE_BATCH_ROWS ||
+            currentChars + rowChars > MAX_WRITE_BATCH_CHARS
+        )) {
+            batches.push({ start, rows: current });
+            start = index;
+            current = [];
+            currentChars = 0;
+        }
+        current.push(row);
+        currentChars += rowChars;
+    });
+
+    if (current.length > 0) batches.push({ start, rows: current });
+    return batches;
 };
 
 export class GoogleSheetsRepository {
@@ -171,24 +198,66 @@ export class GoogleSheetsRepository {
     ): Promise<void> {
         const table = assertTable(tableName);
         const physicalRows = records.flatMap(record => serializeRecordRows(record));
-        if (physicalRows.length > 0) {
-            const range = encodeURIComponent(`${quoteSheetTitle(table)}!A2:E${physicalRows.length + 1}`);
+        const rowCapacity = await this.ensureRowCapacity(table, physicalRows.length + 1);
+        for (const batch of createWriteBatches(physicalRows)) {
+            const firstRow = batch.start + 2;
+            const lastRow = firstRow + batch.rows.length - 1;
+            const range = encodeURIComponent(`${quoteSheetTitle(table)}!A${firstRow}:E${lastRow}`);
             await this.api.request(
                 `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}/values/${range}?valueInputOption=RAW`,
                 {
                     method: 'PUT',
                     body: JSON.stringify({
                         majorDimension: 'ROWS',
-                        values: physicalRows,
+                        values: batch.rows,
                     }),
                 }
             );
         }
         const clearFrom = physicalRows.length + 2;
-        const clearRange = encodeURIComponent(`${quoteSheetTitle(table)}!A${clearFrom}:E`);
+        if (clearFrom <= rowCapacity) {
+            const clearRange = encodeURIComponent(`${quoteSheetTitle(table)}!A${clearFrom}:E${rowCapacity}`);
+            await this.api.request(
+                `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}/values/${clearRange}:clear`,
+                { method: 'POST', body: '{}' }
+            );
+        }
+    }
+
+    private async ensureRowCapacity(table: GoogleWorkspaceTable, requiredRows: number): Promise<number> {
+        const fields = encodeURIComponent('sheets(properties(sheetId,title,gridProperties(rowCount)))');
+        const metadata = await this.api.request<{
+            sheets?: Array<{
+                properties?: {
+                    sheetId?: number;
+                    title?: string;
+                    gridProperties?: { rowCount?: number };
+                };
+            }>;
+        }>(`${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}?includeGridData=false&fields=${fields}`);
+        const properties = metadata.sheets
+            ?.map(sheet => sheet.properties)
+            .find(candidate => candidate?.title === table);
+        const currentRows = Number(properties?.gridProperties?.rowCount || 0);
+        if (requiredRows <= currentRows) return currentRows;
+        if (properties?.sheetId === undefined) {
+            throw new Error(`Não foi possível localizar a aba ${table} para expandir suas linhas.`);
+        }
         await this.api.request(
-            `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}/values/${clearRange}:clear`,
-            { method: 'POST', body: '{}' }
+            `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}:batchUpdate`,
+            {
+                method: 'POST',
+                body: JSON.stringify({
+                    requests: [{
+                        appendDimension: {
+                            sheetId: properties.sheetId,
+                            dimension: 'ROWS',
+                            length: requiredRows - currentRows,
+                        },
+                    }],
+                }),
+            }
         );
+        return requiredRows;
     }
 }

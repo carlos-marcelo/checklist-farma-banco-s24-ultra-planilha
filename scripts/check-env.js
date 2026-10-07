@@ -1,4 +1,5 @@
 import { loadEnv } from 'vite';
+import { existsSync, readFileSync } from 'node:fs';
 
 const environment = {
   ...loadEnv('development', process.cwd(), ''),
@@ -19,6 +20,17 @@ const configured = forbiddenVariables.filter(name =>
 
 if (configured.length > 0) {
   console.error(`Legacy backend configuration is still present: ${configured.join(', ')}`);
+  process.exit(1);
+}
+
+if (existsSync('.env.legacy-disabled')) {
+  console.error('Legacy backend file .env.legacy-disabled must not exist after migration.');
+  process.exit(1);
+}
+
+const packageDocument = JSON.parse(readFileSync('package.json', 'utf8'));
+if (packageDocument.dependencies?.['@supabase/supabase-js']) {
+  console.error('The legacy Supabase client dependency must not be installed.');
   process.exit(1);
 }
 
