@@ -237,6 +237,7 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
             const now = new Date().toISOString();
             let next = [...stored];
             let affected: Row[] = [];
+            const appended: Array<StoredSheetRecord<Row>> = [];
 
             if (this.operation === 'insert' || this.operation === 'upsert') {
                 const incoming = (Array.isArray(this.payload) ? this.payload : [this.payload]).filter(Boolean) as Row[];
@@ -265,14 +266,16 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                         affected.push(merged);
                     } else {
                         const id = String(row.id || createId());
-                        next.push({
+                        const record: StoredSheetRecord<Row> = {
                             id,
                             key: recordKey(row, keyFields),
                             revision: 1,
                             updatedAt: now,
                             value: row,
                             rowNumber: next.length + 2,
-                        });
+                        };
+                        next.push(record);
+                        appended.push(record);
                         affected.push(row);
                     }
                 }
@@ -293,7 +296,8 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                 next = kept;
             }
 
-            await repository.replaceAll(sheet, next);
+            if (this.operation === 'insert') await repository.append(sheet, appended);
+            else await repository.replaceAll(sheet, next);
             return this.shouldReturnRows
                 ? this.shapeRows(affected, affected.length)
                 : { data: null, error: null, count: this.countMode ? affected.length : null };
@@ -321,4 +325,3 @@ export const googleSheetsSupabaseCompat = {
         };
     },
 };
-

@@ -4431,13 +4431,17 @@ const App: React.FC = () => {
 
             const resolvedArea = resolveAreaFromCompanyBranch(currentUser.company_id, currentBranch);
             if (resolvedArea && resolvedArea !== (currentUser.area || '')) {
-                await SupabaseService.updateUser(currentUser.email, { area: resolvedArea });
-                await invalidateUsersCache();
                 setUsers(prev => prev.map(u => u.email === currentUser.email ? { ...u, area: resolvedArea } : u));
                 setCurrentUser(prev => prev && prev.email === currentUser.email ? { ...prev, area: resolvedArea } : prev);
+                setShowBranchSelectionModal(false);
+                const updated = await SupabaseService.updateUser(currentUser.email, { area: resolvedArea });
+                if (!updated) throw new Error('O Google Sheets não confirmou a atualização da área.');
+                await invalidateUsersCache();
+            } else {
+                setShowBranchSelectionModal(false);
             }
 
-            await SupabaseService.insertAppEventLog({
+            SupabaseService.insertAppEventLog({
                 company_id: currentUser.company_id || null,
                 branch: currentBranch || null,
                 area: resolvedArea || currentUser.area || null,
@@ -4452,9 +4456,7 @@ const App: React.FC = () => {
                     action: 'keep',
                     interval_days: BRANCH_REVALIDATION_DAYS
                 }
-            });
-
-            setShowBranchSelectionModal(false);
+            }).catch(() => { });
         } catch (error) {
             console.error('Erro ao confirmar filial atual:', error);
             alert('Não foi possível confirmar a filial agora. Tente novamente.');
@@ -4548,6 +4550,20 @@ const App: React.FC = () => {
         const resolvedArea = resolveAreaFromCompanyBranch(currentUser.company_id, selectedBranch) || branchSelectionArea || '';
         setIsSavingBranchSelection(true);
         try {
+            const previousBranch = currentUser.filial || null;
+            const previousArea = currentUser.area || null;
+            setUsers(prev => prev.map(u => u.email === currentUser.email ? {
+                ...u,
+                filial: selectedBranch,
+                area: resolvedArea || null
+            } : u));
+            setCurrentUser(prev => prev && prev.email === currentUser.email ? {
+                ...prev,
+                filial: selectedBranch,
+                area: resolvedArea || null
+            } : prev);
+            setShowBranchSelectionModal(false);
+
             const updated = await SupabaseService.updateUser(currentUser.email, {
                 filial: selectedBranch,
                 area: resolvedArea || null
@@ -4558,19 +4574,9 @@ const App: React.FC = () => {
                 return;
             }
 
-            setUsers(prev => prev.map(u => u.email === currentUser.email ? {
-                ...u,
-                filial: selectedBranch,
-                area: resolvedArea || null
-            } : u));
             await invalidateUsersCache();
-            setCurrentUser(prev => prev && prev.email === currentUser.email ? {
-                ...prev,
-                filial: selectedBranch,
-                area: resolvedArea || null
-            } : prev);
 
-            await SupabaseService.insertAppEventLog({
+            SupabaseService.insertAppEventLog({
                 company_id: currentUser.company_id || null,
                 branch: selectedBranch,
                 area: resolvedArea || null,
@@ -4584,15 +4590,15 @@ const App: React.FC = () => {
                 success: true,
                 source: 'web',
                 event_meta: {
-                    previous_branch: currentUser.filial || null,
-                    previous_area: currentUser.area || null,
+                    previous_branch: previousBranch,
+                    previous_area: previousArea,
                     new_branch: selectedBranch,
                     new_area: resolvedArea || null,
                     mode: branchSelectionMode
                 }
-            });
+            }).catch(() => { });
 
-            await SupabaseService.insertAppEventLog({
+            SupabaseService.insertAppEventLog({
                 company_id: currentUser.company_id || null,
                 branch: selectedBranch,
                 area: resolvedArea || null,
@@ -4607,9 +4613,7 @@ const App: React.FC = () => {
                     action: 'change',
                     interval_days: BRANCH_REVALIDATION_DAYS
                 }
-            });
-
-            setShowBranchSelectionModal(false);
+            }).catch(() => { });
         } catch (error) {
             console.error('Erro ao salvar filial do usuário:', error);
             alert('Não foi possível salvar a filial no momento.');

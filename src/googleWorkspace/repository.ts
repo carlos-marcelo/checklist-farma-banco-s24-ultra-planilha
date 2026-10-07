@@ -192,6 +192,28 @@ export class GoogleSheetsRepository {
         return true;
     }
 
+    async append<T extends object>(
+        tableName: GoogleWorkspaceTable,
+        records: Array<StoredSheetRecord<T>>,
+    ): Promise<void> {
+        if (records.length === 0) return;
+        const table = assertTable(tableName);
+        const physicalRows = records.flatMap(record => serializeRecordRows(record));
+        const appendRange = encodeURIComponent(`${quoteSheetTitle(table)}!A:E`);
+        for (const batch of createWriteBatches(physicalRows)) {
+            await this.api.request(
+                `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}/values/${appendRange}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+                {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        majorDimension: 'ROWS',
+                        values: batch.rows,
+                    }),
+                }
+            );
+        }
+    }
+
     async replaceAll<T extends object>(
         tableName: GoogleWorkspaceTable,
         records: Array<StoredSheetRecord<T>>,
