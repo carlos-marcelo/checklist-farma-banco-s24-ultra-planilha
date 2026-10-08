@@ -2034,7 +2034,7 @@ const GoogleDriveSyncIndicator = ({
                             : 'Aguardando primeira leitura'}
                 </p>
                 <p className="text-[8px] font-bold uppercase tracking-wider opacity-60">
-                    {isGoogleAppsScriptConfigured() ? 'Ao entrar + automático a cada 30s' : 'Ao entrar + automático a cada 10s'}
+                    Ao entrar, navegar ou atualizar
                 </p>
             </div>
         </div>
@@ -3258,6 +3258,14 @@ const App: React.FC = () => {
         }
     }, [currentView]);
 
+    const [isAuditCrossPanelExpanded, setIsAuditCrossPanelExpanded] = useState(false);
+
+    useEffect(() => {
+        if (currentView === 'audit') {
+            setIsAuditCrossPanelExpanded(false);
+        }
+    }, [currentView]);
+
     useEffect(() => {
         if (!currentUser?.email) return;
         scheduleBackgroundTask(() => {
@@ -4453,19 +4461,21 @@ const App: React.FC = () => {
     ]);
 
     useEffect(() => {
-        if (!currentUser?.company_id || currentUser.role !== 'MASTER') return;
+        const companyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        if (!companyId || currentUser?.role !== 'MASTER') return;
         loadGlobalBaseFiles().catch((error) => {
             console.error('Erro ao carregar cadastros globais:', error);
         });
-    }, [currentUser?.company_id, currentUser?.role]);
+    }, [currentUser?.company_id, currentUser?.role, companies]);
 
     useEffect(() => {
         if (currentView !== 'cadastros_globais') return;
-        if (!currentUser?.company_id || currentUser.role !== 'MASTER') return;
+        const companyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        if (!companyId || currentUser?.role !== 'MASTER') return;
         loadGlobalBaseFiles().catch((error) => {
             console.error('Erro ao atualizar cadastros globais ao abrir a tela:', error);
         });
-    }, [currentView, currentUser?.company_id, currentUser?.role]);
+    }, [currentView, currentUser?.company_id, currentUser?.role, companies]);
 
     useEffect(() => {
         if (!showBranchSelectionModal || !currentUser?.company_id) return;
@@ -4524,29 +4534,36 @@ const App: React.FC = () => {
         }
     };
 
-    const loadGlobalBaseFiles = async () => {
-        if (!currentUser?.company_id) return;
-        const cacheKey = `global_base_meta_${currentUser.company_id}`;
+    const loadGlobalBaseFiles = async (force = false) => {
+        const companyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        if (!companyId) return;
+        const cacheKey = `global_base_meta_${companyId}`;
         setIsLoadingGlobalBaseFiles(true);
         try {
+            if (force) {
+                await CacheService.remove(cacheKey);
+            }
             const files = await CacheService.fetchWithCache(
                 cacheKey,
-                () => SupabaseService.fetchGlobalBaseFilesMeta(currentUser.company_id!, true),
+                () => SupabaseService.fetchGlobalBaseFilesMeta(companyId, true),
                 (fresh) => setGlobalBaseFiles(fresh || []),
                 {
-                    maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'stale',
+                    maxAgeMs: force ? 0 : STATIC_REFERENCE_CACHE_MS,
+                    revalidate: force ? 'always' : 'stale',
                     timeoutMs: 8000
                 }
             );
             if (files) setGlobalBaseFiles(files);
+        } catch (error) {
+            console.error('Erro ao carregar cadastros globais:', error);
         } finally {
             setIsLoadingGlobalBaseFiles(false);
         }
     };
 
     const handleUploadGlobalBaseFile = async (slotKey: string, file: File) => {
-        if (!currentUser?.company_id) {
+        const companyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        if (!companyId) {
             alert('Selecione uma empresa válida para carregar o arquivo.');
             return;
         }
@@ -4554,27 +4571,31 @@ const App: React.FC = () => {
         try {
             const encodedFile = await encodeFileForStorage(file);
             const saved = await SupabaseService.upsertGlobalBaseFile({
-                company_id: currentUser.company_id,
+                company_id: companyId,
                 module_key: slotKey,
                 file_name: file.name,
                 mime_type: file.type || 'application/octet-stream',
                 file_size: file.size,
                 file_data_base64: encodedFile.dataUrl,
-                uploaded_by: currentUser.email
+                uploaded_by: currentUser?.email || 'admin'
             });
             if (!saved) {
                 alert('Não foi possível salvar o arquivo no Supabase.');
                 return;
             }
-            await CacheService.remove(`global_base_meta_${currentUser.company_id}`);
-            await loadGlobalBaseFiles();
-            await CadastrosBaseService.invalidateGlobalBaseFile(currentUser.company_id, slotKey);
+            setGlobalBaseFiles(prev => {
+                const next = prev.filter(f => f.module_key !== slotKey);
+                return [saved, ...next];
+            });
+            await CacheService.remove(`global_base_meta_${companyId}`);
+            await loadGlobalBaseFiles(true);
+            await CadastrosBaseService.invalidateGlobalBaseFile(companyId, slotKey);
             SupabaseService.insertAppEventLog({
-                company_id: currentUser.company_id || null,
-                branch: currentUser.filial || null,
-                area: currentUser.area || null,
-                user_email: currentUser.email,
-                user_name: currentUser.name,
+                company_id: companyId,
+                branch: currentUser?.filial || null,
+                area: currentUser?.area || null,
+                user_email: currentUser?.email || '',
+                user_name: currentUser?.name || '',
                 app: 'cadastros_globais',
                 event_type: 'global_base_uploaded',
                 entity_type: 'global_base_file',
@@ -8316,17 +8337,11 @@ const App: React.FC = () => {
             if (!document.hidden) syncNow();
         };
 
+        // Sincroniza ao entrar na aba (dashboard/audit) ou ao recarregar a tela (F5)
+        // Sem polling contínuo periódico para máxima fluidez e sem requisições desnecessárias
         syncNow();
-        const intervalId = window.setInterval(syncNow, AUDIT_DASHBOARD_REVALIDATE_MS);
-        window.addEventListener('focus', syncNow);
-        window.addEventListener('online', syncNow);
-        document.addEventListener('visibilitychange', syncWhenVisible);
         return () => {
             active = false;
-            window.clearInterval(intervalId);
-            window.removeEventListener('focus', syncNow);
-            window.removeEventListener('online', syncNow);
-            document.removeEventListener('visibilitychange', syncWhenVisible);
         };
     }, [
         currentUser,
@@ -10747,6 +10762,7 @@ const App: React.FC = () => {
         setAuditJumpArea(String(areaName || ''));
         setAuditJumpCompanyId(String(company?.id || companyId || ''));
         setAuditJumpCompanyName(String(company?.name || companyName || ''));
+        setIsAuditCrossPanelExpanded(false);
         setCurrentView('audit');
         window.scrollTo(0, 0);
         setIsSidebarOpen(isMobileLayout());
@@ -10758,6 +10774,7 @@ const App: React.FC = () => {
         setAuditJumpArea('');
         setAuditJumpCompanyId('');
         setAuditJumpCompanyName('');
+        setIsAuditCrossPanelExpanded(false);
     }, [markAuditManualBranchSelectionRequired]);
 
     const handleAuditSessionChanged = useCallback((changedSession: SupabaseService.DbAuditSession) => {
@@ -11086,6 +11103,8 @@ const App: React.FC = () => {
                                     <AuditCrossPanel
                                         rows={auditCrossRows}
                                         loading={isLoadingDashboardAudits || isLoadingCompletedDashboardAudits}
+                                        expanded={isAuditCrossPanelExpanded}
+                                        onToggleExpanded={setIsAuditCrossPanelExpanded}
                                         onRefresh={() => {
                                             void Promise.allSettled([
                                                 loadDashboardAuditSessions(true),
@@ -11109,12 +11128,15 @@ const App: React.FC = () => {
                                                 'all'
                                             );
                                         }}
-                                        onOpenAudit={(row) => handleOpenAuditFromDashboardBranch(
-                                            row.branch,
-                                            row.area,
-                                            row.companyId,
-                                            row.companyName
-                                        )}
+                                        onOpenAudit={(row) => {
+                                            setIsAuditCrossPanelExpanded(false);
+                                            handleOpenAuditFromDashboardBranch(
+                                                row.branch,
+                                                row.area,
+                                                row.companyId,
+                                                row.companyName
+                                            );
+                                        }}
                                     />
                                     <div className="min-w-0 flex-1">
                                         <AuditModule
@@ -11133,7 +11155,10 @@ const App: React.FC = () => {
                                             forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
                                             onAuditExited={handleAuditExited}
                                             onAuditSessionChanged={handleAuditSessionChanged}
-                                            onFilialSelected={clearAuditManualBranchSelectionRequired}
+                                            onFilialSelected={() => {
+                                                setIsAuditCrossPanelExpanded(false);
+                                                clearAuditManualBranchSelectionRequired();
+                                            }}
                                         />
                                     </div>
                                 </div>
@@ -13353,9 +13378,9 @@ const App: React.FC = () => {
                                     </p>
                                 </div>
                                 <button
-                                    onClick={() => loadGlobalBaseFiles()}
+                                    onClick={() => void loadGlobalBaseFiles(true)}
                                     disabled={isLoadingGlobalBaseFiles}
-                                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-gray-200 bg-white text-gray-700 text-xs font-black uppercase tracking-wider hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-gray-200 bg-white text-gray-700 text-xs font-black uppercase tracking-wider hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-colors"
                                 >
                                     <RefreshCw size={14} className={isLoadingGlobalBaseFiles ? 'animate-spin' : ''} />
                                     {isLoadingGlobalBaseFiles ? 'Atualizando...' : 'Atualizar Lista'}

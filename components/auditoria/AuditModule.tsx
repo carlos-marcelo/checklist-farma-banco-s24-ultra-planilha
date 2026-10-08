@@ -3366,28 +3366,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }, delay);
         };
 
-        const getIntervalMs = () => (document.hidden ? 60_000 : 15_000);
-        let interval = setInterval(syncNow, getIntervalMs());
-
-        const resetInterval = () => {
-            clearInterval(interval);
-            interval = setInterval(syncNow, getIntervalMs());
-        };
-
-        const handleVisibilityOrFocus = () => {
-            resetInterval();
-            scheduleWakeSync();
-        };
-
-        document.addEventListener('visibilitychange', handleVisibilityOrFocus);
-        window.addEventListener('focus', handleVisibilityOrFocus);
+        scheduleWakeSync();
 
         return () => {
             cancelled = true;
-            clearInterval(interval);
             cancelWakeSync();
-            document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
-            window.removeEventListener('focus', handleVisibilityOrFocus);
         };
     }, [selectedFilial, loadAuditNum]);
 
@@ -3819,15 +3802,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             }, delay);
         };
 
-        const intervalId = window.setInterval(checkWhenVisible, 60_000);
-        window.addEventListener('focus', checkWhenVisible);
-        document.addEventListener('visibilitychange', checkWhenVisible);
-
         return () => {
-            window.clearInterval(intervalId);
             cancelWakeRefresh();
-            window.removeEventListener('focus', checkWhenVisible);
-            document.removeEventListener('visibilitychange', checkWhenVisible);
         };
     }, [
         selectedCompany?.id,

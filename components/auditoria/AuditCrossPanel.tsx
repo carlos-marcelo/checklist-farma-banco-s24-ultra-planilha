@@ -60,6 +60,8 @@ type AuditCrossPanelProps = {
     onRefresh: () => void;
     onExport: (status: AuditCrossStatus) => void;
     onOpenAudit: (row: AuditCrossRow) => void;
+    expanded?: boolean;
+    onToggleExpanded?: (expanded: boolean) => void;
 };
 
 type AuditSignalEvent = {
@@ -192,11 +194,17 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     loading = false,
     onRefresh,
     onExport,
-    onOpenAudit
+    onOpenAudit,
+    expanded: controlledExpanded,
+    onToggleExpanded
 }) => {
-    const [expanded, setExpanded] = useState(() =>
-        typeof window === 'undefined' || !window.matchMedia('(max-width: 1279px)').matches
-    );
+    const [internalExpanded, setInternalExpanded] = useState(false);
+    const expanded = controlledExpanded !== undefined ? controlledExpanded : internalExpanded;
+    const setExpanded = (nextVal: boolean | ((prev: boolean) => boolean)) => {
+        const resolved = typeof nextVal === 'function' ? nextVal(expanded) : nextVal;
+        setInternalExpanded(resolved);
+        onToggleExpanded?.(resolved);
+    };
     const [statusFilter, setStatusFilter] = useState<'all' | AuditCrossStatus>('all');
     const [areaFilter, setAreaFilter] = useState('all');
     const [cityFilter, setCityFilter] = useState('all');
@@ -1171,7 +1179,10 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
                                     </button>
                                     <button
                                         type="button"
-                                        onClick={() => onOpenAudit(row)}
+                                        onClick={() => {
+                                            setExpanded(false);
+                                            onOpenAudit(row);
+                                        }}
                                         className="h-8 w-8 shrink-0 inline-flex items-center justify-center text-slate-500 hover:bg-white/10 hover:text-white cursor-pointer"
                                         title={`Abrir ${row.branch}`}
                                     >
