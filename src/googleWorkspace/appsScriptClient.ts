@@ -33,11 +33,12 @@ interface ApiEnvelope<T> {
 const readSession = (): StoredSession | null => {
     if (typeof window === 'undefined') return null;
     try {
-        const raw = window.sessionStorage.getItem(SESSION_KEY);
+        const raw = window.localStorage.getItem(SESSION_KEY) || window.sessionStorage.getItem(SESSION_KEY);
         if (!raw) return null;
         const parsed = JSON.parse(raw) as StoredSession;
         if (!parsed?.token || !parsed?.user?.email) return null;
         if (parsed.expiresAt && Date.parse(parsed.expiresAt) <= Date.now()) {
+            window.localStorage.removeItem(SESSION_KEY);
             window.sessionStorage.removeItem(SESSION_KEY);
             return null;
         }
@@ -49,8 +50,14 @@ const readSession = (): StoredSession | null => {
 
 const saveSession = (session: StoredSession | null) => {
     if (typeof window === 'undefined') return;
-    if (!session) window.sessionStorage.removeItem(SESSION_KEY);
-    else window.sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    if (!session) {
+        window.localStorage.removeItem(SESSION_KEY);
+        window.sessionStorage.removeItem(SESSION_KEY);
+    } else {
+        const serialized = JSON.stringify(session);
+        try { window.localStorage.setItem(SESSION_KEY, serialized); } catch { /* ignore quota */ }
+        try { window.sessionStorage.setItem(SESSION_KEY, serialized); } catch { /* ignore quota */ }
+    }
 };
 
 class GoogleAppsScriptClient {
@@ -80,7 +87,14 @@ class GoogleAppsScriptClient {
 
     async logout(): Promise<void> {
         try { await this.request('logout', {}, true); } catch { /* local logout still succeeds */ }
+        this.clearSession();
+    }
+
+    clearSession(): void {
         saveSession(null);
+        if (typeof window !== 'undefined') {
+            window.localStorage.removeItem('APP_CURRENT_EMAIL');
+        }
     }
 
     async query<T>(query: Record<string, unknown>): Promise<T> {
@@ -105,7 +119,7 @@ class GoogleAppsScriptClient {
             const message = typeof detail === 'string' ? detail : detail.message || 'Falha na API segura do Google.';
             const code = typeof detail === 'string' ? 'APPS_SCRIPT_ERROR' : detail.code || 'APPS_SCRIPT_ERROR';
             if (code === 'AUTH_REQUIRED' || code === 'SESSION_EXPIRED') {
-                saveSession(null);
+                this.clearSession();
                 if (typeof window !== 'undefined') window.dispatchEvent(new Event('checklist-farma:session-expired'));
             }
             throw Object.assign(new Error(message), { code });

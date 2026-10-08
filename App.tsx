@@ -2008,10 +2008,10 @@ const GoogleDriveSyncIndicator = ({
         ? googleAppsScriptClient.isAuthenticated()
         : googleWorkspaceService.getStatus().connected) && !error;
     const statusLabel = error
-        ? 'Google Drive indisponível'
+        ? (isGoogleAppsScriptConfigured() ? 'Google Sheets indisponível' : 'Google Drive indisponível')
         : connected
             ? 'Google Sheets conectado'
-            : 'Conectando ao Google Drive';
+            : (isGoogleAppsScriptConfigured() ? 'Conectando ao Google Sheets' : 'Conectando ao Google Drive');
     return (
         <div
             className={`flex min-w-[220px] items-center gap-2 rounded-xl border px-3 py-2 ${
@@ -4328,6 +4328,11 @@ const App: React.FC = () => {
 
     // Restore logged-in session after users load
     useEffect(() => {
+        if (isGoogleAppsScriptConfigured() && !googleAppsScriptClient.isAuthenticated()) {
+            localStorage.removeItem('APP_CURRENT_EMAIL');
+            if (currentUser) setCurrentUser(null);
+            return;
+        }
         const savedEmail = localStorage.getItem('APP_CURRENT_EMAIL');
         if (savedEmail && !currentUser) {
             const u = users.find(u => u.email === savedEmail);
