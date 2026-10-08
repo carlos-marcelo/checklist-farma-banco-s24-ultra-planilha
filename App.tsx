@@ -5370,7 +5370,7 @@ const App: React.FC = () => {
         const nextPassword = teamPasswordDrafts[targetUser.email] ?? targetUser.password ?? '';
         if (nextPassword === targetUser.password) return;
         if (nextPassword.length < 8) {
-            alert("A senha deve ter pelo menos 6 caracteres.");
+            alert("A senha deve ter pelo menos 8 caracteres.");
             return;
         }
 
