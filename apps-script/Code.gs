@@ -489,7 +489,10 @@ function serializeRows_(record) {
 }
 
 function newRecord_(value, fields) { const now = nowIso_(); return { id: String(value.id || Utilities.getUuid()), key: JSON.stringify(fields.map(f => value[f] == null ? null : value[f])), revision: 1, updatedAt: now, value: value, rowNumber: 0, physicalRowCount: 0 }; }
-function ensureSheet_(name) { const book = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty('CF_SPREADSHEET_ID') || CF_SPREADSHEET_ID); let sheet = book.getSheetByName(name); if (!sheet) sheet = book.insertSheet(name); if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, 5).setValues([CF_HEADERS]); return sheet; }
+var _cachedBook_ = null;
+var _cachedSheets_ = {};
+function getSpreadsheetBook_() { if (!_cachedBook_) { var id = PropertiesService.getScriptProperties().getProperty('CF_SPREADSHEET_ID') || CF_SPREADSHEET_ID; _cachedBook_ = SpreadsheetApp.openById(id); } return _cachedBook_; }
+function ensureSheet_(name) { if (_cachedSheets_[name]) return _cachedSheets_[name]; var book = getSpreadsheetBook_(); var sheet = book.getSheetByName(name); if (!sheet) sheet = book.insertSheet(name); if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, 5).setValues([CF_HEADERS]); _cachedSheets_[name] = sheet; return sheet; }
 function project_(row, columns) { if (!columns || columns.trim() === '*') return clone_(row); const result = {}; columns.split(',').map(c => c.trim()).filter(Boolean).forEach(c => result[c] = clone_(row[c])); return result; }
 function sameCompany_(row, user) { return String(row.company_id || '') === String(user.company_id || ''); }
 function normalizeEmail_(value) { return String(value || '').trim().toLowerCase(); }
