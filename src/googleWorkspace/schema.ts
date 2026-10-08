@@ -88,7 +88,7 @@ export const GOOGLE_SOURCE_KEY_FIELDS: Record<GoogleSourceTable, readonly string
     global_base_files: ['company_id', 'module_key'],
     pv_dashboard_reports: ['id'],
     pv_inventory_reports: ['company_id', 'branch'],
-    pv_reports: ['id'],
+    pv_reports: ['user_email', 'report_type'],
     drafts: ['user_email'],
     tickets: ['id'],
     active_sessions: ['client_id'],

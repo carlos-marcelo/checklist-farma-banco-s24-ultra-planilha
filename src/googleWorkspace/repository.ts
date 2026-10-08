@@ -15,6 +15,13 @@ export interface StoredSheetRecord<T> {
     updatedAt: string;
     value: T;
     rowNumber: number;
+    physicalRowCount?: number;
+}
+
+export interface SheetRecordChanges<T extends object> {
+    append?: Array<StoredSheetRecord<T>>;
+    update?: Array<StoredSheetRecord<T>>;
+    remove?: Array<StoredSheetRecord<T>>;
 }
 
 export interface UpsertOptions { expectedRevision?: number; }
@@ -107,12 +114,14 @@ export class GoogleSheetsRepository {
             if (String(row[1]).startsWith(CHUNK_KEY_PREFIX)) continue;
             try {
                 let payload = String(row[4]);
+                let physicalRowCount = 1;
                 if (payload.startsWith(CHUNK_PREFIX)) {
                     const separator = payload.indexOf('__', CHUNK_PREFIX.length);
                     const chunkCount = Number(payload.slice(CHUNK_PREFIX.length, separator));
                     if (!Number.isInteger(chunkCount) || chunkCount < 1 || separator < 0) {
                         throw new Error('Marcador de payload fragmentado inválido.');
                     }
+                    physicalRowCount = chunkCount;
                     payload = payload.slice(separator + 2);
                     for (let chunkIndex = 1; chunkIndex < chunkCount; chunkIndex += 1) {
                         payload += String(rows[index + chunkIndex]?.[4] ?? '');
@@ -126,6 +135,7 @@ export class GoogleSheetsRepository {
                     updatedAt: String(row[3] || ''),
                     value: JSON.parse(payload) as T,
                     rowNumber: physicalRowNumber,
+                    physicalRowCount,
                 });
             } catch (error) {
                 console.warn(`[GoogleSheetsRepository] Linha inválida ignorada em ${table}.`, error);
@@ -167,9 +177,12 @@ export class GoogleSheetsRepository {
             value,
             rowNumber: current?.rowNumber || records.length + 2,
         };
-        if (current) records[rowIndex] = record;
-        else records.push(record);
-        await this.replaceAll(table, records);
+        if (current) {
+            record.physicalRowCount = current.physicalRowCount;
+            await this.applyChanges(table, { update: [record] });
+        } else {
+            await this.applyChanges(table, { append: [record] });
+        }
         return record;
     }
 
@@ -187,9 +200,73 @@ export class GoogleSheetsRepository {
             );
         }
 
-        records.splice(rowIndex, 1);
-        await this.replaceAll(table, records);
+        await this.applyChanges(table, { remove: [current] });
         return true;
+    }
+
+    async applyChanges<T extends object>(
+        tableName: GoogleWorkspaceTable,
+        changes: SheetRecordChanges<T>,
+    ): Promise<void> {
+        const table = assertTable(tableName);
+        const append = [...(changes.append || [])];
+        const updateInPlace: Array<{ record: StoredSheetRecord<T>; rows: unknown[][] }> = [];
+        const clearRanges: string[] = [];
+
+        for (const record of changes.update || []) {
+            const rows = serializeRecordRows(record);
+            const previousRowCount = Math.max(1, record.physicalRowCount || 1);
+            if (rows.length > previousRowCount) {
+                // O registro cresceu e não pode invadir a linha seguinte. Primeiro cria
+                // a nova versão no fim e só depois limpa a versão anterior.
+                append.push(record);
+                clearRanges.push(`${quoteSheetTitle(table)}!A${record.rowNumber}:E${record.rowNumber + previousRowCount - 1}`);
+                continue;
+            }
+            updateInPlace.push({ record, rows });
+            if (rows.length < previousRowCount) {
+                clearRanges.push(
+                    `${quoteSheetTitle(table)}!A${record.rowNumber + rows.length}:E${record.rowNumber + previousRowCount - 1}`
+                );
+            }
+        }
+
+        for (const record of changes.remove || []) {
+            const previousRowCount = Math.max(1, record.physicalRowCount || 1);
+            clearRanges.push(`${quoteSheetTitle(table)}!A${record.rowNumber}:E${record.rowNumber + previousRowCount - 1}`);
+        }
+
+        // Registros que cresceram são anexados antes da limpeza para que uma falha
+        // transitória nunca apague a única cópia válida do dado.
+        await this.append(table, append);
+
+        for (let offset = 0; offset < updateInPlace.length; offset += 100) {
+            const batch = updateInPlace.slice(offset, offset + 100);
+            await this.api.request(
+                `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}/values:batchUpdate`,
+                {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        valueInputOption: 'RAW',
+                        data: batch.map(({ record, rows }) => ({
+                            range: `${quoteSheetTitle(table)}!A${record.rowNumber}:E${record.rowNumber + rows.length - 1}`,
+                            majorDimension: 'ROWS',
+                            values: rows,
+                        })),
+                    }),
+                }
+            );
+        }
+
+        for (let offset = 0; offset < clearRanges.length; offset += 500) {
+            await this.api.request(
+                `${SHEETS_API}/${encodeURIComponent(this.spreadsheetId)}/values:batchClear`,
+                {
+                    method: 'POST',
+                    body: JSON.stringify({ ranges: clearRanges.slice(offset, offset + 500) }),
+                }
+            );
+        }
     }
 
     async append<T extends object>(

@@ -25,12 +25,13 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build
         env:
           VITE_BASE_PATH: /
+          VITE_GOOGLE_APPS_SCRIPT_URL: ${{ vars.VITE_GOOGLE_APPS_SCRIPT_URL }}
 
       - name: Create 404.html for SPA routing
         run: cp dist/index.html dist/404.html

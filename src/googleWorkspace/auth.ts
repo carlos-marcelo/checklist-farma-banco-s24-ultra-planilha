@@ -107,6 +107,9 @@ export class GoogleWorkspaceAuth {
             }
         }
         if (!this.clientId) throw new Error('A conexão OAuth do Google não foi configurada.');
+        if (!interactive) {
+            throw new GoogleAuthorizationRequiredError();
+        }
         await loadGoogleIdentityServices();
         const oauth2 = window.google?.accounts?.oauth2;
         if (!oauth2) throw new Error('Google Identity Services indisponível.');

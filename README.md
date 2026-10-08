@@ -58,11 +58,36 @@ npm run check:offline
 npm run dev
 ```
 
-O cache local e apenas uma copia de desempenho. Uma versao de cache e aplicada
-apos importacoes completas para obrigar a interface a reler os dados do Sheets.
+## Publicacao no GitHub Pages
+
+O workflow `.github/workflows/deploy.yml` permanece manual para evitar publicar
+antes da validacao final. Ele gera o site para a raiz do dominio personalizado e
+usa `public/CNAME` com `marcelo.far.br`. O sistema antigo continua separado em
+`checklist.marcelo.far.br`.
+
+Para producao, o navegador nao acessa o Google Sheets diretamente. O backend em
+`apps-script/Code.gs` executa na conta proprietaria, valida login e permissoes no
+servidor e entrega somente os registros permitidos. Siga
+[`apps-script/README.md`](apps-script/README.md) e cadastre no GitHub apenas:
+
+- `VITE_GOOGLE_APPS_SCRIPT_URL`: URL `/exec` da implantacao do Apps Script.
+
+As antigas variaveis `VITE_GOOGLE_CLIENT_ID`, `VITE_GOOGLE_SPREADSHEET_ID` e
+`VITE_GOOGLE_SPREADSHEET_NAME` podem permanecer cadastradas, mas o workflow de
+producao nao as envia ao site.
+
+No GitHub, selecione **Settings > Pages > Source > GitHub Actions** e configure o
+dominio personalizado `marcelo.far.br`. No provedor DNS atualmente autoritativo
+para `far.br`, aponte o dominio para o GitHub Pages sem remover o registro do
+subdominio `checklist`, que mantem o sistema antigo no ar. Cloudflare nao e
+necessario para esta arquitetura.
+
+O cache local e apenas uma copia de desempenho e e limpo no logout. Senhas,
+hashes, salt e tokens OAuth do Google nunca sao enviados pelo Apps Script.
 
 ## Seguranca
 
 Nao adicione variaveis `VITE_SUPABASE_*`, URLs do tunel antigo, dumps, tokens ou
-arquivos `.env` ao repositorio. `npm run check:offline` bloqueia configuracoes e
-dependencias legadas. O projeto original permanece separado.
+arquivos `.env` ao repositorio. Nao inclua o segredo privado das Propriedades do
+Apps Script. `npm run check:offline` bloqueia configuracoes e dependencias
+legadas. O projeto original permanece separado.

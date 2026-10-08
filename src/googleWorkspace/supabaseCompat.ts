@@ -5,10 +5,12 @@ import {
     GoogleSourceTable,
 } from './schema';
 import type { StoredSheetRecord } from './repository';
+import { googleAppsScriptClient } from './appsScriptClient';
 
 type Row = Record<string, any>;
 type Operation = 'select' | 'insert' | 'upsert' | 'update' | 'delete';
 type Filter = (row: Row) => boolean;
+type FilterSpec = { operator: string; column?: string; value?: unknown; values?: unknown[]; expression?: string };
 
 interface QueryResult {
     data: any;
@@ -49,7 +51,9 @@ const errorResult = (error: unknown): QueryResult => ({
     error: {
         code: error instanceof Error && error.name === 'GoogleAuthorizationRequiredError'
             ? 'GOOGLE_AUTH_REQUIRED'
-            : 'GOOGLE_SHEETS_ERROR',
+            : (typeof error === 'object' && error && 'code' in error
+                ? String((error as { code?: unknown }).code || 'GOOGLE_SHEETS_ERROR')
+                : 'GOOGLE_SHEETS_ERROR'),
         message: error instanceof Error ? error.message : String(error),
         details: error,
     },
@@ -60,7 +64,8 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
     private operation: Operation = 'select';
     private payload: Row | Row[] | null = null;
     private filters: Filter[] = [];
-    private orders: Array<{ column: string; ascending: boolean }> = [];
+    private filterSpecs: FilterSpec[] = [];
+    private orders: Array<{ column: string; ascending: boolean; nullsFirst?: boolean }> = [];
     private selectedColumns = '*';
     private shouldReturnRows = false;
     private head = false;
@@ -108,46 +113,55 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
     }
 
     eq(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'eq', column, value });
         this.filters.push(row => scalarEqual(row[column], value));
         return this;
     }
 
     neq(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'neq', column, value });
         this.filters.push(row => !scalarEqual(row[column], value));
         return this;
     }
 
     gt(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'gt', column, value });
         this.filters.push(row => compare(row[column], value) > 0);
         return this;
     }
 
     gte(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'gte', column, value });
         this.filters.push(row => compare(row[column], value) >= 0);
         return this;
     }
 
     lt(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'lt', column, value });
         this.filters.push(row => compare(row[column], value) < 0);
         return this;
     }
 
     lte(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'lte', column, value });
         this.filters.push(row => compare(row[column], value) <= 0);
         return this;
     }
 
     is(column: string, value: unknown): this {
+        this.filterSpecs.push({ operator: 'is', column, value });
         this.filters.push(row => value === null ? row[column] == null : scalarEqual(row[column], value));
         return this;
     }
 
     in(column: string, values: unknown[]): this {
+        this.filterSpecs.push({ operator: 'in', column, values });
         this.filters.push(row => values.some(value => scalarEqual(row[column], value)));
         return this;
     }
 
     or(expression: string): this {
+        this.filterSpecs.push({ operator: 'or', expression });
         const alternatives = expression.split(',').map(part => {
             const [column, operator, ...rawValue] = part.split('.');
             const value = rawValue.join('.');
@@ -159,8 +173,12 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
         return this;
     }
 
-    order(column: string, options: { ascending?: boolean } = {}): this {
-        this.orders.push({ column, ascending: options.ascending !== false });
+    order(column: string, options: { ascending?: boolean; nullsFirst?: boolean } = {}): this {
+        this.orders.push({
+            column,
+            ascending: options.ascending !== false,
+            nullsFirst: options.nullsFirst,
+        });
         return this;
     }
 
@@ -199,7 +217,14 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
     private shapeRows(rows: Row[], totalCount: number): QueryResult {
         let result = [...rows];
         for (const order of [...this.orders].reverse()) {
-            result.sort((left, right) => compare(left[order.column], right[order.column]) * (order.ascending ? 1 : -1));
+            result.sort((left, right) => {
+                const leftNull = left[order.column] == null;
+                const rightNull = right[order.column] == null;
+                if (leftNull !== rightNull && order.nullsFirst !== undefined) {
+                    return leftNull === order.nullsFirst ? -1 : 1;
+                }
+                return compare(left[order.column], right[order.column]) * (order.ascending ? 1 : -1);
+            });
         }
         if (this.rangeStart !== undefined) result = result.slice(this.rangeStart, (this.rangeEnd ?? this.rangeStart) + 1);
         if (this.maxRows !== undefined) result = result.slice(0, this.maxRows);
@@ -223,6 +248,24 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
 
     private async execute(): Promise<QueryResult> {
         try {
+            if (googleAppsScriptClient.isConfigured()) {
+                return await googleAppsScriptClient.query<QueryResult>({
+                    table: this.table,
+                    operation: this.operation,
+                    payload: this.payload,
+                    filters: this.filterSpecs,
+                    orders: this.orders,
+                    selectedColumns: this.selectedColumns,
+                    shouldReturnRows: this.shouldReturnRows,
+                    head: this.head,
+                    countMode: this.countMode,
+                    maxRows: this.maxRows,
+                    rangeStart: this.rangeStart,
+                    rangeEnd: this.rangeEnd,
+                    singleMode: this.singleMode,
+                    conflictFields: this.conflictFields,
+                });
+            }
             const connection = googleWorkspaceService.getConnection()
                 || await googleWorkspaceService.connectAndInitialize(false);
             const repository = connection.repository;
@@ -238,6 +281,8 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
             let next = [...stored];
             let affected: Row[] = [];
             const appended: Array<StoredSheetRecord<Row>> = [];
+            const updated: Array<StoredSheetRecord<Row>> = [];
+            const removed: Array<StoredSheetRecord<Row>> = [];
 
             if (this.operation === 'insert' || this.operation === 'upsert') {
                 const incoming = (Array.isArray(this.payload) ? this.payload : [this.payload]).filter(Boolean) as Row[];
@@ -256,13 +301,15 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                     if (existingIndex >= 0) {
                         const existing = next[existingIndex];
                         const merged = { ...existing.value, ...row, updated_at: row.updated_at || now };
-                        next[existingIndex] = {
+                        const updatedRecord = {
                             ...existing,
                             key: recordKey(merged, keyFields),
                             revision: existing.revision + 1,
                             updatedAt: now,
                             value: merged,
                         };
+                        next[existingIndex] = updatedRecord;
+                        updated.push(updatedRecord);
                         affected.push(merged);
                     } else {
                         const id = String(row.id || createId());
@@ -285,19 +332,27 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                     if (!this.matches(record.value)) return record;
                     const value = { ...record.value, ...updates };
                     affected.push(value);
-                    return { ...record, revision: record.revision + 1, updatedAt: now, value };
+                    const updatedRecord = { ...record, revision: record.revision + 1, updatedAt: now, value };
+                    updated.push(updatedRecord);
+                    return updatedRecord;
                 });
             } else if (this.operation === 'delete') {
                 const kept: Array<StoredSheetRecord<Row>> = [];
                 for (const record of next) {
-                    if (this.matches(record.value)) affected.push(record.value);
+                    if (this.matches(record.value)) {
+                        affected.push(record.value);
+                        removed.push(record);
+                    }
                     else kept.push(record);
                 }
                 next = kept;
             }
 
-            if (this.operation === 'insert') await repository.append(sheet, appended);
-            else await repository.replaceAll(sheet, next);
+            await repository.applyChanges(sheet, {
+                append: appended,
+                update: updated,
+                remove: removed,
+            });
             return this.shouldReturnRows
                 ? this.shapeRows(affected, affected.length)
                 : { data: null, error: null, count: this.countMode ? affected.length : null };

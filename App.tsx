@@ -26,7 +26,7 @@ import {
 } from './src/branchDirectory';
 import { encodeFileForStorage } from './src/filePayload';
 import { GoogleDriveConnectionPanel } from './components/GoogleDriveConnectionPanel';
-import { googleWorkspaceService } from './src/googleWorkspace';
+import { googleAppsScriptClient, googleWorkspaceService, isGoogleAppsScriptConfigured } from './src/googleWorkspace';
 
 
 const mergeAccessMatrixWithDefaults = (incoming: Partial<Record<AccessLevelId, Record<string, boolean>>>) => {
@@ -2004,11 +2004,13 @@ const GoogleDriveSyncIndicator = ({
     isLoading: boolean;
     error?: string | null;
 }) => {
-    const connected = googleWorkspaceService.getStatus().connected && !error;
+    const connected = (isGoogleAppsScriptConfigured()
+        ? googleAppsScriptClient.isAuthenticated()
+        : googleWorkspaceService.getStatus().connected) && !error;
     const statusLabel = error
         ? 'Google Drive indisponível'
         : connected
-            ? 'Google Drive conectado'
+            ? 'Google Sheets conectado'
             : 'Conectando ao Google Drive';
     return (
         <div
@@ -2019,7 +2021,7 @@ const GoogleDriveSyncIndicator = ({
                         ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                         : 'border-amber-200 bg-amber-50 text-amber-700'
             }`}
-            title={error || 'Leitura automática da planilha Google a cada 30 segundos'}
+            title={error || 'Atualização imediata ao entrar ou voltar para a página e verificação a cada 10 segundos'}
         >
             <Clock size={15} className={isLoading ? 'animate-pulse' : ''} />
             <div className="min-w-0 leading-tight">
@@ -2031,7 +2033,9 @@ const GoogleDriveSyncIndicator = ({
                             ? `Última atualização: ${formatFullDateTime(lastUpdated)}`
                             : 'Aguardando primeira leitura'}
                 </p>
-                <p className="text-[8px] font-bold uppercase tracking-wider opacity-60">Automático a cada 30s</p>
+                <p className="text-[8px] font-bold uppercase tracking-wider opacity-60">
+                    {isGoogleAppsScriptConfigured() ? 'Ao entrar + automático a cada 30s' : 'Ao entrar + automático a cada 10s'}
+                </p>
             </div>
         </div>
     );
@@ -2826,7 +2830,7 @@ const LoginScreen = ({
             }
 
             // Validate Password Length
-            if (password.length < 6) {
+            if (password.length < 8) {
                 triggerFormError('A senha deve ter no mínimo 6 dígitos.');
                 return;
             }
@@ -2841,7 +2845,20 @@ const LoginScreen = ({
                 triggerFormError('E-mail já cadastrado.');
                 return;
             }
-            onRegister({ email, password, name, phone, role: 'USER', approved: false, rejected: false, company_id: selectedCompanyForRegistration || null });
+            const registration: User = { email, password, name, phone, role: 'USER', approved: false, rejected: false, company_id: selectedCompanyForRegistration || null };
+            try {
+                if (isGoogleAppsScriptConfigured()) {
+                    await googleAppsScriptClient.register(registration as unknown as Record<string, unknown>);
+                } else {
+                    await googleWorkspaceService.connectAndInitialize(true);
+                    await onRegister(registration);
+                }
+            } catch (cause) {
+                triggerFormError(cause instanceof Error
+                    ? cause.message
+                    : 'Não foi possível criar a conta.');
+                return;
+            }
             setSuccess('Solicitação enviada com sucesso! Seu acesso será avaliado por um mediador.');
             setIsRegistering(false);
             setEmail('');
@@ -2854,6 +2871,20 @@ const LoginScreen = ({
             // --- LOGIN FLOW ---
             setIsAuthenticating(true);
             try {
+                if (isGoogleAppsScriptConfigured()) {
+                    const apiUser = await googleAppsScriptClient.login(email, password);
+                    onLogin({
+                        ...apiUser,
+                        password: '',
+                        name: apiUser.name || '',
+                        phone: apiUser.phone || '',
+                        approved: Boolean(apiUser.approved),
+                        role: (apiUser.role || 'USER') as UserRole,
+                        preferredTheme: apiUser.preferred_theme as ThemeColor | undefined
+                    });
+                    return;
+                }
+                await googleWorkspaceService.connectAndInitialize(true);
                 const result = await SupabaseService.authenticateUser(email, password);
 
                 if (result.status === 'success') {
@@ -2880,6 +2911,10 @@ const LoginScreen = ({
                 }
 
                 triggerFormError('E-mail ou senha inválidos.');
+            } catch (cause) {
+                triggerFormError(cause instanceof Error
+                    ? cause.message
+                    : 'Não foi possível conectar ao Google Drive.');
             } finally {
                 setIsAuthenticating(false);
             }
@@ -3149,6 +3184,7 @@ const getGoogleSheetsRetryDelay = (failures: number): number =>
 
 const App: React.FC = () => {
     useEffect(() => {
+        if (isGoogleAppsScriptConfigured()) return;
         googleWorkspaceService.connectAndInitialize(false)
             .then(async () => {
                 const sheetUsers = await SupabaseService.fetchUsers();
@@ -3173,7 +3209,15 @@ const App: React.FC = () => {
 
     // Auth State
     const [users, setUsers] = useState<User[]>([]);
-    const [currentUser, setCurrentUser] = useState<User | null>(null);
+    const [currentUser, setCurrentUser] = useState<User | null>(() => {
+        const apiUser = isGoogleAppsScriptConfigured() ? googleAppsScriptClient.getCurrentUser() : null;
+        return apiUser ? {
+            ...apiUser,
+            password: '',
+            role: (apiUser.role || 'USER') as UserRole,
+            preferredTheme: apiUser.preferred_theme as ThemeColor | undefined
+        } as User : null;
+    });
     const [showBranchSelectionModal, setShowBranchSelectionModal] = useState(false);
     const [branchSelectionMode, setBranchSelectionMode] = useState<'required' | 'confirm'>('required');
     const [branchSelectionValue, setBranchSelectionValue] = useState('');
@@ -3695,9 +3739,9 @@ const App: React.FC = () => {
     const CACHE_KEY_TICKETS = 'tickets_list';
     const CACHE_KEY_CHECKLIST_DEFS = 'checklist_definitions';
     const CACHE_KEY_AUDIT_DASHBOARD_PREFIX = 'audit_dashboard_sessions';
-    const GOOGLE_DATA_CACHE_VERSION = 'google-sheets-full-import-2026-10-06-v1';
+    const GOOGLE_DATA_CACHE_VERSION = 'google-apps-script-secure-2026-10-07-v1';
     const GOOGLE_DATA_CACHE_VERSION_KEY = 'APP_GOOGLE_DATA_CACHE_VERSION';
-    const AUDIT_DASHBOARD_REVALIDATE_MS = 30 * 1000;
+    const AUDIT_DASHBOARD_REVALIDATE_MS = isGoogleAppsScriptConfigured() ? 30 * 1000 : 10 * 1000;
     const CACHE_KEY_USERS_META = 'users_list_meta_signature';
     const STATIC_REFERENCE_CACHE_MS = 15 * 60 * 1000;
     const HISTORY_BACKGROUND_CACHE_MS = 2 * 60 * 1000;
@@ -4015,18 +4059,18 @@ const App: React.FC = () => {
                 refreshUsersIfChanged(applyDeferred(applyUsers)),
                 CacheService.fetchWithCache(CACHE_KEY_CONFIG, () => SupabaseService.fetchConfig(true), applyDeferred(applyConfig), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'stale',
+                    revalidate: 'always',
                     timeoutMs: 6000
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_COMPANIES, () => SupabaseService.fetchCompanies(true), applyDeferred(applyCompanies), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'stale',
+                    revalidate: 'always',
                     timeoutMs: 8000,
                     compare: (cached, remote) => getCompanyAreasSignature(cached) !== getCompanyAreasSignature(remote)
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_ACCESS, () => SupabaseService.fetchAccessMatrix(true), applyDeferred(applyAccessMatrix), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'stale',
+                    revalidate: 'always',
                     timeoutMs: 8000
                 })
             ]);
@@ -4036,19 +4080,19 @@ const App: React.FC = () => {
             await Promise.allSettled([
                 CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyDeferred(applyReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
-                    revalidate: 'stale',
+                    revalidate: 'always',
                     timeoutMs: 10000
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true), applyDeferred(applyStockReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
-                    revalidate: 'stale',
+                    revalidate: 'always',
                     timeoutMs: 10000
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_TICKETS, () => SupabaseService.fetchTickets(true), (data) => {
                     if (!cancelled) startTransition(() => setTickets(data || []));
                 }, {
                     maxAgeMs: 60 * 1000,
-                    revalidate: 'stale',
+                    revalidate: 'always',
                     timeoutMs: 8000
                 }),
                 loadPendingStockReports()
@@ -4058,6 +4102,12 @@ const App: React.FC = () => {
         const initializeData = async () => {
             try {
                 setIsLoadingData(true);
+
+                if (isGoogleAppsScriptConfigured() && !googleAppsScriptClient.isAuthenticated()) {
+                    await CacheService.clear();
+                    localStorage.removeItem('APP_USERS');
+                    return;
+                }
 
                 if (localStorage.getItem(GOOGLE_DATA_CACHE_VERSION_KEY) !== GOOGLE_DATA_CACHE_VERSION) {
                     await CacheService.clear();
@@ -4094,10 +4144,12 @@ const App: React.FC = () => {
             } finally {
                 if (!cancelled) {
                     setIsLoadingData(false);
-                    void refreshCoreData();
-                    scheduleBackgroundTask(() => {
-                        void preloadSecondaryData();
-                    }, 1200);
+                    if (!isGoogleAppsScriptConfigured() || googleAppsScriptClient.isAuthenticated()) {
+                        void refreshCoreData();
+                        scheduleBackgroundTask(() => {
+                            void preloadSecondaryData();
+                        }, 1200);
+                    }
                 }
             }
         };
@@ -4106,10 +4158,11 @@ const App: React.FC = () => {
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [currentUser?.email]);
 
     useEffect(() => {
         let cancelled = false;
+        if (isGoogleAppsScriptConfigured() && !googleAppsScriptClient.isAuthenticated()) return;
         const applyChecklistDefinitions = (dbDefinitions: SupabaseService.DbChecklistDefinition[] | null) => {
             if (cancelled || !dbDefinitions || dbDefinitions.length === 0) return;
             const serverMap = dbDefinitions.reduce((acc: Record<string, ChecklistDefinition>, entry) => {
@@ -4125,7 +4178,7 @@ const App: React.FC = () => {
 
         CacheService.fetchWithCache(CACHE_KEY_CHECKLIST_DEFS, () => SupabaseService.fetchChecklistDefinitions(true), applyChecklistDefinitions, {
             maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-            revalidate: 'stale',
+            revalidate: 'always',
             timeoutMs: 8000
         }).then(applyChecklistDefinitions).catch(error => {
             console.error('Erro ao carregar definições dos checklists:', error);
@@ -4134,7 +4187,7 @@ const App: React.FC = () => {
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [currentUser?.email]);
 
     useEffect(() => {
         if (currentView !== 'support') return;
@@ -4224,7 +4277,8 @@ const App: React.FC = () => {
     // Save Users to LocalStorage
     useEffect(() => {
         if (!isLoadingData && users.length > 0) {
-            localStorage.setItem('APP_USERS', JSON.stringify(users));
+            const safeUsers = users.map(({ password: _password, ...user }) => user);
+            localStorage.setItem('APP_USERS', JSON.stringify(safeUsers));
         }
     }, [users, isLoadingData]);
 
@@ -4730,7 +4784,7 @@ const App: React.FC = () => {
 
     // Save Config to Supabase AND LocalStorage
     useEffect(() => {
-        if (!isLoadingData) {
+        if (!isLoadingData && currentUser?.role === 'MASTER') {
             localStorage.setItem('APP_CONFIG', JSON.stringify(config));
 
             // Save to Supabase (async, with debounce)
@@ -4747,7 +4801,7 @@ const App: React.FC = () => {
 
             return () => clearTimeout(timeoutId);
         }
-    }, [config, isLoadingData]);
+    }, [config, isLoadingData, currentUser?.role]);
 
     // Scroll to top on initial load
     useEffect(() => {
@@ -4993,8 +5047,27 @@ const App: React.FC = () => {
         setViewingStockConferenceReport(null);
         setRemoteForceLogoutDeadline(null);
         setCurrentView('dashboard');
+        if (isGoogleAppsScriptConfigured()) {
+            void googleAppsScriptClient.logout();
+            void CacheService.clear();
+            localStorage.removeItem('APP_USERS');
+            setUsers([]);
+            setCompanies([]);
+            setReportHistory([]);
+            setStockConferenceHistory([]);
+            setStockConferenceReportsRaw([]);
+            setTickets([]);
+            setAccessMatrix(createInitialAccessMatrix());
+        }
         logoutInFlightRef.current = false;
     }, [clearAuditManualBranchSelectionRequired, currentUser, currentView]);
+
+    useEffect(() => {
+        if (!isGoogleAppsScriptConfigured()) return;
+        const handleExpiredSession = () => { void handleLogout(); };
+        window.addEventListener('checklist-farma:session-expired', handleExpiredSession);
+        return () => window.removeEventListener('checklist-farma:session-expired', handleExpiredSession);
+    }, [handleLogout]);
 
     const handleRemoteForceLogoutNow = useCallback(() => {
         setRemoteForceLogoutDeadline(null);
@@ -5270,7 +5343,7 @@ const App: React.FC = () => {
 
         const nextPassword = teamPasswordDrafts[targetUser.email] ?? targetUser.password ?? '';
         if (nextPassword === targetUser.password) return;
-        if (nextPassword.length < 6) {
+        if (nextPassword.length < 8) {
             alert("A senha deve ter pelo menos 6 caracteres.");
             return;
         }
@@ -5283,7 +5356,9 @@ const App: React.FC = () => {
                 return;
             }
 
-            setUsers(prev => prev.map(u => u.email === targetUser.email ? { ...u, password: nextPassword } : u));
+            if (!isGoogleAppsScriptConfigured()) {
+                setUsers(prev => prev.map(u => u.email === targetUser.email ? { ...u, password: nextPassword } : u));
+            }
             await invalidateUsersCache();
             setTeamPasswordDrafts(prev => {
                 const next = { ...prev };
@@ -5291,7 +5366,9 @@ const App: React.FC = () => {
                 return next;
             });
             if (currentUser?.email === targetUser.email) {
-                setCurrentUser(prev => prev ? { ...prev, password: nextPassword } : prev);
+                if (!isGoogleAppsScriptConfigured()) {
+                    setCurrentUser(prev => prev ? { ...prev, password: nextPassword } : prev);
+                }
             }
             if (currentUser?.email) {
                 SupabaseService.insertAppEventLog({
@@ -5444,15 +5521,17 @@ const App: React.FC = () => {
                 alert("Erro: As senhas não coincidem. Verifique os campos em vermelho.");
                 return;
             }
-            if (newPassInput.length < 6) {
+            if (newPassInput.length < 8) {
                 setSaveShake(true);
                 setTimeout(() => setSaveShake(false), 500);
                 alert("Erro: A senha deve ter pelo menos 6 caracteres.");
                 return;
             }
             // Update Password in local state
-            setUsers(prevUsers => prevUsers.map(u => u.email === currentUser.email ? { ...u, password: newPassInput } : u));
-            setCurrentUser(prev => prev ? { ...prev, password: newPassInput } : prev);
+            if (!isGoogleAppsScriptConfigured()) {
+                setUsers(prevUsers => prevUsers.map(u => u.email === currentUser.email ? { ...u, password: newPassInput } : u));
+                setCurrentUser(prev => prev ? { ...prev, password: newPassInput } : prev);
+            }
             // Update Password in Supabase
             await SupabaseService.updateUser(currentUser.email, { password: newPassInput });
             await invalidateUsersCache();
@@ -8212,12 +8291,44 @@ const App: React.FC = () => {
     ]);
 
     useEffect(() => {
-        if (currentView !== 'dashboard') return;
-        const tick = () => setDashboardClockTick(Date.now());
-        tick();
-        const intervalId = window.setInterval(tick, AUDIT_DASHBOARD_REVALIDATE_MS);
-        return () => window.clearInterval(intervalId);
-    }, [currentView]);
+        if (
+            !currentUser ||
+            (currentView !== 'dashboard' && currentView !== 'audit')
+        ) return;
+
+        let active = true;
+        const syncNow = () => {
+            if (!active || document.hidden || !navigator.onLine) return;
+            if (dashboardOpenAuditRequestRef.current || dashboardCompletedAuditRequestRef.current) return;
+            void Promise.allSettled([
+                loadDashboardAuditSessions(true),
+                loadCompletedDashboardAuditSessions(true)
+            ]).finally(() => {
+                if (active) setDashboardClockTick(Date.now());
+            });
+        };
+        const syncWhenVisible = () => {
+            if (!document.hidden) syncNow();
+        };
+
+        syncNow();
+        const intervalId = window.setInterval(syncNow, AUDIT_DASHBOARD_REVALIDATE_MS);
+        window.addEventListener('focus', syncNow);
+        window.addEventListener('online', syncNow);
+        document.addEventListener('visibilitychange', syncWhenVisible);
+        return () => {
+            active = false;
+            window.clearInterval(intervalId);
+            window.removeEventListener('focus', syncNow);
+            window.removeEventListener('online', syncNow);
+            document.removeEventListener('visibilitychange', syncWhenVisible);
+        };
+    }, [
+        currentUser,
+        currentView,
+        loadDashboardAuditSessions,
+        loadCompletedDashboardAuditSessions
+    ]);
 
     const logBranchOptions = useMemo(() => {
         // Usa Map normalizado para deduplicar variações: '8' e 'Filial 8' → 'Filial 8'
@@ -11043,7 +11154,7 @@ const App: React.FC = () => {
                                 </div>
                             </div>
 
-                            {currentUser.role === 'MASTER' && <GoogleDriveConnectionPanel />}
+                            {currentUser.role === 'MASTER' && !isGoogleAppsScriptConfigured() && <GoogleDriveConnectionPanel />}
 
                             {/* Appearance & Company (Primary Card) */}
                             <div className="bg-white/80 backdrop-blur-2xl rounded-[48px] shadow-card border border-white/60 overflow-hidden">
@@ -11770,12 +11881,14 @@ const App: React.FC = () => {
                                                     <label className="block text-xs font-bold text-gray-500 uppercase mb-2">Minha Senha Atual</label>
                                                     <div className="relative">
                                                         <input
-                                                            type={showCurrentPassword ? "text" : "password"}
-                                                            value={(users.find(u => u.email === currentUser.email)?.password ?? currentUser.password ?? '')}
+                                                            type={isGoogleAppsScriptConfigured() ? "text" : (showCurrentPassword ? "text" : "password")}
+                                                            value={isGoogleAppsScriptConfigured()
+                                                                ? 'Protegida pelo servidor'
+                                                                : (users.find(u => u.email === currentUser.email)?.password ?? currentUser.password ?? '')}
                                                             readOnly
                                                             className="w-full rounded-lg p-3 pr-12 outline-none shadow-inner-light bg-white border border-gray-300 text-gray-700 focus:ring-2 focus:ring-gray-200"
                                                         />
-                                                        <button
+                                                        {!isGoogleAppsScriptConfigured() && <button
                                                             type="button"
                                                             onClick={() => setShowCurrentPassword(!showCurrentPassword)}
                                                             className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
@@ -11783,7 +11896,7 @@ const App: React.FC = () => {
                                                             aria-label={showCurrentPassword ? 'Ocultar senha' : 'Mostrar senha'}
                                                         >
                                                             {showCurrentPassword ? <EyeOff size={20} /> : <Eye size={20} />}
-                                                        </button>
+                                                        </button>}
                                                     </div>
                                                 </div>
                                                 <div>
