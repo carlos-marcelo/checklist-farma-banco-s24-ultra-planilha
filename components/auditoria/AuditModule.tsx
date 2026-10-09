@@ -24,6 +24,7 @@ import {
     type DbGlobalBaseFile,
     type DbAuditSession
 } from '../../supabaseService';
+import { BRANCH_DIRECTORY } from '../../src/branchDirectory';
 import { CadastrosBaseService } from '../../src/cadastrosBase/cadastrosBaseService';
 import { CacheService } from '../../src/cacheService';
 import { decodeStoredFilePayloadToFile } from '../../src/filePayload';
@@ -166,8 +167,13 @@ const AUDIT_CAT_IDS_GLOBAL_KEY = 'audit_ids_categoria';
 const ALLOWED_IDS = GROUP_UPLOAD_IDS.map(id => Number(id));
 const FILIAIS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18];
 
-const normalizeAreaName = (value?: string | null) =>
-    String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('pt-BR');
+const normalizeAreaName = (value?: string | null) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const numMatch = raw.match(/\d+/);
+    if (numMatch) return `area ${parseInt(numMatch[0], 10)}`;
+    return raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+};
 
 const normalizeAuditBranchDigits = (digits: string) => digits.replace(/^0+(?=\d)/, '');
 
@@ -2315,12 +2321,30 @@ interface AuditModuleProps {
     initialCompanyId?: string | null;
     initialCompanyName?: string | null;
     forceManualFilialSelection?: boolean;
+    knownAuditSessions?: DbAuditSession[];
     onAuditExited?: () => void;
     onAuditSessionChanged?: (session: DbAuditSession) => void;
     onFilialSelected?: () => void;
 }
 
-const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole, userCompanyId, userArea, userFilial, companies, initialFilial, initialArea, initialCompanyId, initialCompanyName, forceManualFilialSelection = false, onAuditExited, onAuditSessionChanged, onFilialSelected }) => {
+const AuditModule: React.FC<AuditModuleProps> = ({
+    userEmail,
+    userName,
+    userRole,
+    userCompanyId,
+    userArea,
+    userFilial,
+    companies,
+    initialFilial,
+    initialArea,
+    initialCompanyId,
+    initialCompanyName,
+    forceManualFilialSelection = false,
+    knownAuditSessions,
+    onAuditExited,
+    onAuditSessionChanged,
+    onFilialSelected
+}) => {
     const isMaster = userRole === 'MASTER';
     const isAdmin = userRole === 'ADMINISTRATIVO';
     const canUseAuditMasterTools = isMaster || isAdmin;
@@ -2482,6 +2506,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             });
         });
 
+        // Se o usuário possui área (ex: ADMINISTRATIVO da Área 1), garante que todas as filiais dessa área existam
+        if (normalizedUserArea) {
+            BRANCH_DIRECTORY.forEach(entry => {
+                if (normalizeAreaName(entry.area) === normalizedUserArea) {
+                    const value = toAuditBranchValue(entry.branch);
+                    if (value) allowed.add(value);
+                }
+            });
+        }
+
         const userBranch = toAuditBranchValue(userFilial || '');
         if (!isMaster && !normalizedUserArea && userBranch) allowed.add(userBranch);
 
@@ -2495,7 +2529,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         return Array.from(allowed).sort(compareAuditBranchValues);
     }, [isMaster, selectedCompany?.areas, initialFilial, userArea, userFilial]);
     const allowedAuditBranchSet = useMemo(() => new Set(allowedAuditBranches), [allowedAuditBranches]);
-    const [branchAuditsHistory, setBranchAuditsHistory] = useState<DbAuditSession[]>([]);
+    const [branchAuditsHistory, setBranchAuditsHistory] = useState<DbAuditSession[]>(() => {
+        const target = toAuditBranchValue(initialFilial || userFilial || '');
+        if (!target || !knownAuditSessions || knownAuditSessions.length === 0) return [];
+        const matching = knownAuditSessions.filter(s => toAuditBranchValue(s.branch) === target);
+        return [...matching].sort((a, b) => {
+            if (a.audit_number !== b.audit_number) return b.audit_number - a.audit_number;
+            const at = new Date(a.updated_at || a.created_at || 0).getTime();
+            const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+            return bt - at;
+        });
+    });
     const [isLoadingBranchAudits, setIsLoadingBranchAudits] = useState(false);
     const [showCompletedAuditsModal, setShowCompletedAuditsModal] = useState(false);
     const [localPendingAudit, setLocalPendingAudit] = useState<AuditData | null>(null);
@@ -2503,7 +2547,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     const [consultingAuditNumber, setConsultingAuditNumber] = useState<number | null>(null);
     const [allowActiveAuditAutoOpen, setAllowActiveAuditAutoOpen] = useState(false);
     const [isTermsPanelCollapsed, setIsTermsPanelCollapsed] = useState(true);
-    const [nextAuditNumber, setNextAuditNumber] = useState(1);
+    const [nextAuditNumber, setNextAuditNumber] = useState<number>(() => {
+        const target = toAuditBranchValue(initialFilial || userFilial || '');
+        if (!target || !knownAuditSessions || knownAuditSessions.length === 0) return 1;
+        const matching = knownAuditSessions.filter(s => toAuditBranchValue(s.branch) === target);
+        const open = matching.find(s => s.status !== 'completed');
+        if (open) return open.audit_number;
+        const max = matching.reduce((acc, s) => Math.max(acc, Number(s.audit_number) || 0), 0);
+        return max > 0 ? max + 1 : 1;
+    });
     // Persiste o ID da sessão no sessionStorage para sobreviver a refresh/troca de aba
     const CONFIRMED_SESSION_KEY = 'audit_confirmed_session_id';
     const CONFIRMED_SESSION_SET_KEY = 'audit_confirmed_session_ids';
@@ -2908,9 +2960,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 !!candidate.data
             ) || null;
 
-            // Na reentrada, um snapshot cuja versão coincide com o metadado remoto já é
-            // autoritativo. Só baixa o JSON completo quando a versão realmente mudou.
-            const mustFetchFullSnapshot = silent || !latestMeta || !cachedMatchingMeta;
+            // Se o metadado remoto já indica que a auditoria está concluída, não há sessão
+            // aberta para restaurar: podemos resolver o número imediatamente sem baixar o snapshot completo pesado.
+            const isOpenSessionPending = !latestMeta || latestMeta.status !== 'completed';
+            const mustFetchFullSnapshot = isOpenSessionPending && (silent || !cachedMatchingMeta);
             const latestFromDbRaw = mustFetchFullSnapshot
                 ? await fetchLatestAudit(selectedFilial)
                 : null;
@@ -2926,6 +2979,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 latest = latestFromDb;
             } else if (cachedMatchingMeta) {
                 latest = cachedMatchingMeta;
+            } else if (latestMeta && latestMeta.status === 'completed') {
+                latest = { ...latestMeta, branch: selectedFilial, data: null } as any;
             } else {
                 const fallbackCandidates = [cachedCurrent, cachedBackup].filter(Boolean) as DbAuditSession[];
                 if (fallbackCandidates.length > 0) {
@@ -3253,7 +3308,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         }
         const requestedFilial = toAuditBranchValue(selectedFilial);
         let cancelled = false;
-        setBranchAuditsHistory([]);
         setShowCompletedAuditsModal(false);
         const loadBranchHistory = async () => {
             setIsLoadingBranchAudits(true);
@@ -3268,6 +3322,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                     return bt - at;
                 });
                 setBranchAuditsHistory(sorted);
+                const open = sorted.find(s => s.status !== 'completed');
+                const max = sorted.reduce((acc, s) => Math.max(acc, Number(s.audit_number) || 0), 0);
+                if (!dataRef.current && !isReadOnlyCompletedView) {
+                    setNextAuditNumber(open ? open.audit_number : (max > 0 ? max + 1 : 1));
+                }
             } catch (error) {
                 console.error("Erro ao carregar histórico de auditorias da filial:", error);
                 if (!cancelled) setBranchAuditsHistory([]);
@@ -3277,7 +3336,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         };
         void loadBranchHistory();
         return () => { cancelled = true; };
-    }, [selectedFilial, isAuditSessionForBranch]);
+    }, [selectedFilial, isAuditSessionForBranch, isReadOnlyCompletedView]);
 
     const latestOpenAudit = useMemo(
         () => {
@@ -3299,6 +3358,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         },
         [branchAuditsHistory, isAuditSessionForBranch, selectedFilial]
     );
+
+    const maxHistoryAudit = useMemo(() => {
+        return branchAuditsHistory.reduce((acc, a) => Math.max(acc, Number(a.audit_number) || 0), 0);
+    }, [branchAuditsHistory]);
+
+    const effectiveNextAuditNumber = useMemo(() => {
+        if (isReadOnlyCompletedView && consultingAuditNumber !== null) {
+            return consultingAuditNumber;
+        }
+        if (latestOpenAudit) return latestOpenAudit.audit_number;
+        if (maxHistoryAudit > 0) {
+            return Math.max(nextAuditNumber, maxHistoryAudit + 1);
+        }
+        return nextAuditNumber || 1;
+    }, [isReadOnlyCompletedView, consultingAuditNumber, latestOpenAudit, maxHistoryAudit, nextAuditNumber]);
 
     useEffect(() => {
         const markForegroundResume = () => {
@@ -3499,9 +3573,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
     }, [loadAuditNum]);
 
     // Derived inventory number (Auto-generated)
-    const accessedAuditNumber = isReadOnlyCompletedView && consultingAuditNumber !== null
-        ? consultingAuditNumber
-        : nextAuditNumber;
+    const accessedAuditNumber = effectiveNextAuditNumber;
     const inventoryNumber = useMemo(() => {
         return selectedFilial ? `${new Date().getFullYear()}-${selectedFilial.padStart(4, '0')}-${String(accessedAuditNumber).padStart(4, '0')}` : '';
     }, [selectedFilial, accessedAuditNumber]);
@@ -3867,17 +3939,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
         setAllowActiveAuditAutoOpen(false);
         setIsReadOnlyCompletedView(false);
         setConsultingAuditNumber(null);
-        setBranchAuditsHistory([]);
         setShowCompletedAuditsModal(false);
         activeAuditOpenChoiceRef.current.clear();
         lastAuditUpdateRef.current = null;
         lastAutoStockSyncKeyRef.current = '';
         completedAuditConsultationRef.current = false;
+
+        // Immediately seed from knownAuditSessions if available
+        if (normalized && knownAuditSessions && knownAuditSessions.length > 0) {
+            const matching = knownAuditSessions.filter(s => toAuditBranchValue(s.branch) === normalized);
+            const sorted = [...matching].sort((a, b) => {
+                if (a.audit_number !== b.audit_number) return b.audit_number - a.audit_number;
+                const at = new Date(a.updated_at || a.created_at || 0).getTime();
+                const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+                return bt - at;
+            });
+            setBranchAuditsHistory(sorted);
+            const open = sorted.find(s => s.status !== 'completed');
+            const max = sorted.reduce((acc, a) => Math.max(acc, Number(a.audit_number) || 0), 0);
+            setNextAuditNumber(open ? open.audit_number : (max > 0 ? max + 1 : 1));
+        } else {
+            setBranchAuditsHistory([]);
+        }
+
         setSelectedFilial(normalized);
         if (normalized) {
             onFilialSelected?.();
         }
-    }, [onFilialSelected]);
+    }, [knownAuditSessions, onFilialSelected]);
 
     const persistAuditSession = useCallback(async (
         session: DbAuditSession,
@@ -5882,7 +5971,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                 return;
             }
         } else if (!shouldMergeStockOnly) {
-            if (!window.confirm(`ATENÇÃO: Você está prestes a criar um NOVO inventário (Nº ${nextAuditNumber}) para a Filial ${selectedFilial}.\n\nDeseja realmente prosseguir?`)) {
+            if (!window.confirm(`ATENÇÃO: Você está prestes a criar um NOVO inventário (Nº ${effectiveNextAuditNumber}) para a Filial ${selectedFilial}.\n\nDeseja realmente prosseguir?`)) {
                 return;
             }
         }
@@ -6478,7 +6567,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const targetAuditNumber = Number(
                 (shouldReclassifyOpen
                     ? (currentAuditNumber || latestOpenAudit?.audit_number)
-                    : nextAuditNumber) || 1
+                    : effectiveNextAuditNumber) || 1
             );
             const targetSessionId = shouldReclassifyOpen
                 ? (dbSessionId || (
@@ -6593,7 +6682,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
             const savedSession = await persistAuditSession({
                 id: dbSessionId,
                 branch: selectedFilial,
-                audit_number: nextAuditNumber,
+                audit_number: effectiveNextAuditNumber,
                 status: 'open',
                 data: { ...nextData, termDrafts: composeTermDraftsForPersist((((nextData as any)?.termDrafts || {}) as Record<string, TermForm>), (((data as any)?.termDrafts || {}) as Record<string, TermForm>), termDrafts) } as any,
                 progress: progress,
@@ -12491,7 +12580,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                             {isReadOnlyCompletedView && consultingAuditNumber !== null ? (
                                                 <>Visualizando: <span className="font-black text-indigo-700">Nº {consultingAuditNumber}</span></>
                                             ) : (
-                                                <>Próximo automático: <span className="font-black text-indigo-700">Nº {nextAuditNumber}</span></>
+                                                <>Próximo automático: <span className="font-black text-indigo-700">Nº {effectiveNextAuditNumber}</span></>
                                             )}
                                         </p>
                                     </div>
@@ -12515,7 +12604,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({ userEmail, userName, userRole
                                                     ? 'Modo atualização de saldos ativo: use somente Atualizar Somente Saldos'
                                                 : latestOpenAudit
                                                     ? `Existe inventário aberto Nº ${latestOpenAudit.audit_number}`
-                                                    : `Criar novo inventário automático Nº ${nextAuditNumber}`
+                                                    : `Criar novo inventário automático Nº ${effectiveNextAuditNumber}`
                                         }
                                     >
                                         Novo inventário

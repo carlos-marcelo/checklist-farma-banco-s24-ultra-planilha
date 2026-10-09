@@ -19,6 +19,8 @@ import { CadastrosBaseService } from './src/cadastrosBase/cadastrosBaseService';
 import { PRE_VENCIDOS_MODULE_ENABLED } from './src/featureFlags';
 import * as StockStorage from './src/stockConference/storage';
 import {
+    BRANCH_DIRECTORY,
+    getBranchNumber,
     getCompanyAreasSignature,
     resolveBranchArea,
     resolveBranchCity,
@@ -296,7 +298,27 @@ const canonicalizeFilterLabel = (value: string) => {
     });
 };
 
-const normalizeFilterKey = (value: string) => canonicalizeFilterLabel(value).toLowerCase();
+const normalizeFilterKey = (value: string) =>
+    canonicalizeFilterLabel(value || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .trim();
+
+const normalizeAreaKey = (value: unknown): string => {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '';
+    const numMatch = raw.match(/\d+/);
+    if (numMatch) {
+        return `area ${parseInt(numMatch[0], 10)}`;
+    }
+    return raw
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .trim();
+};
+
 const isMobileLayout = () => typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches;
 
 /**
@@ -2147,6 +2169,9 @@ const mapDbReportToHistoryItem = (r: SupabaseService.DbReport): ReportHistoryIte
     // If we have filial but missing area/empresa, we could theoretically look it up from config,
     // but for now let's trust the report data or the fallback found.
 
+    const filialValue = String(foundInfo.filial || r.pharmacy_name || 'Sem Filial').trim();
+    const resolvedArea = String(foundInfo.area || resolveBranchArea(filialValue) || 'Sem Área').trim();
+
     return {
         id: r.id || Date.now().toString(),
         userEmail: r.user_email,
@@ -2160,8 +2185,10 @@ const mapDbReportToHistoryItem = (r: SupabaseService.DbReport): ReportHistoryIte
         ignoredChecklists: r.ignored_checklists || [],
         empresa_avaliada: String(foundInfo.empresa || 'Sem Empresa'),
         companyName: String(foundInfo.empresa || 'Sem Empresa'),
-        area: String(foundInfo.area || 'N/A'),
-        filial: String(foundInfo.filial || r.pharmacy_name || 'Sem Filial'),
+        companyId: (r as any).company_id || (r as any).companyId || null,
+        area: resolvedArea,
+        filial: filialValue,
+        branch: filialValue,
         gestor: String(foundInfo.gestor || 'N/A'),
         createdAt: r.created_at || new Date().toISOString()
     };
@@ -3632,8 +3659,76 @@ const App: React.FC = () => {
         void refreshStockConferenceReports();
     };
 
+    const getScopedBranchFilterValues = useCallback((user?: User | null, compList?: any[]): string[] | null => {
+        const targetUser = user ?? currentUser;
+        if (!targetUser || targetUser.role === 'MASTER') {
+            return null;
+        }
+
+        const variants = new Set<string>();
+
+        const addBranchVariants = (rawBranch: unknown) => {
+            const str = String(rawBranch ?? '').trim();
+            if (!str || str.toLowerCase() === 'sem filial') return;
+            variants.add(str);
+            const num = getBranchNumber(str);
+            if (num !== null) {
+                variants.add(`Filial ${num}`);
+                variants.add(`filial ${num}`);
+                variants.add(`FILIAL ${num}`);
+                variants.add(String(num));
+                variants.add(String(num).padStart(2, '0'));
+                variants.add(`Filial ${String(num).padStart(2, '0')}`);
+                variants.add(`filial ${String(num).padStart(2, '0')}`);
+                variants.add(`FILIAL ${String(num).padStart(2, '0')}`);
+                variants.add(`F${num}`);
+                variants.add(`f${num}`);
+                variants.add(`F${String(num).padStart(2, '0')}`);
+                variants.add(`f${String(num).padStart(2, '0')}`);
+            }
+        };
+
+        if (targetUser.role === 'ADMINISTRATIVO') {
+            const effectiveArea = targetUser.area || resolveBranchArea(targetUser.filial);
+            const userAreaNorm = normalizeAreaKey(effectiveArea || '');
+            if (!userAreaNorm) {
+                return null;
+            }
+
+            BRANCH_DIRECTORY.forEach(entry => {
+                if (normalizeAreaKey(entry.area) === userAreaNorm) {
+                    addBranchVariants(entry.branch);
+                    addBranchVariants(entry.branchNumber);
+                }
+            });
+
+            const effectiveCompList = compList && compList.length > 0 ? compList : companies;
+            effectiveCompList.forEach(c => {
+                (c.areas || []).forEach((a: any) => {
+                    if (normalizeAreaKey(a?.name || '') === userAreaNorm) {
+                        (a.branches || []).forEach((b: any) => {
+                            addBranchVariants(b);
+                        });
+                    }
+                });
+            });
+
+            return variants.size > 0 ? Array.from(variants) : null;
+        }
+
+        if (targetUser.role === 'USER') {
+            if (targetUser.filial && targetUser.filial !== 'Sem Filial') {
+                addBranchVariants(targetUser.filial);
+            }
+            return variants.size > 0 ? Array.from(variants) : null;
+        }
+
+        return null;
+    }, [currentUser, companies]);
+
     const loadStockConferenceHistory = async () => {
-        const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE);
+        const branchFilters = getScopedBranchFilterValues(currentUser);
+        const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, false, branchFilters);
         handleStockReportsLoaded(dbStockReports as SupabaseService.DbStockConferenceReport[]);
         setStockConferencePage(0);
         setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
@@ -3645,7 +3740,8 @@ const App: React.FC = () => {
     };
 
     const refreshStockConferenceReports = async () => {
-        const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE);
+        const branchFilters = getScopedBranchFilterValues(currentUser);
+        const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, false, branchFilters);
         handleStockReportsLoaded(dbStockReports as SupabaseService.DbStockConferenceReport[]);
         setStockConferencePage(0);
         setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
@@ -3777,11 +3873,162 @@ const App: React.FC = () => {
         return Math.abs(hash).toString(36);
     };
 
+    const isUserScopedAllowed = useCallback((params: {
+        user?: User | null;
+        companyId?: string | null;
+        area?: string | null;
+        branch?: string | null;
+        userEmail?: string | null;
+        companies?: any[];
+    }): boolean => {
+        const targetUser = params.user ?? currentUser;
+        if (!targetUser) return false;
+        if (targetUser.role === 'MASTER') return true;
+
+        const { companyId, area, branch, userEmail, companies: compList = companies } = params;
+
+        // Se o próprio autor é o usuário logado, tem sempre permissão de visualizar seu próprio registro
+        if (userEmail && normalizeUserEmail(userEmail) === normalizeUserEmail(targetUser.email)) {
+            return true;
+        }
+
+        // Restrição de Empresa
+        if (targetUser.company_id && companyId && String(companyId).trim() !== String(targetUser.company_id).trim()) {
+            return false;
+        }
+
+        const normRecordArea = normalizeFilterKey(area || '');
+        const normRecordBranch = normalizeBranchLabel(branch || '');
+
+        // Administrador (ADMINISTRATIVO / Gestor de Área)
+        if (targetUser.role === 'ADMINISTRATIVO') {
+            const effectiveUserArea = targetUser.area || resolveBranchArea(targetUser.filial);
+            const userAreaNorm = normalizeAreaKey(effectiveUserArea || '');
+            if (!userAreaNorm) {
+                // Admin sem área específica amarrada tem acesso a toda a empresa vinculada
+                return true;
+            }
+
+            // Bate diretamente por área
+            if (normRecordArea && normalizeAreaKey(normRecordArea) === userAreaNorm) {
+                return true;
+            }
+
+            // Bate se a filial do registro pertencer à área do admin
+            if (normRecordBranch && normRecordBranch !== 'Sem Filial') {
+                // 1. Resolução via diretório de filiais
+                const resolvedArea = resolveBranchArea(normRecordBranch, compList.flatMap(c => c?.areas || []));
+                if (resolvedArea && normalizeAreaKey(resolvedArea) === userAreaNorm) {
+                    return true;
+                }
+
+                // 2. Resolução via áreas configuradas da empresa
+                const isBranchInUserArea = compList.some(c =>
+                    (c.areas || []).some((a: any) =>
+                        normalizeAreaKey(a?.name || '') === userAreaNorm &&
+                        (a.branches || []).some((b: string) => normalizeBranchLabel(b) === normRecordBranch)
+                    )
+                );
+                if (isBranchInUserArea) return true;
+            }
+
+            return false;
+        }
+
+        // Usuário Comum (USER)
+        if (targetUser.role === 'USER') {
+            const userFilialNorm = normalizeBranchLabel(targetUser.filial || '');
+            const userAreaNorm = normalizeAreaKey(targetUser.area || '');
+
+            if (normRecordBranch && normRecordBranch !== 'Sem Filial' && userFilialNorm !== 'Sem Filial') {
+                return normRecordBranch === userFilialNorm;
+            }
+
+            if (normRecordArea && userAreaNorm) {
+                return normalizeAreaKey(normRecordArea) === userAreaNorm;
+            }
+
+            return false;
+        }
+
+        return false;
+    }, [currentUser, companies]);
+
+    const scopedCompanies = useMemo(() => {
+        if (!currentUser) return [];
+        if (currentUser.role === 'MASTER') return companies;
+
+        const effectiveCompanies = companies.length > 0 ? companies : [{ id: 'drogaria-cidade', name: 'Drogaria Cidade', areas: [] }];
+        const companyList = currentUser.company_id
+            ? (effectiveCompanies.filter(c => c.id === currentUser.company_id).length > 0
+                ? effectiveCompanies.filter(c => c.id === currentUser.company_id)
+                : effectiveCompanies)
+            : effectiveCompanies;
+
+        if (currentUser.role === 'ADMINISTRATIVO') {
+            const adminAreaNorm = normalizeAreaKey(currentUser.area || '');
+            if (!adminAreaNorm) return companyList;
+
+            return companyList.map(c => {
+                const stabilizedAreas = stabilizeCompanyAreas(c?.name, c?.areas);
+                const filteredAreas = (stabilizedAreas || []).filter((a: any) => normalizeAreaKey(a?.name || '') === adminAreaNorm);
+                return {
+                    ...c,
+                    areas: filteredAreas.length > 0 ? filteredAreas : (c.areas || []).filter((a: any) => normalizeAreaKey(a?.name || '') === adminAreaNorm)
+                };
+            });
+        }
+
+        if (currentUser.role === 'USER') {
+            const userFilialNorm = normalizeBranchLabel(currentUser.filial || '');
+            const userAreaNorm = normalizeAreaKey(currentUser.area || '');
+
+            return companyList.map(c => {
+                const stabilizedAreas = stabilizeCompanyAreas(c?.name, c?.areas);
+                return {
+                    ...c,
+                    areas: (stabilizedAreas || [])
+                        .filter((a: any) => !userAreaNorm || normalizeAreaKey(a?.name || '') === userAreaNorm)
+                        .map((a: any) => ({
+                            ...a,
+                            branches: userFilialNorm !== 'Sem Filial'
+                                ? (a.branches || []).filter((b: string) => normalizeBranchLabel(b) === userFilialNorm)
+                                : a.branches
+                        }))
+                        .filter((a: any) => (a.branches || []).length > 0)
+                };
+            });
+        }
+
+        return companyList;
+    }, [companies, currentUser]);
+
+    const getScopedReportCacheKey = useCallback((user?: User | null) => {
+        const target = user ?? currentUser;
+        if (!target) return 'CACHE_REPORT_HISTORY_ANON';
+        const role = target.role || 'USER';
+        const comp = target.company_id || 'all';
+        const area = normalizeFilterKey(target.area || 'all');
+        const filial = normalizeBranchLabel(target.filial || 'all');
+        return `CACHE_REPORT_HISTORY_${role}_${comp}_${area}_${filial}`;
+    }, [currentUser]);
+
+    const getScopedStockCacheKey = useCallback((user?: User | null) => {
+        const target = user ?? currentUser;
+        if (!target) return 'CACHE_STOCK_HISTORY_ANON';
+        const role = target.role || 'USER';
+        const comp = target.company_id || 'all';
+        const area = normalizeFilterKey(target.area || 'all');
+        const filial = normalizeBranchLabel(target.filial || 'all');
+        return `CACHE_STOCK_HISTORY_${role}_${comp}_${area}_${filial}`;
+    }, [currentUser]);
+
     const buildAuditDashboardCacheKey = (status: 'open' | 'completed', branches: string[]) => {
+        const userScope = currentUser ? `${currentUser.role}_${currentUser.company_id || 'all'}_${currentUser.area || 'all'}_${currentUser.filial || 'all'}` : 'anon';
         const scope = branches.length > 0
             ? branches.slice().sort((a, b) => a.localeCompare(b, 'pt-BR')).join('|')
             : 'all';
-        return `${CACHE_KEY_AUDIT_DASHBOARD_PREFIX}_${status}_${hashCacheKey(scope)}`;
+        return `${CACHE_KEY_AUDIT_DASHBOARD_PREFIX}_${status}_${hashCacheKey(`${userScope}__${scope}`)}`;
     };
 
     const buildAuditMetadataSignature = (rows: Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'updated_at' | 'created_at'>>) =>
@@ -3816,6 +4063,12 @@ const App: React.FC = () => {
             .join('|');
 
     const refreshUsersIfChanged = async (applyUsers?: (rows: any[]) => void) => {
+        if (currentUser && currentUser.role !== 'MASTER' && currentUser.role !== 'ADMINISTRATIVO' && !hasModuleAccess('userManagement') && !hasModuleAccess('userApproval')) {
+            const selfRows = [currentUser as any];
+            if (applyUsers) applyUsers(selfRows);
+            return selfRows;
+        }
+
         const [metadata, cachedSignature] = await Promise.all([
             SupabaseService.fetchUsersMetadata(),
             CacheService.get<string>(CACHE_KEY_USERS_META)
@@ -3874,10 +4127,16 @@ const App: React.FC = () => {
     };
 
     const clearHistoryCache = () => {
+        const reportKey = getScopedReportCacheKey(currentUser);
+        const stockKey = getScopedStockCacheKey(currentUser);
         sessionStorage.removeItem(CACHE_KEY_REPORTS);
         sessionStorage.removeItem(CACHE_KEY_STOCK);
+        sessionStorage.removeItem(reportKey);
+        sessionStorage.removeItem(stockKey);
         void CacheService.remove(CACHE_KEY_REPORTS);
         void CacheService.remove(CACHE_KEY_STOCK);
+        void CacheService.remove(reportKey);
+        void CacheService.remove(stockKey);
     };
 
     const handleReloadReports = async () => {
@@ -3889,21 +4148,66 @@ const App: React.FC = () => {
             setHasMoreReports(true);
             setStockConferencePage(0);
             setHasMoreStockConferences(true);
+            const branchFilters = getScopedBranchFilterValues(currentUser, scopedCompanies);
             const [dbReports, dbStockReports] = await Promise.all([
-                SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE),
-                SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE)
+                SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, false),
+                SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, false, branchFilters)
             ]);
-            const formattedReports = dbReports.map(mapDbReportToHistoryItem);
-            setReportHistory(formattedReports);
-            setHasMoreReports(dbReports.length === REPORTS_PAGE_SIZE);
-            handleStockReportsLoaded(dbStockReports as SupabaseService.DbStockConferenceReport[]);
+            let allDbReports = [...dbReports];
+            let allFormattedReports = dbReports
+                .map(mapDbReportToHistoryItem)
+                .filter(r => isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: r.companyId,
+                    area: r.area || resolveBranchArea(r.filial || r.branch),
+                    branch: r.filial || r.branch,
+                    userEmail: r.userEmail,
+                    companies: scopedCompanies
+                }));
+            let currentReportsPage = 0;
+            // Se o usuário tem escopo restrito e a primeira página veio sem registros dele, avança automaticamente
+            while (allFormattedReports.length === 0 && allDbReports.length === REPORTS_PAGE_SIZE * (currentReportsPage + 1) && currentReportsPage < 5) {
+                currentReportsPage++;
+                const nextBatch = await SupabaseService.fetchReportsSummary(currentReportsPage, REPORTS_PAGE_SIZE, false);
+                if (!nextBatch || nextBatch.length === 0) break;
+                allDbReports = [...allDbReports, ...nextBatch];
+                const nextFormatted = nextBatch
+                    .map(mapDbReportToHistoryItem)
+                    .filter(r => isUserScopedAllowed({
+                        user: currentUser,
+                        companyId: r.companyId,
+                        area: r.area || resolveBranchArea(r.filial || r.branch),
+                        branch: r.filial || r.branch,
+                        userEmail: r.userEmail,
+                        companies: scopedCompanies
+                    }));
+                allFormattedReports = [...allFormattedReports, ...nextFormatted];
+                if (nextBatch.length < REPORTS_PAGE_SIZE) break;
+            }
+
+            const scopedStockReports = (dbStockReports as SupabaseService.DbStockConferenceReport[]).filter(r =>
+                isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: (r as any).company_id || (r as any).companyId,
+                    area: r.area || resolveBranchArea(r.branch || (r as any).filial),
+                    branch: r.branch || (r as any).filial,
+                    userEmail: (r as any).userEmail || (r as any).user_email,
+                    companies: scopedCompanies
+                })
+            );
+            setReportHistory(allFormattedReports);
+            setReportsPage(currentReportsPage);
+            setHasMoreReports(allDbReports.length % REPORTS_PAGE_SIZE === 0 && allDbReports.length > 0);
+            handleStockReportsLoaded(scopedStockReports);
             setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
-            saveHistoryCache(CACHE_KEY_REPORTS, formattedReports);
-            saveHistoryCache(CACHE_KEY_STOCK, dbStockReports);
-            await CacheService.set(CACHE_KEY_REPORTS, dbReports);
-            await CacheService.set(CACHE_KEY_STOCK, dbStockReports);
+            const reportKey = getScopedReportCacheKey(currentUser);
+            const stockKey = getScopedStockCacheKey(currentUser);
+            saveHistoryCache(reportKey, allFormattedReports);
+            saveHistoryCache(stockKey, scopedStockReports);
+            await CacheService.set(reportKey, allDbReports);
+            await CacheService.set(stockKey, scopedStockReports);
             setLastHistoryCacheAt(new Date());
-            console.log('✅ Relatórios recarregados:', formattedReports.length, '| Conferências:', dbStockReports.length);
+            console.log('✅ Relatórios recarregados:', allFormattedReports.length, '| Conferências:', scopedStockReports.length);
         } catch (error) {
             console.error('❌ Erro ao recarregar:', error);
             alert('Erro ao recarregar relatórios.');
@@ -3916,16 +4220,42 @@ const App: React.FC = () => {
         if (isLoadingMore || !hasMoreReports) return;
         setIsLoadingMore(true);
         try {
-            const nextPage = reportsPage + 1;
-            const dbReports = await SupabaseService.fetchReportsSummary(nextPage, REPORTS_PAGE_SIZE);
-            if (dbReports.length > 0) {
-                const formattedReports = dbReports.map(mapDbReportToHistoryItem);
-                setReportHistory(prev => [...prev, ...formattedReports]);
-                setReportsPage(nextPage);
-                setHasMoreReports(dbReports.length === REPORTS_PAGE_SIZE);
-            } else {
-                setHasMoreReports(false);
+            let nextPage = reportsPage + 1;
+            let keepSearching = true;
+            let lastBatchLength = 0;
+            let accumulatedFormatted: ReportHistoryItem[] = [];
+
+            while (keepSearching) {
+                const dbReports = await SupabaseService.fetchReportsSummary(nextPage, REPORTS_PAGE_SIZE, false);
+                lastBatchLength = dbReports.length;
+                if (dbReports.length > 0) {
+                    const formattedReports = dbReports
+                        .map(mapDbReportToHistoryItem)
+                        .filter(r => isUserScopedAllowed({
+                            user: currentUser,
+                            companyId: r.companyId,
+                            area: r.area || resolveBranchArea(r.filial || r.branch),
+                            branch: r.filial || r.branch,
+                            userEmail: r.userEmail,
+                            companies: scopedCompanies
+                        }));
+                    accumulatedFormatted = [...accumulatedFormatted, ...formattedReports];
+                    // Para se achou relatórios no escopo ou se o banco retornou menos que uma página cheia
+                    if (formattedReports.length > 0 || dbReports.length < REPORTS_PAGE_SIZE) {
+                        keepSearching = false;
+                    } else {
+                        nextPage++;
+                    }
+                } else {
+                    keepSearching = false;
+                }
             }
+
+            if (accumulatedFormatted.length > 0) {
+                setReportHistory(prev => [...prev, ...accumulatedFormatted]);
+            }
+            setReportsPage(nextPage);
+            setHasMoreReports(lastBatchLength === REPORTS_PAGE_SIZE);
         } catch (error) {
             console.error('❌ Erro ao carregar mais relatórios:', error);
         } finally {
@@ -3938,9 +4268,20 @@ const App: React.FC = () => {
         setIsLoadingMoreStock(true);
         try {
             const nextPage = stockConferencePage + 1;
-            const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(nextPage, STOCK_PAGE_SIZE);
+            const branchFilters = getScopedBranchFilterValues(currentUser, scopedCompanies);
+            const dbStockReports = await SupabaseService.fetchStockConferenceReportsSummaryPage(nextPage, STOCK_PAGE_SIZE, false, branchFilters);
             if (dbStockReports.length > 0) {
-                handleStockReportsLoaded(dbStockReports as SupabaseService.DbStockConferenceReport[], true);
+                const scopedStockReports = (dbStockReports as SupabaseService.DbStockConferenceReport[]).filter(r =>
+                    isUserScopedAllowed({
+                        user: currentUser,
+                        companyId: (r as any).company_id || (r as any).companyId,
+                        area: r.area || resolveBranchArea(r.branch || (r as any).filial),
+                        branch: r.branch || (r as any).filial,
+                        userEmail: (r as any).userEmail || (r as any).user_email,
+                        companies: scopedCompanies
+                    })
+                );
+                handleStockReportsLoaded(scopedStockReports, true);
                 setStockConferencePage(nextPage);
                 setHasMoreStockConferences(dbStockReports.length === STOCK_PAGE_SIZE);
             } else {
@@ -4030,7 +4371,16 @@ const App: React.FC = () => {
 
         const applyReports = (rows: any[] | null | undefined) => {
             if (!rows || cancelled) return;
-            const formatted = rows.map(mapDbReportToHistoryItem);
+            const formatted = rows
+                .map(mapDbReportToHistoryItem)
+                .filter(r => isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: r.companyId,
+                    area: r.area || resolveBranchArea(r.filial || r.branch),
+                    branch: r.filial || r.branch,
+                    userEmail: r.userEmail,
+                    companies: scopedCompanies
+                }));
             setReportHistory(formatted);
             setHasMoreReports(rows.length === REPORTS_PAGE_SIZE);
             setReportsPage(0);
@@ -4039,7 +4389,17 @@ const App: React.FC = () => {
 
         const applyStockReports = (rows: any[] | null | undefined) => {
             if (!rows || cancelled) return;
-            handleStockReportsLoaded(rows as SupabaseService.DbStockConferenceReport[]);
+            const scopedRows = (rows as SupabaseService.DbStockConferenceReport[]).filter(r =>
+                isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: (r as any).company_id || (r as any).companyId,
+                    area: r.area || resolveBranchArea(r.branch || (r as any).filial),
+                    branch: r.branch || (r as any).filial,
+                    userEmail: (r as any).userEmail || (r as any).user_email,
+                    companies: scopedCompanies
+                })
+            );
+            handleStockReportsLoaded(scopedRows);
             setHasMoreStockConferences(rows.length === STOCK_PAGE_SIZE);
             setStockConferencePage(0);
             setLastHistoryCacheAt(new Date());
@@ -4047,15 +4407,23 @@ const App: React.FC = () => {
 
         const applyCompanies = (rows: any[] | null | undefined) => {
             if (!rows || rows.length === 0 || cancelled) return;
-            setCompanies(rows.map(company => ({
+            const mapped = rows.map(company => ({
                 ...company,
                 areas: stabilizeCompanyAreas(company?.name, company?.areas)
-            })));
+            }));
+            setCompanies(prev => {
+                if (prev.length === mapped.length && JSON.stringify(prev) === JSON.stringify(mapped)) return prev;
+                return mapped;
+            });
         };
 
         const applyAccessMatrix = (rows: any[] | null | undefined) => {
             if (!rows || rows.length === 0 || cancelled) return;
-            setAccessMatrix(mapAccessRowsToMatrix(rows));
+            const mapped = mapAccessRowsToMatrix(rows);
+            setAccessMatrix(prev => {
+                if (JSON.stringify(prev) === JSON.stringify(mapped)) return prev;
+                return mapped;
+            });
         };
 
         const applyDeferred = <T,>(apply: (value: T) => void) => (value: T) => {
@@ -4085,13 +4453,16 @@ const App: React.FC = () => {
         };
 
         const preloadSecondaryData = async () => {
+            const reportKey = getScopedReportCacheKey(currentUser);
+            const stockKey = getScopedStockCacheKey(currentUser);
+            const branchFilters = getScopedBranchFilterValues(currentUser, scopedCompanies);
             await Promise.allSettled([
-                CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyDeferred(applyReports), {
+                CacheService.fetchWithCache(reportKey, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyDeferred(applyReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
                     revalidate: 'always',
                     timeoutMs: 10000
                 }),
-                CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true), applyDeferred(applyStockReports), {
+                CacheService.fetchWithCache(stockKey, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true, branchFilters), applyDeferred(applyStockReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
                     revalidate: 'always',
                     timeoutMs: 10000
@@ -4122,13 +4493,15 @@ const App: React.FC = () => {
                     localStorage.setItem(GOOGLE_DATA_CACHE_VERSION_KEY, GOOGLE_DATA_CACHE_VERSION);
                 }
 
+                const reportKey = getScopedReportCacheKey(currentUser);
+                const stockKey = getScopedStockCacheKey(currentUser);
                 const cached = await CacheService.getMany<any>([
                     CACHE_KEY_USERS,
                     CACHE_KEY_CONFIG,
                     CACHE_KEY_COMPANIES,
                     CACHE_KEY_ACCESS,
-                    CACHE_KEY_REPORTS,
-                    CACHE_KEY_STOCK,
+                    reportKey,
+                    stockKey,
                     CACHE_KEY_TICKETS
                 ]);
 
@@ -4136,8 +4509,8 @@ const App: React.FC = () => {
                 applyConfig(cached[CACHE_KEY_CONFIG]);
                 applyCompanies(cached[CACHE_KEY_COMPANIES] as any[]);
                 applyAccessMatrix(cached[CACHE_KEY_ACCESS] as any[]);
-                applyReports(cached[CACHE_KEY_REPORTS] as any[]);
-                applyStockReports(cached[CACHE_KEY_STOCK] as any[]);
+                applyReports(cached[reportKey] as any[]);
+                applyStockReports(cached[stockKey] as any[]);
                 if (cached[CACHE_KEY_TICKETS] && !cancelled) setTickets(cached[CACHE_KEY_TICKETS] as DbTicket[]);
 
                 // F5/refresh sempre volta para o dashboard inicial.
@@ -4166,7 +4539,7 @@ const App: React.FC = () => {
         return () => {
             cancelled = true;
         };
-    }, [currentUser?.email]);
+    }, [currentUser?.email, currentUser?.role, currentUser?.area, currentUser?.filial, currentUser?.company_id]);
 
     useEffect(() => {
         let cancelled = false;
@@ -4220,9 +4593,21 @@ const App: React.FC = () => {
         if (currentView !== 'history') return;
         let cancelled = false;
 
+        const reportKey = getScopedReportCacheKey(currentUser);
+        const stockKey = getScopedStockCacheKey(currentUser);
+
         const applyReports = (rows: any[] | null | undefined) => {
             if (cancelled || !rows) return;
-            const formatted = rows.map(mapDbReportToHistoryItem);
+            const formatted = rows
+                .map(mapDbReportToHistoryItem)
+                .filter(r => isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: r.companyId,
+                    area: r.area || resolveBranchArea(r.filial || r.branch),
+                    branch: r.filial || r.branch,
+                    userEmail: r.userEmail,
+                    companies: scopedCompanies
+                }));
             setReportHistory(formatted);
             setHasMoreReports(rows.length === REPORTS_PAGE_SIZE);
             setReportsPage(0);
@@ -4231,19 +4616,31 @@ const App: React.FC = () => {
 
         const applyStockReports = (rows: any[] | null | undefined) => {
             if (cancelled || !rows) return;
-            handleStockReportsLoaded(rows as SupabaseService.DbStockConferenceReport[]);
+            const scopedRows = (rows as SupabaseService.DbStockConferenceReport[]).filter(r =>
+                isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: (r as any).company_id || (r as any).companyId,
+                    area: r.area || resolveBranchArea(r.branch || (r as any).filial),
+                    branch: r.branch || (r as any).filial,
+                    userEmail: (r as any).userEmail || (r as any).user_email,
+                    companies: scopedCompanies
+                })
+            );
+            handleStockReportsLoaded(scopedRows);
             setHasMoreStockConferences(rows.length === STOCK_PAGE_SIZE);
             setStockConferencePage(0);
             setLastHistoryCacheAt(new Date());
         };
 
+        const branchFilters = getScopedBranchFilterValues(currentUser, scopedCompanies);
+
         Promise.allSettled([
-            CacheService.fetchWithCache(CACHE_KEY_REPORTS, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyReports, {
+            CacheService.fetchWithCache(reportKey, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyReports, {
                 maxAgeMs: 30 * 1000,
                 revalidate: 'stale',
                 timeoutMs: 10000
             }).then(applyReports),
-            CacheService.fetchWithCache(CACHE_KEY_STOCK, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true), applyStockReports, {
+            CacheService.fetchWithCache(stockKey, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true, branchFilters), applyStockReports, {
                 maxAgeMs: 30 * 1000,
                 revalidate: 'stale',
                 timeoutMs: 10000
@@ -4320,15 +4717,17 @@ const App: React.FC = () => {
         if (currentUser) {
             const freshUser = users.find(u => u.email === currentUser.email);
             if (freshUser) {
+                const freshCompanyId = freshUser.company_id || currentUser.company_id || null;
+                const companyChanged = Boolean(freshUser.company_id && freshUser.company_id !== currentUser.company_id);
                 if (freshUser.name !== currentUser.name ||
                     freshUser.phone !== currentUser.phone ||
                     freshUser.photo !== currentUser.photo ||
                     freshUser.preferredTheme !== currentUser.preferredTheme ||
-                    freshUser.company_id !== currentUser.company_id ||
+                    companyChanged ||
                     freshUser.area !== currentUser.area ||
                     freshUser.filial !== currentUser.filial ||
                     freshUser.role !== currentUser.role) {
-                    setCurrentUser(freshUser);
+                    setCurrentUser({ ...freshUser, company_id: freshCompanyId });
                 }
             }
         }
@@ -4387,11 +4786,21 @@ const App: React.FC = () => {
                 }
                 return;
             }
-            if (currentUser.role === 'ADMINISTRATIVO' && String(currentUser.area || '').trim()) {
-                if (!cancelled) {
-                    setShowBranchSelectionModal(false);
-                    setBranchPromptCheckedForUser(currentUser.email);
+            if (currentUser.role === 'ADMINISTRATIVO') {
+                if (String(currentUser.area || '').trim()) {
+                    if (!cancelled) {
+                        setShowBranchSelectionModal(false);
+                        setBranchPromptCheckedForUser(currentUser.email);
+                    }
+                    return;
                 }
+                if (cancelled) return;
+                setBranchSelectionMode('required');
+                setBranchSelectionValue(currentUser.filial || '');
+                setBranchSelectionArea('');
+                setBranchSelectionMessage('Selecione sua Área de atuação administrativa para continuar.');
+                setShowBranchSelectionModal(true);
+                setBranchPromptCheckedForUser(currentUser.email);
                 return;
             }
             if (currentUser.company_id && companies.length === 0) return;
@@ -4621,36 +5030,46 @@ const App: React.FC = () => {
 
     const handleSaveBranchSelection = async () => {
         if (!currentUser) return;
+        const isAdm = currentUser.role === 'ADMINISTRATIVO';
         const selectedBranch = (branchSelectionValue || '').trim();
-        if (!selectedBranch) {
+        const resolvedCompanyId = currentUser.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        const resolvedArea = resolveAreaFromCompanyBranch(resolvedCompanyId, selectedBranch) || branchSelectionArea || currentUser.area || '';
+
+        if (!selectedBranch && !isAdm) {
             alert('Selecione uma filial para continuar.');
             return;
         }
+        if (!resolvedArea && isAdm && !selectedBranch) {
+            alert('Selecione uma área para continuar.');
+            return;
+        }
 
-        const resolvedArea = resolveAreaFromCompanyBranch(currentUser.company_id, selectedBranch) || branchSelectionArea || '';
         setIsSavingBranchSelection(true);
         try {
             const previousBranch = currentUser.filial || null;
             const previousArea = currentUser.area || null;
             setUsers(prev => prev.map(u => u.email === currentUser.email ? {
                 ...u,
-                filial: selectedBranch,
+                company_id: resolvedCompanyId || u.company_id || null,
+                filial: selectedBranch || null,
                 area: resolvedArea || null
             } : u));
             setCurrentUser(prev => prev && prev.email === currentUser.email ? {
                 ...prev,
-                filial: selectedBranch,
+                company_id: resolvedCompanyId || prev.company_id || null,
+                filial: selectedBranch || null,
                 area: resolvedArea || null
             } : prev);
             setShowBranchSelectionModal(false);
 
             const updated = await SupabaseService.updateUser(currentUser.email, {
-                filial: selectedBranch,
+                company_id: resolvedCompanyId || null,
+                filial: selectedBranch || null,
                 area: resolvedArea || null
             });
 
             if (!updated) {
-                alert('Não foi possível salvar a filial no momento.');
+                alert('Não foi possível salvar os dados no momento.');
                 return;
             }
 
@@ -4928,9 +5347,33 @@ const App: React.FC = () => {
         return true;
     });
 
+    const scopedStockConferenceHistory = useMemo(() => {
+        if (!currentUser) return [];
+        return stockConferenceHistory.filter(item => isUserScopedAllowed({
+            user: currentUser,
+            companyId: (item as any).company_id || (item as any).companyId,
+            area: item.area || resolveBranchArea(item.branch),
+            branch: item.branch || (item as any).filial,
+            userEmail: (item as any).userEmail || (item as any).user_email,
+            companies: scopedCompanies
+        }));
+    }, [stockConferenceHistory, currentUser, scopedCompanies, isUserScopedAllowed]);
+
+    const scopedPendingStockReports = useMemo(() => {
+        if (!currentUser) return [];
+        return pendingStockReports.filter(item => isUserScopedAllowed({
+            user: currentUser,
+            companyId: (item as any).company_id || (item as any).companyId,
+            area: item.area || resolveBranchArea(item.branch),
+            branch: item.branch || (item as any).filial,
+            userEmail: (item as any).userEmail || (item as any).user_email,
+            companies: scopedCompanies
+        }));
+    }, [pendingStockReports, currentUser, scopedCompanies, isUserScopedAllowed]);
+
     const stockConferenceBranchOptions = useMemo(() => {
         const map = new Map<string, string>();
-        const combined = [...pendingStockReports, ...stockConferenceHistory];
+        const combined = [...scopedPendingStockReports, ...scopedStockConferenceHistory];
         combined.forEach(item => {
             const branchValue = sanitizeStockBranch(item.branch);
             const key = normalizeFilterKey(branchValue);
@@ -4941,12 +5384,12 @@ const App: React.FC = () => {
         return Array.from(map.entries())
             .map(([key, label]) => ({ key, label }))
             .sort((a, b) => a.label.localeCompare(b.label));
-    }, [stockConferenceHistory, pendingStockReports]);
+    }, [scopedStockConferenceHistory, scopedPendingStockReports]);
     const stockConferenceBranchKeys = useMemo(() => stockConferenceBranchOptions.map(option => option.key), [stockConferenceBranchOptions]);
 
     const stockConferenceAreaOptions = useMemo(() => {
         const map = new Map<string, string>();
-        const combined = [...pendingStockReports, ...stockConferenceHistory];
+        const combined = [...scopedPendingStockReports, ...scopedStockConferenceHistory];
         combined.forEach(item => {
             const label = canonicalizeFilterLabel(sanitizeStockArea(item.area));
             const key = normalizeFilterKey(label);
@@ -4957,23 +5400,24 @@ const App: React.FC = () => {
         return Array.from(map.entries())
             .map(([key, label]) => ({ key, label }))
             .sort((a, b) => a.label.localeCompare(b.label));
-    }, [stockConferenceHistory, pendingStockReports]);
+    }, [scopedStockConferenceHistory, scopedPendingStockReports]);
     const stockConferenceAreaKeys = useMemo(() => stockConferenceAreaOptions.map(option => option.key), [stockConferenceAreaOptions]);
 
     const filteredStockConferenceHistory = useMemo(() => {
         // Pending reports always bypass filters and stay at the top
-        const pending = pendingStockReports.filter(p => p.id && String(p.id).startsWith('pending_'));
+        const pending = scopedPendingStockReports.filter(p => p.id && String(p.id).startsWith('pending_'));
         
-        const filteredFromHistory = stockConferenceHistory.filter(item => {
+        const filteredFromHistory = scopedStockConferenceHistory.filter(item => {
             const branchKey = normalizeFilterKey(sanitizeStockBranch(item.branch));
-            const areaKey = normalizeFilterKey(sanitizeStockArea(item.area));
+            const effectiveArea = item.area || resolveBranchArea(item.branch);
+            const areaKey = normalizeAreaKey(effectiveArea);
             const matchesBranch = stockBranchFilters.length === 0 || stockBranchFilters.includes(branchKey);
-            const matchesArea = stockAreaFilter === 'all' || areaKey === stockAreaFilter;
+            const matchesArea = stockAreaFilter === 'all' || areaKey === normalizeAreaKey(stockAreaFilter);
             return matchesBranch && matchesArea;
         });
 
         return [...pending, ...filteredFromHistory];
-    }, [stockConferenceHistory, pendingStockReports, stockBranchFilters, stockAreaFilter]);
+    }, [scopedStockConferenceHistory, scopedPendingStockReports, stockBranchFilters, stockAreaFilter]);
 
     const stockMobileTotalPages = useMemo(() => {
         return Math.max(1, Math.ceil(filteredStockConferenceHistory.length / MOBILE_STOCK_HISTORY_PAGE_SIZE));
@@ -5008,11 +5452,36 @@ const App: React.FC = () => {
         // Persist session so F5 doesn't log the user out
         localStorage.setItem('APP_CURRENT_EMAIL', user.email);
         localStorage.setItem('APP_CURRENT_VIEW', 'dashboard');
-        setCurrentView('dashboard');
         setCurrentUser(user);
         setBranchPromptCheckedForUser(null);
         setShowBranchSelectionModal(false);
         clearAuditManualBranchSelectionRequired();
+        setAuditJumpFilial('');
+        setAuditJumpArea('');
+        setAuditJumpCompanyId('');
+        setAuditJumpCompanyName('');
+        setIsAuditCrossPanelExpanded(false);
+        setDashboardAuditSessions([]);
+        setDashboardCompletedAuditSessions([]);
+        setHistoryFilterUser('all');
+        setHistoryAreaFilter('all');
+        setStockBranchFilters([]);
+        setStockAreaFilter('all');
+        setOpenAuditNumberFilter('all');
+        setOpenAuditAreaFilter('all');
+        setCompletedAuditNumberFilter('all');
+        setCompletedAuditAreaFilter('all');
+        setAppEventLogs([]);
+        setFormData({});
+        setImages({});
+        setSignatures({});
+        setViewHistoryItem(null);
+        setViewingStockConferenceReport(null);
+        setDraftLoaded(false);
+        setLoadedDraftEmail(null);
+        try {
+            sessionStorage.clear();
+        } catch { }
 
         SupabaseService.insertAppEventLog({
             company_id: user.company_id || null,
@@ -5062,6 +5531,14 @@ const App: React.FC = () => {
         localStorage.removeItem('APP_VIEW_HISTORY_ITEM');
         localStorage.removeItem('APP_VIEW_STOCK_REPORT');
         clearAuditManualBranchSelectionRequired();
+        setAuditJumpFilial('');
+        setAuditJumpArea('');
+        setAuditJumpCompanyId('');
+        setAuditJumpCompanyName('');
+        setIsAuditCrossPanelExpanded(false);
+        try {
+            sessionStorage.clear();
+        } catch { }
 
         setBranchPromptCheckedForUser(null);
         setShowBranchSelectionModal(false);
@@ -5073,17 +5550,30 @@ const App: React.FC = () => {
         setViewingStockConferenceReport(null);
         setRemoteForceLogoutDeadline(null);
         setCurrentView('dashboard');
+        setDashboardAuditSessions([]);
+        setDashboardCompletedAuditSessions([]);
+        setHistoryFilterUser('all');
+        setHistoryAreaFilter('all');
+        setStockBranchFilters([]);
+        setStockAreaFilter('all');
+        setOpenAuditNumberFilter('all');
+        setOpenAuditAreaFilter('all');
+        setCompletedAuditNumberFilter('all');
+        setCompletedAuditAreaFilter('all');
+        setAppEventLogs([]);
+        setDraftLoaded(false);
+        setLoadedDraftEmail(null);
+        void CacheService.clear();
+        localStorage.removeItem('APP_USERS');
+        setUsers([]);
+        setCompanies([]);
+        setReportHistory([]);
+        setStockConferenceHistory([]);
+        setStockConferenceReportsRaw([]);
+        setTickets([]);
+        setAccessMatrix(createInitialAccessMatrix());
         if (isGoogleAppsScriptConfigured()) {
             void googleAppsScriptClient.logout();
-            void CacheService.clear();
-            localStorage.removeItem('APP_USERS');
-            setUsers([]);
-            setCompanies([]);
-            setReportHistory([]);
-            setStockConferenceHistory([]);
-            setStockConferenceReportsRaw([]);
-            setTickets([]);
-            setAccessMatrix(createInitialAccessMatrix());
         }
         logoutInFlightRef.current = false;
     }, [clearAuditManualBranchSelectionRequired, currentUser, currentView]);
@@ -6237,8 +6727,17 @@ const App: React.FC = () => {
 
             // Force refresh reports from Supabase to ensure sync across devices
             console.log('🔄 Recarregando todos os relatórios do Supabase...');
-            const dbReports = await SupabaseService.fetchReportsSummary(0, 30);
-            const formattedReports = dbReports.map(mapDbReportToHistoryItem);
+            const dbReports = await SupabaseService.fetchReportsSummary(0, 30, false);
+            const formattedReports = dbReports
+                .map(mapDbReportToHistoryItem)
+                .filter(r => isUserScopedAllowed({
+                    user: currentUser,
+                    companyId: r.companyId,
+                    area: r.area || resolveBranchArea(r.filial || r.branch),
+                    branch: r.filial || r.branch,
+                    userEmail: r.userEmail,
+                    companies: scopedCompanies
+                }));
             setReportHistory(formattedReports);
             await refreshStockConferenceReports();
             console.log('✅ Relatórios atualizados:', formattedReports.length, 'itens');
@@ -6270,7 +6769,16 @@ const App: React.FC = () => {
             // Em caso de erro, tentar recarregar relatórios do Supabase
             try {
                 const dbReports = await SupabaseService.fetchReports();
-                const formattedReports = dbReports.map(mapDbReportToHistoryItem);
+                const formattedReports = dbReports
+                    .map(mapDbReportToHistoryItem)
+                    .filter(r => isUserScopedAllowed({
+                        user: currentUser,
+                        companyId: r.companyId,
+                        area: r.area || resolveBranchArea(r.filial || r.branch),
+                        branch: r.filial || r.branch,
+                        userEmail: r.userEmail,
+                        companies: scopedCompanies
+                    }));
                 setReportHistory(formattedReports);
                 await refreshStockConferenceReports();
                 setCurrentView('history');
@@ -7344,7 +7852,12 @@ const App: React.FC = () => {
 
     useEffect(() => {
         if (currentView !== 'logs') return;
-        if (!currentUser?.company_id) return;
+        const activeCompanyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        if (!activeCompanyId) {
+            setHasLoadedLogsForMetrics(true);
+            setIsLoadingLogs(false);
+            return;
+        }
 
         let cancelled = false;
 
@@ -7354,13 +7867,13 @@ const App: React.FC = () => {
                 ? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
                 : null;
 
-        const effectiveBranch = currentUser.role === 'MASTER' ? null : (currentUser.filial || null);
-        const logsCacheKey = `app_event_logs_${currentUser.company_id}_${effectiveBranch || 'all'}_${logsDateRange}`;
+        const effectiveBranch = currentUser?.role === 'MASTER' ? null : (currentUser?.filial || null);
+        const logsCacheKey = `app_event_logs_${activeCompanyId}_${effectiveBranch || 'all'}_${logsDateRange}`;
         const applyLogs = (logs: SupabaseService.DbAppEventLog[] | null | undefined) => {
             if (cancelled || !logs) return;
             startTransition(() => {
                 setAppEventLogs(logs);
-                if (currentUser.role !== 'MASTER' && currentUser.filial) {
+                if (currentUser?.role !== 'MASTER' && currentUser?.filial) {
                     setLogsBranchFilter(currentUser.filial);
                 }
             });
@@ -7381,7 +7894,7 @@ const App: React.FC = () => {
                 const logs = await CacheService.fetchWithCache(
                     logsCacheKey,
                     () => SupabaseService.fetchAppEventLogs({
-                        companyId: currentUser.company_id!,
+                        companyId: activeCompanyId,
                         branch: effectiveBranch,
                         sinceISO: sinceDate ? sinceDate.toISOString() : null,
                         limit: 2000
@@ -7390,6 +7903,8 @@ const App: React.FC = () => {
                     { maxAgeMs: 60_000, revalidate: 'stale', timeoutMs: 10_000 }
                 );
                 applyLogs(logs);
+            } catch (err) {
+                console.warn('Erro ao carregar logs de métricas:', err);
             } finally {
                 if (!cancelled) {
                     setIsLoadingLogs(false);
@@ -7401,7 +7916,7 @@ const App: React.FC = () => {
         return () => {
             cancelled = true;
         };
-    }, [currentView, currentUser?.company_id, currentUser?.filial, currentUser?.role, logsDateRange]);
+    }, [currentView, currentUser?.company_id, currentUser?.filial, currentUser?.role, logsDateRange, companies]);
 
     const refreshActiveSessions = useCallback(async () => {
         if (activeSessionsLoadInFlightRef.current || document.hidden || !navigator.onLine) return;
@@ -7444,13 +7959,18 @@ const App: React.FC = () => {
     }, [currentView, currentUser?.role, currentUser?.company_id]);
 
     useEffect(() => {
-        if (currentView !== 'logs' || currentUser?.role !== 'MASTER' || !currentUser?.company_id) return;
+        if (currentView !== 'logs' || currentUser?.role !== 'MASTER') return;
+        const activeCompanyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+        if (!activeCompanyId) {
+            setHasLoadedSessionsForMetrics(true);
+            return;
+        }
 
         refreshActiveSessions();
         const interval = setInterval(refreshActiveSessions, MASTER_SESSIONS_POLL_MS);
 
         return () => clearInterval(interval);
-    }, [currentView, currentUser?.role, currentUser?.company_id, refreshActiveSessions, MASTER_SESSIONS_POLL_MS]);
+    }, [currentView, currentUser?.role, currentUser?.company_id, refreshActiveSessions, MASTER_SESSIONS_POLL_MS, companies]);
 
     useEffect(() => {
         if (currentView !== 'logs' || currentUser?.role !== 'MASTER') return;
@@ -7590,7 +8110,20 @@ const App: React.FC = () => {
     const isMetricsInitialHydrating =
         currentView === 'logs' &&
         canViewManagerMetrics &&
+        isLoadingLogs &&
         (!hasLoadedLogsForMetrics || (currentUser?.role === 'MASTER' && !hasLoadedSessionsForMetrics));
+
+    // Watchdog: evita que a tela de Métricas Gerenciais fique travada em "Sincronizando"
+    useEffect(() => {
+        if (currentView === 'logs') {
+            const timer = setTimeout(() => {
+                setHasLoadedLogsForMetrics(true);
+                setHasLoadedSessionsForMetrics(true);
+                setIsLoadingLogs(false);
+            }, 3500);
+            return () => clearTimeout(timer);
+        }
+    }, [currentView]);
     const remoteForceLogoutSecondsRemaining = remoteForceLogoutDeadline
         ? Math.max(0, Math.ceil((remoteForceLogoutDeadline - Date.now()) / 1000))
         : 0;
@@ -7770,9 +8303,11 @@ const App: React.FC = () => {
         return foundArea?.name || '';
     };
 
+
     const branchSelectionGroups = useMemo(() => {
-        if (!currentUser?.company_id) return [] as Array<{ area: string; options: { branch: string; area: string }[] }>;
-        const company = companies.find((c: any) => c.id === currentUser.company_id);
+        const company = (currentUser?.company_id
+            ? (scopedCompanies.find((c: any) => c.id === currentUser.company_id) || companies.find((c: any) => c.id === currentUser.company_id))
+            : null) || scopedCompanies[0] || companies[0];
         if (!company?.areas) return [] as Array<{ area: string; options: { branch: string; area: string }[] }>;
 
         const sortBranchAscending = (a: string, b: string) => {
@@ -7808,18 +8343,12 @@ const App: React.FC = () => {
             });
 
         return grouped;
-    }, [companies, currentUser?.company_id]);
+    }, [scopedCompanies, companies, currentUser?.company_id]);
 
     const branchSelectionOptions = useMemo(
         () => branchSelectionGroups.flatMap(group => group.options),
         [branchSelectionGroups]
     );
-
-    const scopedCompanies = useMemo(() => {
-        if (currentUser?.role === 'MASTER') return companies;
-        if (!currentUser?.company_id) return companies;
-        return companies.filter(c => c.id === currentUser.company_id);
-    }, [companies, currentUser?.company_id, currentUser?.role]);
 
     const scopedUsers = useMemo(() => {
         if (!currentUser) return [];
@@ -7835,40 +8364,47 @@ const App: React.FC = () => {
 
     const dashboardAuditBranchCandidates = useMemo(() => {
         const set = new Set<string>();
-        const isAreaScopedAdmin = currentUser?.role === 'ADMINISTRATIVO' && !!String(currentUser.area || '').trim();
-        const adminArea = String(currentUser?.area || '').trim().toLocaleLowerCase('pt-BR');
-        const isAllowedAuditArea = (areaName?: string | null) =>
-            !isAreaScopedAdmin || String(areaName || '').trim().toLocaleLowerCase('pt-BR') === adminArea;
-        const isAllowedAuditBranch = (branchName?: string | null) => {
-            if (!isAreaScopedAdmin) return true;
-            const normalizedBranch = normalizeBranchLabel(branchName).toLocaleLowerCase('pt-BR');
-            return scopedCompanies.some(c =>
-                (c.areas || []).some((area: any) =>
-                    isAllowedAuditArea(area?.name) &&
-                    (area.branches || []).some((branch: string) =>
-                        normalizeBranchLabel(branch).toLocaleLowerCase('pt-BR') === normalizedBranch
-                    )
-                )
-            );
-        };
+        if (!currentUser) return [];
 
-        if (currentUser?.filial && isAllowedAuditBranch(currentUser.filial)) {
+        if (currentUser.role === 'MASTER') {
+            scopedCompanies.forEach(c => {
+                (c.areas || []).forEach((area: any) => {
+                    (area.branches || []).forEach((branch: string) => {
+                        buildBranchQueryVariants(branch).forEach(v => set.add(v));
+                    });
+                });
+            });
+            return Array.from(set);
+        }
+
+        if (currentUser.role === 'USER') {
+            if (currentUser.filial) {
+                buildBranchQueryVariants(currentUser.filial).forEach(v => set.add(v));
+            }
+            return Array.from(set);
+        }
+
+        // ADMINISTRATIVO:
+        if (currentUser.filial && isUserScopedAllowed({ user: currentUser, area: currentUser.area, branch: currentUser.filial })) {
             buildBranchQueryVariants(currentUser.filial).forEach(v => set.add(v));
         }
-        scopedUsers.forEach(u => {
-            if (!isAllowedAuditArea(u.area)) return;
-            buildBranchQueryVariants(u.filial || '').forEach(v => set.add(v));
-        });
         scopedCompanies.forEach(c => {
             (c.areas || []).forEach((area: any) => {
-                if (!isAllowedAuditArea(area?.name)) return;
                 (area.branches || []).forEach((branch: string) => {
                     buildBranchQueryVariants(branch).forEach(v => set.add(v));
                 });
             });
         });
+        if (currentUser.area) {
+            const adminAreaNorm = normalizeAreaKey(currentUser.area);
+            BRANCH_DIRECTORY.forEach(entry => {
+                if (normalizeAreaKey(entry.area) === adminAreaNorm) {
+                    buildBranchQueryVariants(entry.branch).forEach(v => set.add(v));
+                }
+            });
+        }
         return Array.from(set);
-    }, [currentUser?.filial, currentUser?.role, currentUser?.area, scopedUsers, scopedCompanies]);
+    }, [currentUser, scopedCompanies, isUserScopedAllowed]);
 
     const loadDashboardAuditSessions = useCallback((force = false): Promise<void> => {
         if (!currentUser) return Promise.resolve();
@@ -7891,7 +8427,14 @@ const App: React.FC = () => {
             const cachedRowsRaw = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
                 || await CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey);
             const cachedRows = Array.isArray(cachedRowsRaw)
-                ? cachedRowsRaw.filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch))
+                ? cachedRowsRaw
+                    .filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch))
+                    .filter(session => isUserScopedAllowed({
+                        user: currentUser,
+                        branch: session.branch,
+                        userEmail: session.user_email,
+                        companies: scopedCompanies
+                    }))
                 : cachedRowsRaw;
 
             if (Array.isArray(cachedRows) && cachedRows.length > 0) {
@@ -7927,15 +8470,14 @@ const App: React.FC = () => {
 
             const metadataRows = ((metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>)
                 .filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch));
-            const scopedMetadata = (currentUser.role === 'MASTER' || currentUser.role === 'ADMINISTRATIVO')
-                ? metadataRows
-                : metadataRows.filter(session => {
-                    const currentBranch = String(currentUser.filial || '').trim();
-                    if (!currentBranch) return false;
-                    const sessionRaw = String(session.branch || '').trim();
-                    if (sessionRaw === currentBranch) return true;
-                    return normalizeBranchLabel(sessionRaw) === normalizeBranchLabel(currentBranch);
-                });
+            const scopedMetadata = metadataRows.filter(session =>
+                isUserScopedAllowed({
+                    user: currentUser,
+                    branch: session.branch,
+                    userEmail: session.user_email,
+                    companies: scopedCompanies
+                })
+            );
 
             // Mantem a versão mais recente de cada filial + inventário.
             const latestByBranchAndNumber = new Map<string, typeof scopedMetadata[number]>();
@@ -8071,7 +8613,14 @@ const App: React.FC = () => {
             const cachedRowsRaw = CacheService.peek<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
                 || await CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey);
             const cachedRows = Array.isArray(cachedRowsRaw)
-                ? cachedRowsRaw.filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch))
+                ? cachedRowsRaw
+                    .filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch))
+                    .filter(session => isUserScopedAllowed({
+                        user: currentUser,
+                        branch: session.branch,
+                        userEmail: session.user_email,
+                        companies: scopedCompanies
+                    }))
                 : cachedRowsRaw;
 
             if (Array.isArray(cachedRows) && cachedRows.length > 0) {
@@ -8107,15 +8656,14 @@ const App: React.FC = () => {
 
             const metadataRows = ((metadataRowsRaw || []) as Array<Pick<SupabaseService.DbAuditSession, 'id' | 'branch' | 'audit_number' | 'status' | 'progress' | 'user_email' | 'created_at' | 'updated_at'>>)
                 .filter(session => !SupabaseService.isTechnicalArchivedAuditBranch(session.branch));
-            const scopedMetadata = (currentUser.role === 'MASTER' || currentUser.role === 'ADMINISTRATIVO')
-                ? metadataRows
-                : metadataRows.filter(session => {
-                    const currentBranch = String(currentUser.filial || '').trim();
-                    if (!currentBranch) return false;
-                    const sessionRaw = String(session.branch || '').trim();
-                    if (sessionRaw === currentBranch) return true;
-                    return normalizeBranchLabel(sessionRaw) === normalizeBranchLabel(currentBranch);
-                });
+            const scopedMetadata = metadataRows.filter(session =>
+                isUserScopedAllowed({
+                    user: currentUser,
+                    branch: session.branch,
+                    userEmail: session.user_email,
+                    companies: scopedCompanies
+                })
+            );
 
             // Keep the latest completed session per branch and audit_number
             const latestByBranchAndNumber = new Map<string, typeof scopedMetadata[number]>();
@@ -8478,34 +9026,36 @@ const App: React.FC = () => {
         return date.toLocaleString('pt-BR', { hour12: false });
     }, [filteredEventLogs]);
 
-    const canModerateHistory = hasModuleAccess('historyModeration');
+    const canModerateHistory = currentUser?.role === 'MASTER' || currentUser?.role === 'ADMINISTRATIVO' || hasModuleAccess('historyModeration');
 
     const handleStockAreaFilterChange = (value: string) => setStockAreaFilter(value);
 
+    const scopedChecklistHistory = useMemo(() => {
+        if (!currentUser) return [];
+        return reportHistory.filter(r => isUserScopedAllowed({
+            user: currentUser,
+            companyId: r.companyId,
+            area: r.area || resolveBranchArea(r.filial || r.branch),
+            branch: r.filial || r.branch,
+            userEmail: r.userEmail,
+            companies: scopedCompanies
+        }));
+    }, [reportHistory, currentUser, scopedCompanies, isUserScopedAllowed]);
+
+    const checklistHistoryAreaOptions = useMemo(() => {
+        return Array.from(new Set(scopedChecklistHistory.map(r => r.area || resolveBranchArea(r.filial || r.branch)))).filter(Boolean).sort();
+    }, [scopedChecklistHistory, resolveBranchArea]);
+
+    const checklistHistoryUserOptions = useMemo(() => {
+        return Array.from(new Set(scopedChecklistHistory.map(r => r.userEmail))).filter(Boolean).sort();
+    }, [scopedChecklistHistory]);
+
     const getFilteredHistory = () => {
-        let filtered = [...reportHistory];
+        let filtered = [...scopedChecklistHistory];
 
-        // 1. Base User Filter (Permissions)
-        if (canModerateHistory) {
-            // Masters can see all, or filter by specific user
-            if (historyFilterUser !== 'all') {
-                filtered = filtered.filter(r => r.userEmail === historyFilterUser);
-            }
-        } else {
-            // Regular users see only their own (plus allowed overrides)
-            const allowed = new Set<string>(['asconavietagestor@gmail.com']);
-            if (currentUser?.email) allowed.add(currentUser.email);
-
-            // First restrict to allowed emails
-            filtered = filtered.filter(r => allowed.has(r.userEmail));
-
-            // Then apply user filter if they selected one (though UI usually hides this for non-masters, logic remains safe)
-            if (historyFilterUser !== 'all' && allowed.has(historyFilterUser)) {
-                filtered = filtered.filter(r => r.userEmail === historyFilterUser);
-            } else if (historyFilterUser !== 'all') {
-                // Tried to filter by someone not allowed
-                return [];
-            }
+        // 1. User Filter
+        if (historyFilterUser !== 'all') {
+            filtered = filtered.filter(r => r.userEmail === historyFilterUser);
         }
 
         // 2. Filter by Search (Company Name)
@@ -8516,7 +9066,10 @@ const App: React.FC = () => {
 
         // 3. Filter by Area
         if (historyAreaFilter !== 'all') {
-            filtered = filtered.filter(r => r.area === historyAreaFilter);
+            filtered = filtered.filter(r => {
+                const effectiveArea = r.area || resolveBranchArea(r.filial || r.branch);
+                return normalizeAreaKey(effectiveArea) === normalizeAreaKey(historyAreaFilter);
+            });
         }
 
         // 4. Filter by Date Range
@@ -8553,9 +9106,7 @@ const App: React.FC = () => {
     };
 
     const filteredChecklistHistory = useMemo(() => getFilteredHistory(), [
-        reportHistory,
-        canModerateHistory,
-        currentUser?.email,
+        scopedChecklistHistory,
         historyFilterUser,
         historySearch,
         historyAreaFilter,
@@ -8618,6 +9169,12 @@ const App: React.FC = () => {
         const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         dashboardAuditSessions.forEach(session => {
             if (SupabaseService.isTechnicalArchivedAuditBranch(session.branch)) return;
+            if (!isUserScopedAllowed({
+                user: currentUser,
+                branch: session.branch,
+                userEmail: session.user_email,
+                companies: scopedCompanies
+            })) return;
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
             const key = `${branchLabel}_${auditNumber}`;
@@ -9046,6 +9603,16 @@ const App: React.FC = () => {
             );
             const branchCity = getAuditBranchCity(parsedData, session.branch) || branchToCity.get(branchLabel);
             const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
+            if (!isUserScopedAllowed({
+                user: currentUser,
+                companyId: companyInfo?.id,
+                area: branchArea,
+                branch: branchLabel,
+                userEmail: session.user_email,
+                companies: scopedCompanies
+            })) {
+                return;
+            }
             branches.push({
                 branch: branchLabel,
                 area: branchArea,
@@ -9261,6 +9828,12 @@ const App: React.FC = () => {
         const latestByBranchAndNumber = new Map<string, SupabaseService.DbAuditSession>();
         dashboardCompletedAuditSessions.forEach(session => {
             if (SupabaseService.isTechnicalArchivedAuditBranch(session.branch)) return;
+            if (!isUserScopedAllowed({
+                user: currentUser,
+                branch: session.branch,
+                userEmail: session.user_email,
+                companies: scopedCompanies
+            })) return;
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
             const key = `${branchLabel}_${auditNumber}`;
@@ -9679,6 +10252,16 @@ const App: React.FC = () => {
             );
             const branchCity = getAuditBranchCity(parsedData, session.branch) || branchToCity.get(branchLabel);
             const companyInfo = branchAreaToCompany.get(`${normalizeFilterKey(branchArea)}|${branchLabel}`) || branchToCompany.get(branchLabel);
+            if (!isUserScopedAllowed({
+                user: currentUser,
+                companyId: companyInfo?.id,
+                area: branchArea,
+                branch: branchLabel,
+                userEmail: session.user_email,
+                companies: scopedCompanies
+            })) {
+                return;
+            }
             branches.push({
                 branch: branchLabel,
                 area: branchArea,
@@ -11058,9 +11641,10 @@ const App: React.FC = () => {
                         <div className="h-full animate-fade-in relative pb-24">
                             <Suspense fallback={<div className="p-6 text-sm font-semibold text-slate-500">Carregando módulo...</div>}>
                                 <StockConference
+                                    key={`stock-${currentUser?.email || 'anon'}-${currentUser?.company_id || 'all'}-${currentUser?.filial || 'none'}`}
                                     userEmail={currentUser?.email || ''}
                                     userName={currentUser?.name || ''}
-                                    companies={companies}
+                                    companies={scopedCompanies}
                                     onReportSaved={async () => { await refreshStockConferenceReports(); }}
                                     pendingReportsCount={pendingStockReports.length}
                                     onManualSync={async () => {
@@ -11086,10 +11670,11 @@ const App: React.FC = () => {
                         <div className="h-full animate-fade-in relative pb-24">
                             <Suspense fallback={<div className="p-6 text-sm font-semibold text-slate-500">Carregando módulo...</div>}>
                                 <PreVencidosManager
+                                    key={`pre-${currentUser?.email || 'anon'}-${currentUser?.company_id || 'all'}-${currentUser?.filial || 'none'}`}
                                     userEmail={currentUser?.email || ''}
                                     userName={currentUser?.name || ''}
                                     userRole={currentUser?.role || 'USER'}
-                                    companies={companies}
+                                    companies={scopedCompanies}
                                     onLogout={handleLogout}
                                 />
                             </Suspense>
@@ -11140,19 +11725,20 @@ const App: React.FC = () => {
                                     />
                                     <div className="min-w-0 flex-1">
                                         <AuditModule
-                                            key={`audit-${auditJumpCompanyId || currentUser?.company_id || 'all'}-${auditJumpArea || currentUser?.area || 'all'}-${auditJumpFilial || 'manual'}`}
+                                            key={`audit-${currentUser?.email || 'anon'}-${currentUser?.role || 'user'}-${currentUser?.company_id || 'all'}-${currentUser?.area || 'all'}-${currentUser?.filial || 'none'}-${auditJumpCompanyId || 'none'}-${auditJumpFilial || 'manual'}`}
                                             userEmail={currentUser?.email || ''}
                                             userName={currentUser?.name || ''}
                                             userRole={currentUser?.role || 'USER'}
                                             userCompanyId={currentUser?.company_id || null}
                                             userArea={currentUser?.area || null}
                                             userFilial={currentUser?.filial || null}
-                                            companies={companies}
+                                            companies={scopedCompanies}
                                             initialFilial={auditJumpFilial}
                                             initialArea={auditJumpArea}
                                             initialCompanyId={auditJumpCompanyId || null}
-                                            initialCompanyName={auditJumpCompanyName || null}
+                                            initialCompanyName={auditJumpCompanyName || (currentUser?.company_id ? companies.find(c => c.id === currentUser.company_id)?.name : null) || null}
                                             forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
+                                            knownAuditSessions={[...dashboardAuditSessions, ...dashboardCompletedAuditSessions]}
                                             onAuditExited={handleAuditExited}
                                             onAuditSessionChanged={handleAuditSessionChanged}
                                             onFilialSelected={() => {
@@ -12443,11 +13029,12 @@ const App: React.FC = () => {
                                 </div>
                                 <button
                                     onClick={() => {
-                                        if (!currentUser?.company_id) return;
+                                        const activeCompanyId = currentUser?.company_id || (companies && companies.length > 0 ? companies[0]?.id : null);
+                                        if (!activeCompanyId) return;
                                         setIsLoadingLogs(true);
                                         SupabaseService.fetchAppEventLogs({
-                                            companyId: currentUser.company_id,
-                                            branch: currentUser.role === 'MASTER' ? null : (currentUser.filial || null),
+                                            companyId: activeCompanyId,
+                                            branch: currentUser?.role === 'MASTER' ? null : (currentUser?.filial || null),
                                             sinceISO: logsDateRange === '7d'
                                                 ? new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
                                                 : logsDateRange === '30d'
@@ -14192,13 +14779,16 @@ const App: React.FC = () => {
                                                                         const selectedFilial = e.target.value;
                                                                         handleInputChange(item.id, selectedFilial);
                                                                         const empresaValue = getInputValue('empresa');
-                                                                        const selectedCompany = companies.find((c: any) => c.name === empresaValue);
+                                                                        const selectedCompany = scopedCompanies.find((c: any) => c.name === empresaValue) || companies.find((c: any) => c.name === empresaValue);
                                                                         if (selectedCompany && selectedCompany.areas) {
                                                                             const areaForFilial = selectedCompany.areas.find((area: any) =>
                                                                                 area.branches && area.branches.includes(selectedFilial)
                                                                             );
                                                                             if (areaForFilial) {
                                                                                 handleInputChange('area', areaForFilial.name);
+                                                                            } else {
+                                                                                const resolved = resolveBranchArea(selectedFilial, selectedCompany.areas);
+                                                                                if (resolved) handleInputChange('area', resolved);
                                                                             }
                                                                         }
                                                                     }}
@@ -14208,9 +14798,14 @@ const App: React.FC = () => {
                                                                     <option value="">-- SELECIONE A FILIAL --</option>
                                                                     {(() => {
                                                                         const empresaValue = getInputValue('empresa');
-                                                                        const selectedCompany = companies.find((c: any) => c.name === empresaValue);
+                                                                        const selectedCompany = scopedCompanies.find((c: any) => c.name === empresaValue) || companies.find((c: any) => c.name === empresaValue);
                                                                         if (selectedCompany && selectedCompany.areas) {
-                                                                            const allBranches = selectedCompany.areas.flatMap((area: any) => area.branches || []);
+                                                                            const allBranches = Array.from(new Set(selectedCompany.areas.flatMap((area: any) => area.branches || []))).sort((a, b) => {
+                                                                                const numA = Number((a.match(/\d+/)?.[0] || ''));
+                                                                                const numB = Number((b.match(/\d+/)?.[0] || ''));
+                                                                                if (numA && numB) return numA - numB;
+                                                                                return a.localeCompare(b, 'pt-BR');
+                                                                            });
                                                                             return allBranches.map((branch: string, idx: number) => (
                                                                                 <option key={idx} value={branch}>{branch}</option>
                                                                             ));
@@ -14726,7 +15321,11 @@ const App: React.FC = () => {
                             </div>
                             
                             <Suspense fallback={<div className="flex justify-center p-12"><Loader2 className="animate-spin text-blue-500" size={32} /></div>}>
-                                <AnaliseDashboard currentUser={currentUser!} companies={companies} />
+                                <AnaliseDashboard
+                                    key={`analise-${currentUser?.email || 'anon'}-${currentUser?.company_id || 'all'}`}
+                                    currentUser={currentUser!}
+                                    companies={scopedCompanies}
+                                />
                             </Suspense>
                         </div>
                     )}
@@ -15498,7 +16097,7 @@ const App: React.FC = () => {
 
                                     {/* Advanced Filters Bar */}
                                     <div className="bg-gray-50/40 backdrop-blur-sm p-8 rounded-[32px] border border-gray-100 mb-10">
-                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                        <div className={`grid grid-cols-1 md:grid-cols-2 ${canModerateHistory ? 'lg:grid-cols-4' : 'lg:grid-cols-3'} gap-6`}>
                                             <div className="space-y-2">
                                                 <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Buscar por Empresa</label>
                                                 <div className="relative group">
@@ -15523,7 +16122,7 @@ const App: React.FC = () => {
                                                         className="w-full bg-white border border-gray-200 rounded-2xl pl-12 pr-10 py-4 outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all font-bold text-gray-700 flex appearance-none cursor-pointer shadow-sm"
                                                     >
                                                         <option value="all">Todas as Áreas / Setores</option>
-                                                        {Array.from(new Set(reportHistory.map(r => r.area))).filter(Boolean).sort().map(area => (
+                                                        {checklistHistoryAreaOptions.map(area => (
                                                             <option key={area} value={area}>{area}</option>
                                                         ))}
                                                     </select>
@@ -15531,9 +16130,9 @@ const App: React.FC = () => {
                                                 </div>
                                             </div>
 
-                                            {canModerateHistory ? (
+                                            {canModerateHistory && (
                                                 <div className="space-y-2">
-                                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Responsável (Master Only)</label>
+                                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Responsável</label>
                                                     <div className="relative">
                                                         <UserCircle2 className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={20} />
                                                         <select
@@ -15542,32 +16141,32 @@ const App: React.FC = () => {
                                                             className="w-full bg-white border border-gray-200 rounded-2xl pl-12 pr-10 py-4 outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all font-bold text-gray-700 flex appearance-none cursor-pointer shadow-sm"
                                                         >
                                                             <option value="all">Todos os Auditores</option>
-                                                            {Array.from(new Set(reportHistory.map(r => r.userEmail))).map(email => (
+                                                            {checklistHistoryUserOptions.map(email => (
                                                                 <option key={email} value={email}>{users.find(u => u.email === email)?.name || email}</option>
                                                             ))}
                                                         </select>
                                                         <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" size={18} />
                                                     </div>
                                                 </div>
-                                            ) : (
-                                                <div className="space-y-2">
-                                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Período</label>
-                                                    <div className="relative">
-                                                        <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={20} />
-                                                        <select
-                                                            value={historyDateRange}
-                                                            onChange={(e) => setHistoryDateRange(e.target.value)}
-                                                            className="w-full bg-white border border-gray-200 rounded-2xl pl-12 pr-10 py-4 outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all font-bold text-gray-700 flex appearance-none cursor-pointer shadow-sm"
-                                                        >
-                                                            <option value="all">Todo o Período</option>
-                                                            <option value="today">Apenas Hoje</option>
-                                                            <option value="week">Últimos 7 dias</option>
-                                                            <option value="month">Últimos 30 dias</option>
-                                                        </select>
-                                                        <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" size={18} />
-                                                    </div>
-                                                </div>
                                             )}
+
+                                            <div className="space-y-2">
+                                                <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Período</label>
+                                                <div className="relative">
+                                                    <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={20} />
+                                                    <select
+                                                        value={historyDateRange}
+                                                        onChange={(e) => setHistoryDateRange(e.target.value)}
+                                                        className="w-full bg-white border border-gray-200 rounded-2xl pl-12 pr-10 py-4 outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 transition-all font-bold text-gray-700 flex appearance-none cursor-pointer shadow-sm"
+                                                    >
+                                                        <option value="all">Todo o Período</option>
+                                                        <option value="today">Apenas Hoje</option>
+                                                        <option value="week">Últimos 7 dias</option>
+                                                        <option value="month">Últimos 30 dias</option>
+                                                    </select>
+                                                    <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" size={18} />
+                                                </div>
+                                            </div>
                                         </div>
                                     </div>
 
@@ -15581,6 +16180,19 @@ const App: React.FC = () => {
                                                             <FileSearch size={36} strokeWidth={1.2} />
                                                         </div>
                                                         <p className="text-sm font-bold text-gray-400">Nenhum registro encontrado</p>
+                                                        <div className="flex flex-col items-center gap-2 mt-2">
+                                                            <button onClick={handleReloadReports} className="text-xs text-blue-500 font-bold hover:underline">Limpar filtros ou recarregar</button>
+                                                            {hasMoreReports && (
+                                                                <button
+                                                                    onClick={handleLoadMoreReports}
+                                                                    disabled={isLoadingMore}
+                                                                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl font-black text-xs text-white bg-blue-600 hover:bg-blue-700 transition shadow-md disabled:opacity-50"
+                                                                >
+                                                                    {isLoadingMore ? <Loader2 size={14} className="animate-spin" /> : <ChevronDown size={14} />}
+                                                                    CARREGAR MAIS DO BANCO
+                                                                </button>
+                                                            )}
+                                                        </div>
                                                     </div>
                                                 </div>
                                             ) : (
@@ -15664,7 +16276,19 @@ const App: React.FC = () => {
                                                                         <FileSearch size={64} strokeWidth={1} />
                                                                     </div>
                                                                     <p className="text-xl font-black text-gray-300">Nenhum registro encontrado</p>
-                                                                    <button onClick={handleReloadReports} className="text-blue-500 font-bold hover:underline">Limpar filtros ou recarregar</button>
+                                                                    <div className="flex flex-wrap items-center justify-center gap-3">
+                                                                        <button onClick={handleReloadReports} className="text-blue-500 font-bold hover:underline">Limpar filtros ou recarregar</button>
+                                                                        {hasMoreReports && (
+                                                                            <button
+                                                                                onClick={handleLoadMoreReports}
+                                                                                disabled={isLoadingMore}
+                                                                                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-black text-xs text-white bg-blue-600 hover:bg-blue-700 transition shadow-md disabled:opacity-50"
+                                                                            >
+                                                                                {isLoadingMore ? <Loader2 size={14} className="animate-spin" /> : <ChevronDown size={14} />}
+                                                                                CARREGAR MAIS DO BANCO
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
                                                                 </div>
                                                             </td>
                                                         </tr>
@@ -15770,7 +16394,7 @@ const App: React.FC = () => {
                                                     </span>
                                                 </button>
                                             ) : (
-                                                reportHistory.length > 0 && (
+                                                scopedChecklistHistory.length > 0 && (
                                                     <div className="flex flex-col items-center gap-2 text-gray-400 group">
                                                         <div className="w-8 h-0.5 bg-gray-100 rounded-full group-hover:w-16 transition-all duration-700" />
                                                         <span className="font-black text-[9px] uppercase tracking-[0.3em]">Fim do Histórico</span>
@@ -15778,7 +16402,7 @@ const App: React.FC = () => {
                                                 )
                                             )}
 
-                                            {reportHistory.length > 0 && (
+                                            {scopedChecklistHistory.length > 0 && (
                                                 <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest opacity-60">
                                                     Mostrando {filteredChecklistHistory.length} avaliações
                                                 </p>
@@ -15813,9 +16437,23 @@ const App: React.FC = () => {
                                             </button>
                                         )}
                                     </div>
-                                    {stockConferenceHistory.length === 0 ? (
-                                        <div className="text-center py-12 text-sm text-gray-500">
-                                            Nenhuma conferência de estoque registrada ainda.
+                                    {scopedStockConferenceHistory.length === 0 ? (
+                                        <div className="text-center py-12 text-sm text-gray-500 space-y-4">
+                                            <p>Nenhuma conferência de estoque registrada ainda.</p>
+                                            {hasMoreStockConferences && (
+                                                <button
+                                                    onClick={handleLoadMoreStockConferences}
+                                                    disabled={isLoadingMoreStock}
+                                                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-black text-xs text-white transition-all active:scale-95 disabled:opacity-50 shadow-md"
+                                                    style={{ background: 'linear-gradient(135deg, #f97316, #ef4444)' }}
+                                                >
+                                                    {isLoadingMoreStock ? (
+                                                        <><Loader2 size={14} className="animate-spin" /> Carregando...</>
+                                                    ) : (
+                                                        <><ChevronDown size={14} /> CARREGAR MAIS</>
+                                                    )}
+                                                </button>
+                                            )}
                                         </div>
                                     ) : (
                                         <div className="space-y-4">
@@ -15826,7 +16464,7 @@ const App: React.FC = () => {
                                                         <span className="font-semibold text-gray-700">Filtrar conferências</span>
                                                     </div>
                                                     <div className="text-xs text-gray-500">
-                                                        Mostrando {filteredStockConferenceHistory.length} de {stockConferenceHistory.length} conferência(s)
+                                                        Mostrando {filteredStockConferenceHistory.length} de {scopedStockConferenceHistory.length} conferência(s)
                                                     </div>
                                                 </div>
                                                 <div className="space-y-2">
@@ -15996,7 +16634,7 @@ const App: React.FC = () => {
                                                 </div>
                                                     <div className="px-4 py-3 border-t border-gray-100 bg-gray-50 flex items-center justify-between">
                                                         <span className="text-[11px] text-gray-500">
-                                                            {stockConferenceHistory.length} conferência(s) carregada(s)
+                                                            {scopedStockConferenceHistory.length} conferência(s) carregada(s)
                                                         </span>
                                                         {hasMoreStockConferences && (
                                                             <button
@@ -16012,7 +16650,7 @@ const App: React.FC = () => {
                                                                 )}
                                                             </button>
                                                         )}
-                                                        {!hasMoreStockConferences && stockConferenceHistory.length > 0 && (
+                                                        {!hasMoreStockConferences && scopedStockConferenceHistory.length > 0 && (
                                                             <span className="text-[10px] font-black text-gray-300 uppercase tracking-widest">Fim do histórico</span>
                                                         )}
                                                     </div>
@@ -16435,46 +17073,99 @@ const App: React.FC = () => {
                                 </div>
 
                                 <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <div>
-                                        <label className="block text-xs font-bold uppercase tracking-widest text-gray-500 mb-2">Filial</label>
-                                        {branchSelectionOptions.length > 0 ? (
-                                            <select
-                                                value={branchSelectionValue}
-                                                onChange={(e) => setBranchSelectionValue(e.target.value)}
-                                                className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                                disabled={isSavingBranchSelection}
-                                            >
-                                                <option value="">Selecione...</option>
-                                                {branchSelectionGroups.map(group => (
-                                                    <optgroup key={group.area} label={group.area}>
-                                                        {group.options.map(option => (
-                                                            <option key={`${group.area}-${option.branch}`} value={option.branch}>
-                                                                {option.branch}
-                                                            </option>
+                                    {companies.length > 0 && (
+                                        <div className="md:col-span-2 bg-blue-50/70 border border-blue-100 rounded-2xl p-3.5 flex items-center justify-between">
+                                            <div className="flex items-center gap-2">
+                                                <Store size={16} className="text-blue-600" />
+                                                <span className="text-xs font-black text-blue-900 uppercase tracking-wider">
+                                                    Empresa:
+                                                </span>
+                                            </div>
+                                            <span className="text-xs font-black text-blue-800 bg-white px-3 py-1 rounded-xl shadow-sm border border-blue-100">
+                                                {companies.find(c => c.id === currentUser.company_id)?.name || companies[0]?.name || 'Drogaria Cidade'}
+                                            </span>
+                                        </div>
+                                    )}
+
+                                    {currentUser.role === 'ADMINISTRATIVO' ? (
+                                        <>
+                                            <div>
+                                                <label className="block text-xs font-bold uppercase tracking-widest text-gray-500 mb-2">Sua Área Administrativa</label>
+                                                <select
+                                                    value={branchSelectionArea}
+                                                    onChange={(e) => {
+                                                        setBranchSelectionArea(e.target.value);
+                                                    }}
+                                                    className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                    disabled={isSavingBranchSelection}
+                                                >
+                                                    <option value="">Selecione sua área...</option>
+                                                    {branchSelectionGroups.map(group => (
+                                                        <option key={group.area} value={group.area}>{group.area}</option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs font-bold uppercase tracking-widest text-gray-500 mb-2">Filial Principal (opcional)</label>
+                                                <select
+                                                    value={branchSelectionValue}
+                                                    onChange={(e) => setBranchSelectionValue(e.target.value)}
+                                                    className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                    disabled={isSavingBranchSelection}
+                                                >
+                                                    <option value="">Todas as filiais da área</option>
+                                                    {(branchSelectionGroups.find(g => g.area === branchSelectionArea)?.options || branchSelectionOptions).map(option => (
+                                                        <option key={`${option.area}-${option.branch}`} value={option.branch}>
+                                                            {option.branch} ({option.area})
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <div>
+                                                <label className="block text-xs font-bold uppercase tracking-widest text-gray-500 mb-2">Filial</label>
+                                                {branchSelectionOptions.length > 0 ? (
+                                                    <select
+                                                        value={branchSelectionValue}
+                                                        onChange={(e) => setBranchSelectionValue(e.target.value)}
+                                                        className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        disabled={isSavingBranchSelection}
+                                                    >
+                                                        <option value="">Selecione...</option>
+                                                        {branchSelectionGroups.map(group => (
+                                                            <optgroup key={group.area} label={group.area}>
+                                                                {group.options.map(option => (
+                                                                    <option key={`${group.area}-${option.branch}`} value={option.branch}>
+                                                                        {option.branch}
+                                                                    </option>
+                                                                ))}
+                                                            </optgroup>
                                                         ))}
-                                                    </optgroup>
-                                                ))}
-                                            </select>
-                                        ) : (
-                                            <input
-                                                type="text"
-                                                value={branchSelectionValue}
-                                                onChange={(e) => setBranchSelectionValue(e.target.value)}
-                                                className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                                placeholder="Digite a filial"
-                                                disabled={isSavingBranchSelection}
-                                            />
-                                        )}
-                                    </div>
-                                    <div>
-                                        <label className="block text-xs font-bold uppercase tracking-widest text-gray-500 mb-2">Área (automática)</label>
-                                        <input
-                                            type="text"
-                                            value={branchSelectionArea || 'Área não identificada'}
-                                            readOnly
-                                            className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-700 bg-gray-50"
-                                        />
-                                    </div>
+                                                    </select>
+                                                ) : (
+                                                    <input
+                                                        type="text"
+                                                        value={branchSelectionValue}
+                                                        onChange={(e) => setBranchSelectionValue(e.target.value)}
+                                                        className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        placeholder="Digite a filial"
+                                                        disabled={isSavingBranchSelection}
+                                                    />
+                                                )}
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs font-bold uppercase tracking-widest text-gray-500 mb-2">Área (automática)</label>
+                                                <input
+                                                    type="text"
+                                                    value={branchSelectionArea || 'Área não identificada'}
+                                                    readOnly
+                                                    className="w-full rounded-xl border border-gray-200 px-3 py-3 text-sm font-semibold text-gray-700 bg-gray-50"
+                                                />
+                                            </div>
+                                        </>
+                                    )}
                                 </div>
 
                                 <div className="mt-6 flex flex-wrap justify-end gap-3">
@@ -16491,7 +17182,7 @@ const App: React.FC = () => {
                                     <button
                                         type="button"
                                         onClick={handleSaveBranchSelection}
-                                        disabled={isSavingBranchSelection || !branchSelectionValue.trim()}
+                                        disabled={isSavingBranchSelection || (!branchSelectionValue.trim() && !(currentUser.role === 'ADMINISTRATIVO' && branchSelectionArea.trim()))}
                                         className="px-5 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-bold hover:bg-blue-700 transition disabled:opacity-50"
                                     >
                                         {isSavingBranchSelection ? 'Salvando...' : branchSelectionMode === 'required' ? 'Salvar e continuar' : 'Trocar filial'}

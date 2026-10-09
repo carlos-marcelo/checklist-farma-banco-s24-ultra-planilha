@@ -236,7 +236,7 @@ function canReadLegacy_(table, row, user) {
     return normalizeEmail_(row.email) === normalizeEmail_(user.email) ||
       (role === 'ADMINISTRATIVO' && sameCompany_(row, user));
   }
-  if (table === 'companies') return String(row.id || '') === String(user.company_id || '');
+  if (table === 'companies') return !user.company_id || String(row.id || '') === String(user.company_id || '');
   if (['access_matrix', 'configs', 'checklist_definitions'].indexOf(table) >= 0) return true;
   if (row.company_id && !sameCompany_(row, user)) return false;
   if (role === 'ADMINISTRATIVO') return !row.company_id || sameCompany_(row, user);
@@ -283,9 +283,9 @@ function canRead_(table, row, user) {
   if (role === 'MASTER') return true;
   if (table === 'users') {
     return normalizeEmail_(row.email) === normalizeEmail_(user.email) ||
-      ((hasAccess_(user, 'userManagement') || hasAccess_(user, 'userApproval')) && sameCompany_(row, user));
+      ((role === 'ADMINISTRATIVO' || hasAccess_(user, 'userManagement') || hasAccess_(user, 'userApproval')) && sameCompany_(row, user));
   }
-  if (table === 'companies') return String(row.id || '') === String(user.company_id || '');
+  if (table === 'companies') return !user.company_id || String(row.id || '') === String(user.company_id || '');
   if (['access_matrix', 'configs', 'checklist_definitions'].indexOf(table) >= 0) return true;
   if (row.company_id && !sameCompany_(row, user)) return false;
   if (role === 'ADMINISTRATIVO') return !row.company_id || sameCompany_(row, user);
@@ -308,8 +308,8 @@ function assertWrite_(table, current, next, patch, user, operation) {
   if (table === 'users') {
     const candidate = next || current || {};
     const isSelf = current && normalizeEmail_(current.email) === normalizeEmail_(user.email);
-    const canManage = hasAccess_(user, 'userManagement') && sameCompany_(candidate, user);
-    const canApprove = hasAccess_(user, 'userApproval') && sameCompany_(candidate, user);
+    const canManage = (role === 'ADMINISTRATIVO' || hasAccess_(user, 'userManagement')) && sameCompany_(candidate, user);
+    const canApprove = (role === 'ADMINISTRATIVO' || hasAccess_(user, 'userApproval')) && sameCompany_(candidate, user);
     if (!isSelf && !canManage && !canApprove) throw apiError_('FORBIDDEN', 'Usuario sem permissao.');
     const selfFields = new Set(['name', 'phone', 'photo', 'preferred_theme', 'password', 'area', 'filial', 'updated_at']);
     const approvalFields = new Set(['approved', 'rejected', 'updated_at']);
@@ -433,7 +433,9 @@ function matches_(row, filters) {
   });
 }
 
+var _cachedRecords_ = {};
 function listRecords_(sheetName) {
+  if (_cachedRecords_[sheetName]) return _cachedRecords_[sheetName];
   const sheet = ensureSheet_(sheetName);
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
@@ -456,10 +458,12 @@ function listRecords_(sheetName) {
         updatedAt: String(row[3] || ''), value: JSON.parse(payload), rowNumber: index - count + 3, physicalRowCount: count });
     } catch (error) { console.warn('Registro inválido em ' + sheetName + ': ' + error); }
   }
+  _cachedRecords_[sheetName] = records;
   return records;
 }
 
 function applyChanges_(sheetName, append, update, remove) {
+  _cachedRecords_ = {};
   const sheet = ensureSheet_(sheetName);
   (append || []).forEach(record => appendRecord_(sheet, record));
   (update || []).forEach(record => writeRecord_(sheetName, record));
@@ -494,7 +498,7 @@ var _cachedSheets_ = {};
 function getSpreadsheetBook_() { if (!_cachedBook_) { var id = PropertiesService.getScriptProperties().getProperty('CF_SPREADSHEET_ID') || CF_SPREADSHEET_ID; _cachedBook_ = SpreadsheetApp.openById(id); } return _cachedBook_; }
 function ensureSheet_(name) { if (_cachedSheets_[name]) return _cachedSheets_[name]; var book = getSpreadsheetBook_(); var sheet = book.getSheetByName(name); if (!sheet) sheet = book.insertSheet(name); if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, 5).setValues([CF_HEADERS]); _cachedSheets_[name] = sheet; return sheet; }
 function project_(row, columns) { if (!columns || columns.trim() === '*') return clone_(row); const result = {}; columns.split(',').map(c => c.trim()).filter(Boolean).forEach(c => result[c] = clone_(row[c])); return result; }
-function sameCompany_(row, user) { return String(row.company_id || '') === String(user.company_id || ''); }
+function sameCompany_(row, user) { return !user.company_id || !row.company_id || String(row.company_id || '') === String(user.company_id || ''); }
 function normalizeEmail_(value) { return String(value || '').trim().toLowerCase(); }
 function normalizeText_(value) { return String(value || '').trim().toUpperCase(); }
 function normalizeBranch_(value) { return normalizeText_(value).replace(/^FILIAL\s*/i, '').replace(/^0+/, ''); }

@@ -221,16 +221,24 @@ const formatDateToBr = (dateStr?: string) => {
 export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser, companies = [] }) => {
     const dashboardRef = useRef<HTMLDivElement>(null);
     const [isExporting, setIsExporting] = useState(false);
-    const currentCompany = useMemo(
-        () => companies.find(c => c.id === currentUser?.company_id),
-        [companies, currentUser?.company_id]
-    );
+    const [selectedCompanyId, setSelectedCompanyId] = useState<string>('');
+    const currentCompany = useMemo(() => {
+        const targetId = selectedCompanyId || currentUser?.company_id;
+        if (targetId) {
+            const found = companies.find(c => c.id === targetId);
+            if (found) return found;
+        }
+        return companies[0] || null;
+    }, [companies, currentUser?.company_id, selectedCompanyId]);
+
+    const companyId = currentCompany?.id || currentUser?.company_id || (companies && companies[0]?.id) || '';
+
     const effectiveCompanyAreas = useMemo(
         () => stabilizeCompanyAreas(currentCompany?.name, currentCompany?.areas),
         [currentCompany?.name, currentCompany?.areas]
     );
     const companyAreasSignature = useMemo(() => {
-        if (!currentCompany) return `${currentUser?.company_id || ''}|${BRANCH_DIRECTORY_VERSION}`;
+        if (!currentCompany) return `${companyId || ''}|${BRANCH_DIRECTORY_VERSION}`;
         return JSON.stringify({
             id: currentCompany.id,
             directoryVersion: BRANCH_DIRECTORY_VERSION,
@@ -239,7 +247,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 branches: [...(area.branches || [])].sort()
             })).sort((a: any, b: any) => String(a.name).localeCompare(String(b.name), 'pt-BR'))
         });
-    }, [currentCompany, currentUser?.company_id, effectiveCompanyAreas]);
+    }, [currentCompany, companyId, effectiveCompanyAreas]);
 
     const [rawState, setRawState] = useState<RawDataState>({
         loading: true,
@@ -290,8 +298,9 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         const loadAndParseData = async () => {
             let hadUsableCache = false;
             try {
-                const companyId = currentUser?.company_id || '';
-                if (!companyId) throw new Error("Empresa não selecionada.");
+                if (!companyId) {
+                    throw new Error("Nenhuma empresa cadastrada no sistema. Cadastre uma empresa para visualizar a Análise de Resultados.");
+                }
 
                 const cacheKey = `analysis_resultados_parsed_${companyId}`;
                 const cached = await CacheService.get<AnalysisParsedCache>(cacheKey);
@@ -551,7 +560,7 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
         return () => {
             cancelled = true;
         };
-    }, [currentUser?.company_id, companyAreasSignature]);
+    }, [companyId, companyAreasSignature]);
 
     // Data Engine calculations based on filters
     const filteredData = useMemo(() => {
@@ -771,9 +780,33 @@ export const AnaliseDashboard: React.FC<AnaliseDashboardProps> = ({ currentUser,
                 <div className="flex items-center gap-2 text-gray-600">
                     <Filter size={18} />
                     <span className="font-bold text-sm tracking-wide">Filtros Gerenciais</span>
+                    {currentCompany && (
+                        <span className="ml-2 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-50 text-blue-700 border border-blue-200">
+                            {currentCompany.name || 'Empresa'}
+                        </span>
+                    )}
                 </div>
                 
                 <div className="flex flex-col sm:flex-row gap-4 w-full md:w-auto">
+                    {companies.length > 1 && (
+                        <div className="flex-1 sm:flex-none flex items-center bg-gray-50 border border-gray-200 rounded-xl px-3 py-1.5 focus-within:ring-2 ring-purple-100 transition-shadow">
+                            <Building2 size={14} className="text-purple-500 mr-2" />
+                            <select 
+                                className="bg-transparent border-none text-sm font-bold text-gray-700 outline-none pr-4 cursor-pointer appearance-none"
+                                value={companyId}
+                                onChange={(e) => {
+                                    setSelectedCompanyId(e.target.value);
+                                    setSelectedArea('ALL');
+                                    setSelectedCity('ALL');
+                                    setSelectedBranch('ALL');
+                                }}
+                            >
+                                {companies.map(c => (
+                                    <option key={c.id} value={c.id}>{c.name || 'Empresa sem nome'}</option>
+                                ))}
+                            </select>
+                        </div>
+                    )}
                     <div className="flex-1 sm:flex-none flex items-center bg-gray-50 border border-gray-200 rounded-xl px-3 py-1.5 focus-within:ring-2 ring-indigo-100 transition-shadow">
                         <MapPin size={14} className="text-indigo-400 mr-2" />
                         <select 

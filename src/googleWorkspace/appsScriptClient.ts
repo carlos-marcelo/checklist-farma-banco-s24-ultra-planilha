@@ -107,24 +107,44 @@ class GoogleAppsScriptClient {
         if (authenticated && !session) {
             throw Object.assign(new Error('Sua sessão expirou. Entre novamente.'), { code: 'AUTH_REQUIRED' });
         }
-        const response = await fetch(this.endpoint, {
-            method: 'POST',
-            redirect: 'follow',
-            headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-            body: JSON.stringify({ action, payload, sessionToken: session?.token || null }),
-        });
-        const envelope = await response.json() as ApiEnvelope<T>;
-        if (!response.ok || !envelope.ok) {
-            const detail = typeof envelope.error === 'string' ? envelope.error : envelope.error || {};
-            const message = typeof detail === 'string' ? detail : detail.message || 'Falha na API segura do Google.';
-            const code = typeof detail === 'string' ? 'APPS_SCRIPT_ERROR' : detail.code || 'APPS_SCRIPT_ERROR';
-            if (code === 'AUTH_REQUIRED' || code === 'SESSION_EXPIRED') {
-                this.clearSession();
-                if (typeof window !== 'undefined') window.dispatchEvent(new Event('checklist-farma:session-expired'));
+
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (typeof navigator !== 'undefined' && !navigator.onLine) {
+                    throw Object.assign(new Error('Sem conexão com a internet.'), { code: 'OFFLINE' });
+                }
+                const response = await fetch(this.endpoint, {
+                    method: 'POST',
+                    redirect: 'follow',
+                    headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                    body: JSON.stringify({ action, payload, sessionToken: session?.token || null }),
+                });
+                const envelope = await response.json() as ApiEnvelope<T>;
+                if (!response.ok || !envelope.ok) {
+                    const detail = typeof envelope.error === 'string' ? envelope.error : envelope.error || {};
+                    const message = typeof detail === 'string' ? detail : detail.message || 'Falha na API segura do Google.';
+                    const code = typeof detail === 'string' ? 'APPS_SCRIPT_ERROR' : detail.code || 'APPS_SCRIPT_ERROR';
+                    if (code === 'AUTH_REQUIRED' || code === 'SESSION_EXPIRED') {
+                        this.clearSession();
+                        if (typeof window !== 'undefined') window.dispatchEvent(new Event('checklist-farma:session-expired'));
+                    }
+                    throw Object.assign(new Error(message), { code });
+                }
+                return envelope.data as T;
+            } catch (err: any) {
+                lastError = err;
+                if (err?.code === 'AUTH_REQUIRED' || err?.code === 'SESSION_EXPIRED' || err?.code === 'INVALID_CREDENTIALS') {
+                    throw err;
+                }
+                if (attempt === 0 && (err instanceof TypeError || String(err?.message || '').includes('Failed to fetch') || err?.code === 'OFFLINE')) {
+                    await new Promise(r => setTimeout(r, 800));
+                    continue;
+                }
+                throw err;
             }
-            throw Object.assign(new Error(message), { code });
         }
-        return envelope.data as T;
+        throw lastError;
     }
 }
 

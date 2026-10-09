@@ -344,8 +344,8 @@ export async function fetchUsers(): Promise<DbUser[]> {
 
     if (error) throw error;
     return data || [];
-  } catch (error) {
-    console.error('Error fetching users:', error);
+  } catch (error: any) {
+    console.warn('[SupabaseService] Restrição ou aviso ao consultar usuários:', error?.message || error?.code || error);
     return [];
   }
 }
@@ -653,12 +653,13 @@ export async function fetchReportsSummary(
     const from = page * pageSize;
     const to = from + pageSize - 1;
 
-    const { data, error } = await supabase
+    const query = supabase
       .from('reports')
       .select('id, user_email, user_name, pharmacy_name, score, created_at, form_data')
       .order('created_at', { ascending: false })
       .range(from, to);
 
+    const { data, error } = await query;
     if (error) throw error;
     return data || [];
   } catch (error) {
@@ -795,14 +796,21 @@ export async function fetchStockConferenceReportsSummaryAll(pageSize: number = 2
 export async function fetchStockConferenceReportsSummaryPage(
   page: number = 0,
   pageSize: number = 20,
-  throwOnError = false
+  throwOnError = false,
+  allowedBranches?: string[] | null
 ): Promise<Partial<DbStockConferenceReport>[]> {
   try {
     const from = page * pageSize;
     const to = from + pageSize - 1;
-    const { data, error } = await supabase
+    let query = supabase
       .from('stock_conference_reports')
-      .select('id, user_email, user_name, branch, area, created_at, pharmacist, manager, summary')
+      .select('id, user_email, user_name, branch, area, created_at, pharmacist, manager, summary');
+
+    if (allowedBranches && allowedBranches.length > 0) {
+      query = query.in('branch', allowedBranches);
+    }
+
+    const { data, error } = await query
       .order('created_at', { ascending: false })
       .range(from, to);
     if (error) throw error;
@@ -2095,8 +2103,8 @@ export async function pruneAppEventLogs(companyId?: string | null, branch?: stri
     const { data, error } = await query.select('id');
     if (error) throw error;
     return data?.length || 0;
-  } catch (error) {
-    console.error('Error pruning app event logs:', error);
+  } catch (error: any) {
+    console.warn('[SupabaseService] Limpeza de logs ignorada ou sem permissão:', error?.message || error?.code || error);
     return 0;
   }
 }
@@ -2126,7 +2134,6 @@ export async function insertAppEventLog(event: DbAppEventLog): Promise<DbAppEven
       .select()
       .single();
     if (error) throw error;
-    pruneAppEventLogs(event.company_id, event.branch, 30).catch(() => { });
     return data || null;
   } catch (error) {
     console.error('Error inserting app event log:', error);

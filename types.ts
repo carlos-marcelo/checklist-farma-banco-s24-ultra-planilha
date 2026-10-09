@@ -96,6 +96,8 @@ export interface ReportHistoryItem {
   companyName?: string; // Alias para compatibilidade
   area?: string;
   filial?: string;
+  branch?: string;
+  companyId?: string | null;
   gestor?: string;
   createdAt?: string; // Alias para compatibilidade
 }
