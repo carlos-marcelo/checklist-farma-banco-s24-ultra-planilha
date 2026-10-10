@@ -622,6 +622,110 @@ const parseHierarchyCells = (
     };
 };
 
+const normalizeDepartmentClassification = (params: {
+    deptId?: string | number | null;
+    deptName?: string | null;
+    groupId?: string | number | null;
+    row?: any[];
+}): { deptId: string; deptName: string } => {
+    let rawId = String(params.deptId ?? '').trim();
+    let rawName = String(params.deptName ?? '').trim();
+    const gId = String(params.groupId ?? '').trim();
+
+    // 1. Varredura direta na linha do produto por menção explícita a medicamento tarjado ou 121
+    if (Array.isArray(params.row)) {
+        for (let i = 0; i < Math.min(params.row.length, 35); i++) {
+            const cellVal = String(params.row[i] ?? '').trim();
+            const cellNorm = normalizeLookupText(cellVal);
+            if (cellNorm.includes('tarjad') || (cellNorm.includes('medicamento') && cellNorm.includes('tarj'))) {
+                return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
+            }
+            if (cellVal === '121') {
+                rawId = '121';
+                rawName = 'MEDICAMENTO TARJADO';
+                break;
+            }
+        }
+    }
+
+    const normName = normalizeLookupText(rawName);
+
+    // 2. Se for identificado como Tarjado
+    if (rawId === '121' || normName.includes('tarjad') || (normName.includes('medicamento') && normName.includes('tarj'))) {
+        return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
+    }
+
+    // 3. Se for Seção 8 do Trier ou MIP
+    if (rawId === '8' || rawId === '120' || normName === 'mip' || normName.includes('isento') || normName.includes('medicamento isento')) {
+        // Se pertencer ao Grupo 3000 ("Medicamentos RX"), os medicamentos sob prescrição são Tarjados (121).
+        // No Trier, a Seção 8 frequentemente é lida por engano no lugar do departamento 121.
+        if (gId === '3000') {
+            return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
+        }
+        return { deptId: '120', deptName: 'MIP' };
+    }
+
+    // 4. Se pertencer ao Grupo 3000 ("Medicamentos RX") e o departamento for genérico/vazio/placeholder:
+    // O padrão do catálogo RX é departamento 121 (MEDICAMENTO TARJADO)
+    if (gId === '3000') {
+        if (!rawId || rawId === '8' || rawId === '99999' || isHierarchyPlaceholderName(rawName, ['OUTROS', 'GERAL', 'DIVERSOS'])) {
+            return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
+        }
+    }
+
+    // 5. Se sobrou ID 8 em qualquer outro grupo (Seção 8 da Trier = MIP):
+    if (rawId === '8') {
+        return { deptId: '120', deptName: 'MIP' };
+    }
+
+    return { deptId: rawId, deptName: rawName || 'OUTROS' };
+};
+
+const detectHierarchyColumnsInRows = (rows: any[][]) => {
+    let deptCodeCol = -1;
+    let deptNameCol = -1;
+    let catCodeCol = -1;
+    let catNameCol = -1;
+
+    const maxScan = Math.min(rows.length, 30);
+    for (let r = 0; r < maxScan; r++) {
+        const row = rows[r];
+        if (!Array.isArray(row) || row.length < 4) continue;
+        for (let c = 0; c < row.length; c++) {
+            const text = normalizeHeaderText(row[c]);
+            if (!text) continue;
+            
+            // Departamento
+            if (deptCodeCol < 0 && (
+                (text.includes('cod') || text.includes('cd.')) &&
+                (text.includes('dep') || text.includes('depto') || text.includes('departamento'))
+            )) {
+                deptCodeCol = c;
+            } else if (deptNameCol < 0 && (
+                (text === 'departamento' || text === 'depto' || text.includes('nome dep') || text.includes('descr. dep') || text.includes('descrição dep')) &&
+                !text.includes('cod') && !text.includes('cd.')
+            )) {
+                deptNameCol = c;
+            }
+            
+            // Categoria
+            if (catCodeCol < 0 && (
+                (text.includes('cod') || text.includes('cd.')) &&
+                (text.includes('cat') || text.includes('categoria'))
+            )) {
+                catCodeCol = c;
+            } else if (catNameCol < 0 && (
+                (text === 'categoria' || text.includes('nome cat') || text.includes('descr. cat') || text.includes('descrição cat')) &&
+                !text.includes('cod') && !text.includes('cd.')
+            )) {
+                catNameCol = c;
+            }
+        }
+    }
+
+    return { deptCodeCol, deptNameCol, catCodeCol, catNameCol };
+};
+
 const findBarcodeInRow = (row: any[]): string => {
     const normalize = (val: any) => {
         if (val === null || val === undefined) return '';
@@ -4229,6 +4333,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     await AuditStorage.saveLocalAuditSession(incomingData, false);
                     setData(prev => prev ? { ...prev, pendingSync: false } : prev);
                 }
+                if (saved?.status === 'open') {
+                    onAuditSessionChanged?.(savedForClient);
+                }
             }
             return savedForClient;
         } catch (err) {
@@ -5316,8 +5423,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                         const deptRaw = String(row[18] ?? '').trim();
                         const catRaw = String(row[22] ?? '').trim();
                         if (!deptRaw && !catRaw) return;
-                        const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS', ['GERAL']);
+                        const deptParsedRaw = parseHierarchyCells(row[18], row[19], 'DIVERSOS', ['GERAL']);
                         const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS', ['GERAL']);
+                        const normalizedDept = normalizeDepartmentClassification({
+                            deptId: deptParsedRaw.numericId,
+                            deptName: deptParsedRaw.name,
+                            groupId: gIdNorm,
+                            row
+                        });
+                        const deptParsed = {
+                            numericId: normalizedDept.deptId,
+                            name: normalizedDept.deptName
+                        };
 
                         const key = normalizeProductLookupCode(reduced);
                         if (!key) return;
@@ -5637,6 +5754,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         if (shouldNotify) {
             alert("Estoques atualizados e confirmados no banco (apenas para itens não finalizados).");
         }
+        onAuditSessionChanged?.(savedSession);
         return true;
     };
 
@@ -6090,12 +6208,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     const cellName18 = parseHierarchyCell(row[18], "").name;
                     const cellName19 = String(row[19] || "").trim();
 
-                    if (cellId18 !== null) {
+                    if (cellId18 !== null && cellId18 !== 8) {
                         inlineDeptId = String(cellId18);
                     }
-                    if (cellName19 && cellName19.toUpperCase() !== "OUTROS") {
+                    if (cellName19 && cellName19.toUpperCase() !== "OUTROS" && cellName19.toUpperCase() !== "MIP") {
                         inlineDeptName = cellName19;
-                    } else if (cellName18 && cellName18.toUpperCase() !== "OUTROS") {
+                    } else if (cellName18 && cellName18.toUpperCase() !== "OUTROS" && cellName18.toUpperCase() !== "MIP") {
                         inlineDeptName = cellName18;
                     }
                     
@@ -6113,7 +6231,12 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     }
                     const nameKey = superClean(rowName);
 
-                    const deptData = { deptId: inlineDeptId, deptName: inlineDeptName };
+                    const normalizedDept = normalizeDepartmentClassification({
+                        deptId: inlineDeptId,
+                        deptName: inlineDeptName,
+                        row
+                    });
+                    const deptData = { deptId: normalizedDept.deptId, deptName: normalizedDept.deptName };
 
                     for (let i = 0; i < Math.min(row.length, 20); i++) {
                         if (isStrictBarcode(row[i], i)) {
@@ -6287,6 +6410,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             groupFileRows.forEach(({ groupId, rows }) => {
                 const groupName = GROUP_CONFIG_DEFAULTS[groupId] || `Grupo ${groupId}`;
+                const detectedCols = detectHierarchyColumnsInRows(rows);
 
                 rows.forEach((row) => {
                     if (!row || row.length < 4) return;
@@ -6303,16 +6427,28 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     }
                     const productNameKey = superClean(productNameKeyStr);
 
-                    const deptCell = parseHierarchyCells(row[18], row[19], "OUTROS", ['GERAL']);
-                    const catCell = parseHierarchyCells(row[22], row[23], "GERAL", ['GERAL']);
-                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name || row[19] || row[18], deptIdByDescription, deptDescEntries);
-                    const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name || row[23] || row[22], catIdByDescription, catDescEntries);
+                    const rawDeptCol = detectedCols.deptCodeCol >= 0 ? row[detectedCols.deptCodeCol] : row[18];
+                    const rawDeptNameCol = detectedCols.deptNameCol >= 0 ? row[detectedCols.deptNameCol] : row[19];
+                    const rawCatCol = detectedCols.catCodeCol >= 0 ? row[detectedCols.catCodeCol] : row[22];
+                    const rawCatNameCol = detectedCols.catNameCol >= 0 ? row[detectedCols.catNameCol] : row[23];
+
+                    const deptCell = parseHierarchyCells(rawDeptCol, rawDeptNameCol, "OUTROS", ['GERAL']);
+                    const catCell = parseHierarchyCells(rawCatCol, rawCatNameCol, "GERAL", ['GERAL']);
+                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name || rawDeptNameCol || rawDeptCol, deptIdByDescription, deptDescEntries);
+                    const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name || rawCatNameCol || rawCatCol, catIdByDescription, catDescEntries);
+
+                    const normalizedDept = normalizeDepartmentClassification({
+                        deptId: deptResolvedId,
+                        deptName: deptCell.name,
+                        groupId,
+                        row
+                    });
 
                     const scope: ProductScope = {
                         groupId,
                         groupName,
-                        deptId: deptResolvedId,
-                        deptName: deptCell.name,
+                        deptId: normalizedDept.deptId,
+                        deptName: normalizedDept.deptName,
                         catId: catResolvedId,
                         catName: catCell.name
                     };
@@ -6477,6 +6613,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     }
                 }
 
+                const normalizedFinalDept = normalizeDepartmentClassification({
+                    deptId: resolvedScope.deptId,
+                    deptName: resolvedScope.deptName,
+                    groupId: resolvedScope.groupId
+                });
+                resolvedScope.deptId = normalizedFinalDept.deptId;
+                resolvedScope.deptName = normalizedFinalDept.deptName;
+
                 const finalGroupId = resolvedScope.groupId;
                 const finalGroupName = resolvedScope.groupName;
                 const finalGroupKey = resolveGroupKey(finalGroupId, finalGroupName);
@@ -6608,6 +6752,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             setFileStock(null);
             setIsUpdatingStock(false);
             setView({ level: 'groups' });
+            onAuditSessionChanged?.(savedSession);
             if (shouldReclassifyOpen) {
                 alert("Saldos reclassificados e sincronizados com sucesso.");
             }
@@ -6698,6 +6843,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             setTermDrafts(preservedTermDrafts as any);
             setData((savedSession.data as AuditData) || (nextData as AuditData));
             setView({ level: 'groups' });
+            onAuditSessionChanged?.(savedSession);
             setInitialDoneUnits(0);
             setSessionStartTime(Date.now());
             setGroupFiles(createInitialGroupFiles());
@@ -8901,10 +9047,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                             const catRaw = String(row[22] ?? '').trim(); // Col W = categoria
                             if (!deptRaw && !catRaw) return;
 
-                            const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                            const deptParsedRaw = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
                             const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
-                            const deptName = deptParsed.name;
-                            const catName = catParsed.name;
+                            const normalizedDept = normalizeDepartmentClassification({
+                                deptId: deptParsedRaw.numericId,
+                                deptName: deptParsedRaw.name,
+                                groupId,
+                                row
+                            });
+                            const deptName = normalizedDept.deptName;
+                            const deptId = normalizedDept.deptId;
 
                             const codes = collectProductCodeCandidates(row, 12);
                             codes.forEach(code => {
@@ -9094,10 +9246,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                 // Skip rows where both dept and cat are empty (header/blank rows)
                                 if (!deptRaw && !catRaw) return;
 
-                                const deptParsed = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                                const deptParsedRaw = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
                                 const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
-                                const deptName = deptParsed.name;
-                                const catName = catParsed.name;
+                                const normalizedDept = normalizeDepartmentClassification({
+                                    deptId: deptParsedRaw.numericId,
+                                    deptName: deptParsedRaw.name,
+                                    groupId: primaryScopeGroupId,
+                                    row
+                                });
+                                const deptName = normalizedDept.deptName;
+                                const deptId = normalizedDept.deptId;
 
                                 const rowCodes = collectProductCodeCandidates(row, 12);
                                 rowCodes.forEach((codeCandidate) => {
@@ -9105,7 +9263,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                     const candidate = {
                                         groupId: normalizeScopeId(primaryScopeGroupId),
                                         groupName: GROUP_CONFIG_DEFAULTS[normalizeScopeId(primaryScopeGroupId)] || `Grupo ${primaryScopeGroupId}`,
-                                        deptId: normalizeScopeId(deptParsed.numericId),
+                                        deptId: normalizeScopeId(deptId),
                                         deptName,
                                         catId: normalizeScopeId(catParsed.numericId),
                                         catName

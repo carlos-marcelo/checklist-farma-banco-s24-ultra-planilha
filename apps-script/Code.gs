@@ -178,7 +178,12 @@ function executeQuery_(query, user) {
     const stored = listRecords_(sheetName);
     const visible = stored.filter(record => canRead_(table, record.value, user));
     if (operation === 'select') {
-      const rows = visible.map(record => sanitizeRow_(table, record.value)).filter(row => matches_(row, query.filters || []));
+      const rows = visible.map(record => {
+        const row = sanitizeRow_(table, record.value);
+        if (!row.id && record.id) row.id = record.id;
+        if (!row.updated_at && record.updatedAt) row.updated_at = record.updatedAt;
+        return row;
+      }).filter(row => matches_(row, query.filters || []));
       return shapeRows_(rows, query);
     }
 
@@ -193,12 +198,13 @@ function executeQuery_(query, user) {
     if (operation === 'insert' || operation === 'upsert') {
       payloads.filter(Boolean).forEach(raw => {
         let row = clone_(raw);
-        if (!row.id && keyFields.indexOf('id') >= 0) row.id = Utilities.getUuid();
+        if (!row.id) row.id = Utilities.getUuid();
         if (!row.created_at) row.created_at = now;
         if (!row.updated_at) row.updated_at = now;
         row = preparePasswordMutation_(table, row);
         const existing = stored.find(record => keyFields.every(field => scalarEqual_(record.value[field], row[field])));
         if (existing && operation === 'insert') throw apiError_('23505', 'Registro duplicado.');
+        if (existing && !row.id) row.id = existing.value && existing.value.id || existing.id;
         const nextValue = existing ? Object.assign({}, existing.value, row, { updated_at: row.updated_at || now }) : row;
         assertWrite_(table, existing && existing.value, nextValue, raw, user, operation);
         if (existing) update.push(Object.assign({}, existing, { revision: existing.revision + 1, updatedAt: now, value: nextValue }));
@@ -492,7 +498,7 @@ function serializeRows_(record) {
     index === 0 ? CF_CHUNK_PREFIX + chunks.length + '__' + chunk : chunk]);
 }
 
-function newRecord_(value, fields) { const now = nowIso_(); return { id: String(value.id || Utilities.getUuid()), key: JSON.stringify(fields.map(f => value[f] == null ? null : value[f])), revision: 1, updatedAt: now, value: value, rowNumber: 0, physicalRowCount: 0 }; }
+function newRecord_(value, fields) { const now = nowIso_(); if (!value.id) value.id = Utilities.getUuid(); return { id: String(value.id), key: JSON.stringify(fields.map(f => value[f] == null ? null : value[f])), revision: 1, updatedAt: now, value: value, rowNumber: 0, physicalRowCount: 0 }; }
 var _cachedBook_ = null;
 var _cachedSheets_ = {};
 function getSpreadsheetBook_() { if (!_cachedBook_) { var id = PropertiesService.getScriptProperties().getProperty('CF_SPREADSHEET_ID') || CF_SPREADSHEET_ID; _cachedBook_ = SpreadsheetApp.openById(id); } return _cachedBook_; }

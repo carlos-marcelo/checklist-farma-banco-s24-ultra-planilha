@@ -109,7 +109,7 @@ class GoogleAppsScriptClient {
         }
 
         let lastError: unknown = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
             try {
                 if (typeof navigator !== 'undefined' && !navigator.onLine) {
                     throw Object.assign(new Error('Sem conexão com a internet.'), { code: 'OFFLINE' });
@@ -120,7 +120,22 @@ class GoogleAppsScriptClient {
                     headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
                     body: JSON.stringify({ action, payload, sessionToken: session?.token || null }),
                 });
-                const envelope = await response.json() as ApiEnvelope<T>;
+
+                const rawText = await response.text();
+                let envelope: ApiEnvelope<T>;
+                try {
+                    envelope = JSON.parse(rawText) as ApiEnvelope<T>;
+                } catch {
+                    const isHtml = /^\s*</i.test(rawText);
+                    const errMsg = isHtml
+                        ? 'O serviço do Google Apps Script demorou para responder ou retornou página temporária. Tentando novamente...'
+                        : 'Resposta inválida do serviço do Google.';
+                    throw Object.assign(new Error(errMsg), {
+                        code: 'TRANSIENT_HTML_ERROR',
+                        status: response.status
+                    });
+                }
+
                 if (!response.ok || !envelope.ok) {
                     const detail = typeof envelope.error === 'string' ? envelope.error : envelope.error || {};
                     const message = typeof detail === 'string' ? detail : detail.message || 'Falha na API segura do Google.';
@@ -137,8 +152,14 @@ class GoogleAppsScriptClient {
                 if (err?.code === 'AUTH_REQUIRED' || err?.code === 'SESSION_EXPIRED' || err?.code === 'INVALID_CREDENTIALS') {
                     throw err;
                 }
-                if (attempt === 0 && (err instanceof TypeError || String(err?.message || '').includes('Failed to fetch') || err?.code === 'OFFLINE')) {
-                    await new Promise(r => setTimeout(r, 800));
+                const isTransient = err?.code === 'TRANSIENT_HTML_ERROR' ||
+                    err?.code === 'APPS_SCRIPT_TIMEOUT' ||
+                    err instanceof TypeError ||
+                    String(err?.message || '').includes('Failed to fetch') ||
+                    String(err?.message || '').includes('Unexpected token') ||
+                    err?.code === 'OFFLINE';
+                if (attempt < 2 && isTransient) {
+                    await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
                     continue;
                 }
                 throw err;

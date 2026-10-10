@@ -1353,7 +1353,7 @@ export async function upsertAuditSession(
       return data;
     }
 
-    if (session.id) payload.id = session.id;
+    payload.id = session.id || (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     const { data, error } = await supabase
       .from('audit_sessions')
       .insert(payload)

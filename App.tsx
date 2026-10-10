@@ -3199,11 +3199,15 @@ const isTransientGoogleSheetsError = (error: unknown): boolean => {
     return status === 429 || status === 500 || status === 502 || status === 503 || status === 504 ||
         status === 520 || status === 521 || status === 522 || status === 523 || status === 524 ||
         code === 'PGRST000' || code === 'PGRST002' ||
+        code === 'TRANSIENT_HTML_ERROR' || code === 'APPS_SCRIPT_TIMEOUT' ||
         message.includes('bad gateway') ||
         message.includes('service unavailable') ||
         message.includes('schema cache') ||
         message.includes('origin time-out') ||
-        message.includes('failed to fetch');
+        message.includes('failed to fetch') ||
+        message.includes('unexpected token') ||
+        message.includes('demorou para responder') ||
+        message.includes('temporariamente');
 };
 
 const getGoogleSheetsRetryDelay = (failures: number): number =>
@@ -3880,12 +3884,13 @@ const App: React.FC = () => {
         branch?: string | null;
         userEmail?: string | null;
         companies?: any[];
+        allowAllAreas?: boolean;
     }): boolean => {
         const targetUser = params.user ?? currentUser;
         if (!targetUser) return false;
         if (targetUser.role === 'MASTER') return true;
 
-        const { companyId, area, branch, userEmail, companies: compList = companies } = params;
+        const { companyId, area, branch, userEmail, companies: compList = companies, allowAllAreas } = params;
 
         // Se o próprio autor é o usuário logado, tem sempre permissão de visualizar seu próprio registro
         if (userEmail && normalizeUserEmail(userEmail) === normalizeUserEmail(targetUser.email)) {
@@ -3902,6 +3907,7 @@ const App: React.FC = () => {
 
         // Administrador (ADMINISTRATIVO / Gestor de Área)
         if (targetUser.role === 'ADMINISTRATIVO') {
+            if (allowAllAreas) return true;
             const effectiveUserArea = targetUser.area || resolveBranchArea(targetUser.filial);
             const userAreaNorm = normalizeAreaKey(effectiveUserArea || '');
             if (!userAreaNorm) {
@@ -8374,6 +8380,9 @@ const App: React.FC = () => {
                     });
                 });
             });
+            BRANCH_DIRECTORY.forEach(entry => {
+                buildBranchQueryVariants(entry.branch).forEach(v => set.add(v));
+            });
             return Array.from(set);
         }
 
@@ -8385,9 +8394,10 @@ const App: React.FC = () => {
         }
 
         // ADMINISTRATIVO:
-        if (currentUser.filial && isUserScopedAllowed({ user: currentUser, area: currentUser.area, branch: currentUser.filial })) {
-            buildBranchQueryVariants(currentUser.filial).forEach(v => set.add(v));
-        }
+        // No dashboard da rede, o administrativo tem acesso a todas as filiais das áreas atendidas
+        BRANCH_DIRECTORY.forEach(entry => {
+            buildBranchQueryVariants(entry.branch).forEach(v => set.add(v));
+        });
         scopedCompanies.forEach(c => {
             (c.areas || []).forEach((area: any) => {
                 (area.branches || []).forEach((branch: string) => {
@@ -8395,16 +8405,8 @@ const App: React.FC = () => {
                 });
             });
         });
-        if (currentUser.area) {
-            const adminAreaNorm = normalizeAreaKey(currentUser.area);
-            BRANCH_DIRECTORY.forEach(entry => {
-                if (normalizeAreaKey(entry.area) === adminAreaNorm) {
-                    buildBranchQueryVariants(entry.branch).forEach(v => set.add(v));
-                }
-            });
-        }
         return Array.from(set);
-    }, [currentUser, scopedCompanies, isUserScopedAllowed]);
+    }, [currentUser, scopedCompanies]);
 
     const loadDashboardAuditSessions = useCallback((force = false): Promise<void> => {
         if (!currentUser) return Promise.resolve();
@@ -8433,7 +8435,8 @@ const App: React.FC = () => {
                         user: currentUser,
                         branch: session.branch,
                         userEmail: session.user_email,
-                        companies: scopedCompanies
+                        companies: scopedCompanies,
+                        allowAllAreas: true
                     }))
                 : cachedRowsRaw;
 
@@ -8475,7 +8478,8 @@ const App: React.FC = () => {
                     user: currentUser,
                     branch: session.branch,
                     userEmail: session.user_email,
-                    companies: scopedCompanies
+                    companies: scopedCompanies,
+                    allowAllAreas: true
                 })
             );
 
@@ -8497,21 +8501,27 @@ const App: React.FC = () => {
                 }
             });
 
-            const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
-            const detailIds = latestMetadata.map(s => String(s.id));
+            // Garante identificador estável para cada sessão mesmo se a linha original na planilha não possuir coluna id preenchida
+            const latestMetadata = Array.from(latestByBranchAndNumber.values()).map(s => {
+                const fallbackId = String(s.id || `${normalizeBranchLabel(s.branch)}_${s.audit_number}`);
+                return { ...s, id: fallbackId };
+            });
             const metadataSignature = buildAuditMetadataSignature(latestMetadata);
 
-            const [cachedSignature, cachedRows] = await Promise.all([
+            const [cachedSignature, storedCacheRows] = await Promise.all([
                 CacheService.get<string>(dashboardMetaKey),
                 CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
             ]);
 
+            const effectiveCachedRows = (Array.isArray(storedCacheRows) && storedCacheRows.length > 0)
+                ? storedCacheRows
+                : (Array.isArray(cachedRows) ? cachedRows : []);
+
             if (
                 cachedSignature === metadataSignature &&
-                Array.isArray(cachedRows) &&
-                cachedRows.length === latestMetadata.length
+                effectiveCachedRows.length === latestMetadata.length
             ) {
-                startTransition(() => setDashboardAuditSessions(cachedRows));
+                startTransition(() => setDashboardAuditSessions(effectiveCachedRows));
                 dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
                 setDashboardAuditRetryAt(0);
                 setDashboardAuditsError(null);
@@ -8519,7 +8529,7 @@ const App: React.FC = () => {
                 return;
             }
 
-            if (detailIds.length === 0) {
+            if (latestMetadata.length === 0) {
                 setDashboardAuditSessions([]);
                 await CacheService.set(dashboardMetaKey, metadataSignature);
                 await CacheService.set(dashboardCacheKey, []);
@@ -8530,26 +8540,99 @@ const App: React.FC = () => {
                 return;
             }
 
-            const chunkSize = 30;
-            const detailBatches: string[][] = [];
-            for (let i = 0; i < detailIds.length; i += chunkSize) {
-                detailBatches.push(detailIds.slice(i, i + chunkSize));
+            // Otimização Incremental: reaproveita do cache local as sessões que não foram alteradas
+            const cacheByBranchAndAudit = new Map<string, SupabaseService.DbAuditSession>();
+            effectiveCachedRows.forEach(row => {
+                if (!row) return;
+                const bKey = `${normalizeBranchLabel(row.branch)}_${Number(row.audit_number || 0)}`;
+                cacheByBranchAndAudit.set(bKey, row);
+                if (row.id) cacheByBranchAndAudit.set(String(row.id), row);
+            });
+
+            const freshFromCache: SupabaseService.DbAuditSession[] = [];
+            const toFetchMetadata: typeof latestMetadata = [];
+
+            latestMetadata.forEach(meta => {
+                const bKey = `${normalizeBranchLabel(meta.branch)}_${Number(meta.audit_number || 0)}`;
+                const cached = (meta.id ? cacheByBranchAndAudit.get(String(meta.id)) : null) || cacheByBranchAndAudit.get(bKey);
+                const cachedTs = Date.parse(String(cached?.updated_at || cached?.created_at || '')) || 0;
+                const metaTs = Date.parse(String(meta.updated_at || meta.created_at || '')) || 0;
+                const hasValidData = Boolean(cached?.data && typeof cached.data === 'object');
+
+                if (cached && hasValidData && cachedTs >= metaTs) {
+                    freshFromCache.push(cached);
+                } else {
+                    toFetchMetadata.push(meta);
+                }
+            });
+
+            if (toFetchMetadata.length === 0) {
+                startTransition(() => setDashboardAuditSessions(freshFromCache));
+                await CacheService.set(dashboardMetaKey, metadataSignature);
+                await CacheService.set(dashboardCacheKey, freshFromCache);
+                dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+                setDashboardAuditRetryAt(0);
+                setDashboardAuditsError(null);
+                setDashboardAuditsFetchedAt(new Date().toISOString());
+                return;
             }
 
-            const detailResults = await Promise.all(detailBatches.map(async (batch) => {
-                const { data: detailRows, error: detailError } = await supabase
-                    .from('audit_sessions')
-                    .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
-                    .in('id', batch);
-                if (detailError) throw detailError;
-                return (detailRows || []) as SupabaseService.DbAuditSession[];
-            }));
+            // Busca apenas as sessões pendentes/atualizadas em lotes pequenos e sequenciais
+            const pendingBranches = Array.from(new Set(toFetchMetadata.map(m => m.branch).filter(Boolean)));
+            const fetchedDetails: SupabaseService.DbAuditSession[] = [];
+            const batchSize = 4;
 
-            const detailedRows = detailResults.flat();
-            const detailsById = new Map(detailedRows.map(row => [String(row.id), row]));
-            const resolvedRows = latestMetadata
-                .map((meta) => detailsById.get(String(meta.id)))
-                .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
+            for (let i = 0; i < pendingBranches.length; i += batchSize) {
+                const branchBatch = pendingBranches.slice(i, i + batchSize);
+                try {
+                    const { data: batchRows, error: batchError } = await supabase
+                        .from('audit_sessions')
+                        .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
+                        .in('branch', branchBatch)
+                        .eq('status', 'open');
+
+                    if (batchError) {
+                        console.warn(`Aviso ao buscar lote de filiais abertas [${branchBatch.join(', ')}]:`, batchError);
+                    } else if (Array.isArray(batchRows)) {
+                        fetchedDetails.push(...batchRows);
+                    }
+                } catch (batchErr) {
+                    console.warn('Exceção transitória ao buscar lote de filiais abertas:', batchErr);
+                }
+
+                if (i + batchSize < pendingBranches.length) {
+                    await new Promise(r => setTimeout(r, 120));
+                }
+            }
+
+            const allAvailableMap = new Map<string, SupabaseService.DbAuditSession>();
+            freshFromCache.forEach(row => {
+                const bKey = `${normalizeBranchLabel(row.branch)}_${Number(row.audit_number || 0)}`;
+                allAvailableMap.set(bKey, row);
+                if (row.id) allAvailableMap.set(String(row.id), row);
+            });
+            fetchedDetails.forEach(row => {
+                const bKey = `${normalizeBranchLabel(row.branch)}_${Number(row.audit_number || 0)}`;
+                allAvailableMap.set(bKey, row);
+                if (row.id) allAvailableMap.set(String(row.id), row);
+            });
+
+            const resolvedRows = latestMetadata.map(meta => {
+                const bKey = `${normalizeBranchLabel(meta.branch)}_${Number(meta.audit_number || 0)}`;
+                const match = (meta.id ? allAvailableMap.get(String(meta.id)) : null) || allAvailableMap.get(bKey);
+                if (match) return match;
+                return {
+                    id: String(meta.id),
+                    branch: meta.branch,
+                    audit_number: meta.audit_number,
+                    status: meta.status,
+                    progress: meta.progress,
+                    user_email: meta.user_email,
+                    created_at: meta.created_at,
+                    updated_at: meta.updated_at,
+                    data: null as any
+                } as SupabaseService.DbAuditSession;
+            });
 
             startTransition(() => setDashboardAuditSessions(resolvedRows));
             await CacheService.set(dashboardMetaKey, metadataSignature);
@@ -8619,7 +8702,8 @@ const App: React.FC = () => {
                         user: currentUser,
                         branch: session.branch,
                         userEmail: session.user_email,
-                        companies: scopedCompanies
+                        companies: scopedCompanies,
+                        allowAllAreas: true
                     }))
                 : cachedRowsRaw;
 
@@ -8640,12 +8724,13 @@ const App: React.FC = () => {
 
             setIsLoadingCompletedDashboardAudits(true);
             try {
+            const completedStatusList = ['completed', 'concluida', 'concluída', 'fechada', 'COMPLETED', 'CONCLUIDA', 'FECHADA', 'Concluída', 'Concluida'];
             let metadataQuery = supabase
                 .from('audit_sessions')
                 .select('id, branch, audit_number, status, progress, user_email, created_at, updated_at')
-                .eq('status', 'completed')
+                .in('status', completedStatusList)
                 .order('updated_at', { ascending: false })
-                .limit(1000); // We might need a larger limit for completed audits
+                .limit(1000);
 
             if (currentUser.role !== 'MASTER' && queryBranches.length > 0) {
                 metadataQuery = metadataQuery.in('branch', queryBranches);
@@ -8661,11 +8746,12 @@ const App: React.FC = () => {
                     user: currentUser,
                     branch: session.branch,
                     userEmail: session.user_email,
-                    companies: scopedCompanies
+                    companies: scopedCompanies,
+                    allowAllAreas: true
                 })
             );
 
-            // Keep the latest completed session per branch and audit_number
+            // Mantém a versão mais recente por filial e número de auditoria
             const latestByBranchAndNumber = new Map<string, typeof scopedMetadata[number]>();
             scopedMetadata.forEach((session) => {
                 const branchLabel = normalizeBranchLabel(session.branch);
@@ -8683,21 +8769,27 @@ const App: React.FC = () => {
                 }
             });
 
-            const latestMetadata = Array.from(latestByBranchAndNumber.values()).filter(s => !!s.id);
-            const detailIds = latestMetadata.map(s => String(s.id));
+            // Garante identificador estável para cada sessão mesmo se a linha original na planilha não possuir coluna id preenchida
+            const latestMetadata = Array.from(latestByBranchAndNumber.values()).map(s => {
+                const fallbackId = String(s.id || `${normalizeBranchLabel(s.branch)}_${s.audit_number}`);
+                return { ...s, id: fallbackId };
+            });
             const metadataSignature = buildAuditMetadataSignature(latestMetadata);
 
-            const [cachedSignature, cachedRows] = await Promise.all([
+            const [cachedSignature, storedCacheRows] = await Promise.all([
                 CacheService.get<string>(dashboardMetaKey),
                 CacheService.get<SupabaseService.DbAuditSession[]>(dashboardCacheKey)
             ]);
 
+            const effectiveCachedRows = (Array.isArray(storedCacheRows) && storedCacheRows.length > 0)
+                ? storedCacheRows
+                : (Array.isArray(cachedRows) ? cachedRows : []);
+
             if (
                 cachedSignature === metadataSignature &&
-                Array.isArray(cachedRows) &&
-                cachedRows.length === latestMetadata.length
+                effectiveCachedRows.length === latestMetadata.length
             ) {
-                startTransition(() => setDashboardCompletedAuditSessions(cachedRows));
+                startTransition(() => setDashboardCompletedAuditSessions(effectiveCachedRows));
                 dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
                 setDashboardAuditRetryAt(0);
                 setCompletedDashboardAuditsError(null);
@@ -8705,7 +8797,7 @@ const App: React.FC = () => {
                 return;
             }
 
-            if (detailIds.length === 0) {
+            if (latestMetadata.length === 0) {
                 setDashboardCompletedAuditSessions([]);
                 await CacheService.set(dashboardMetaKey, metadataSignature);
                 await CacheService.set(dashboardCacheKey, []);
@@ -8716,26 +8808,99 @@ const App: React.FC = () => {
                 return;
             }
 
-            const chunkSize = 30;
-            const detailBatches: string[][] = [];
-            for (let i = 0; i < detailIds.length; i += chunkSize) {
-                detailBatches.push(detailIds.slice(i, i + chunkSize));
+            // Otimização Incremental: reaproveita do cache local as sessões concluídas não alteradas
+            const cacheByBranchAndAudit = new Map<string, SupabaseService.DbAuditSession>();
+            effectiveCachedRows.forEach(row => {
+                if (!row) return;
+                const bKey = `${normalizeBranchLabel(row.branch)}_${Number(row.audit_number || 0)}`;
+                cacheByBranchAndAudit.set(bKey, row);
+                if (row.id) cacheByBranchAndAudit.set(String(row.id), row);
+            });
+
+            const freshFromCache: SupabaseService.DbAuditSession[] = [];
+            const toFetchMetadata: typeof latestMetadata = [];
+
+            latestMetadata.forEach(meta => {
+                const bKey = `${normalizeBranchLabel(meta.branch)}_${Number(meta.audit_number || 0)}`;
+                const cached = (meta.id ? cacheByBranchAndAudit.get(String(meta.id)) : null) || cacheByBranchAndAudit.get(bKey);
+                const cachedTs = Date.parse(String(cached?.updated_at || cached?.created_at || '')) || 0;
+                const metaTs = Date.parse(String(meta.updated_at || meta.created_at || '')) || 0;
+                const hasValidData = Boolean(cached?.data && typeof cached.data === 'object');
+
+                if (cached && hasValidData && cachedTs >= metaTs) {
+                    freshFromCache.push(cached);
+                } else {
+                    toFetchMetadata.push(meta);
+                }
+            });
+
+            if (toFetchMetadata.length === 0) {
+                startTransition(() => setDashboardCompletedAuditSessions(freshFromCache));
+                await CacheService.set(dashboardMetaKey, metadataSignature);
+                await CacheService.set(dashboardCacheKey, freshFromCache);
+                dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
+                setDashboardAuditRetryAt(0);
+                setCompletedDashboardAuditsError(null);
+                setCompletedDashboardAuditsFetchedAt(new Date().toISOString());
+                return;
             }
 
-            const detailResults = await Promise.all(detailBatches.map(async (batch) => {
-                const { data: detailRows, error: detailError } = await supabase
-                    .from('audit_sessions')
-                    .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
-                    .in('id', batch);
-                if (detailError) throw detailError;
-                return (detailRows || []) as SupabaseService.DbAuditSession[];
-            }));
+            // Busca apenas as sessões pendentes em lotes pequenos sequenciais para não sobrecarregar o Apps Script
+            const pendingBranches = Array.from(new Set(toFetchMetadata.map(m => m.branch).filter(Boolean)));
+            const fetchedDetails: SupabaseService.DbAuditSession[] = [];
+            const batchSize = 4;
 
-            const detailedRows = detailResults.flat();
-            const detailsById = new Map(detailedRows.map(row => [String(row.id), row]));
-            const resolvedRows = latestMetadata
-                .map((meta) => detailsById.get(String(meta.id)))
-                .filter((row): row is SupabaseService.DbAuditSession => Boolean(row));
+            for (let i = 0; i < pendingBranches.length; i += batchSize) {
+                const branchBatch = pendingBranches.slice(i, i + batchSize);
+                try {
+                    const { data: batchRows, error: batchError } = await supabase
+                        .from('audit_sessions')
+                        .select('id, branch, audit_number, status, progress, data, user_email, created_at, updated_at')
+                        .in('branch', branchBatch)
+                        .in('status', completedStatusList);
+
+                    if (batchError) {
+                        console.warn(`Aviso ao buscar lote de filiais concluídas [${branchBatch.join(', ')}]:`, batchError);
+                    } else if (Array.isArray(batchRows)) {
+                        fetchedDetails.push(...batchRows);
+                    }
+                } catch (batchErr) {
+                    console.warn('Exceção transitória ao buscar lote de filiais concluídas:', batchErr);
+                }
+
+                if (i + batchSize < pendingBranches.length) {
+                    await new Promise(r => setTimeout(r, 120));
+                }
+            }
+
+            const allAvailableMap = new Map<string, SupabaseService.DbAuditSession>();
+            freshFromCache.forEach(row => {
+                const bKey = `${normalizeBranchLabel(row.branch)}_${Number(row.audit_number || 0)}`;
+                allAvailableMap.set(bKey, row);
+                if (row.id) allAvailableMap.set(String(row.id), row);
+            });
+            fetchedDetails.forEach(row => {
+                const bKey = `${normalizeBranchLabel(row.branch)}_${Number(row.audit_number || 0)}`;
+                allAvailableMap.set(bKey, row);
+                if (row.id) allAvailableMap.set(String(row.id), row);
+            });
+
+            const resolvedRows = latestMetadata.map(meta => {
+                const bKey = `${normalizeBranchLabel(meta.branch)}_${Number(meta.audit_number || 0)}`;
+                const match = (meta.id ? allAvailableMap.get(String(meta.id)) : null) || allAvailableMap.get(bKey);
+                if (match) return match;
+                return {
+                    id: String(meta.id),
+                    branch: meta.branch,
+                    audit_number: meta.audit_number,
+                    status: meta.status,
+                    progress: meta.progress,
+                    user_email: meta.user_email,
+                    created_at: meta.created_at,
+                    updated_at: meta.updated_at,
+                    data: null as any
+                } as SupabaseService.DbAuditSession;
+            });
 
             startTransition(() => setDashboardCompletedAuditSessions(resolvedRows));
             await CacheService.set(dashboardMetaKey, metadataSignature);
@@ -8795,10 +8960,15 @@ const App: React.FC = () => {
                 return;
             }
             setDashboardAuditRetryAt(0);
-            void Promise.allSettled([
-                loadDashboardAuditSessions(),
-                loadCompletedDashboardAuditSessions()
-            ]);
+            void (async () => {
+                try {
+                    await loadDashboardAuditSessions();
+                    await new Promise(r => setTimeout(r, 200));
+                    await loadCompletedDashboardAuditSessions();
+                } catch {
+                    /* erros tratados internamente em cada loader */
+                }
+            })();
         };
 
         timerId = window.setTimeout(retryIfReady, Math.max(100, dashboardAuditRetryAt - Date.now()));
@@ -8829,13 +8999,14 @@ const App: React.FC = () => {
             if (openDataIsFresh && completedDataIsFresh) return;
             if (auditCrossLoadScheduledRef.current) return;
             auditCrossLoadScheduledRef.current = true;
-            scheduleBackgroundTask(() => {
-                void Promise.allSettled([
-                    openDataIsFresh ? Promise.resolve() : loadDashboardAuditSessions(!!dashboardAuditsFetchedAt),
-                    completedDataIsFresh ? Promise.resolve() : loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt)
-                ]).finally(() => {
+            scheduleBackgroundTask(async () => {
+                try {
+                    if (!openDataIsFresh) await loadDashboardAuditSessions(!!dashboardAuditsFetchedAt);
+                    await new Promise(r => setTimeout(r, 200));
+                    if (!completedDataIsFresh) await loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt);
+                } finally {
                     auditCrossLoadScheduledRef.current = false;
-                });
+                }
             }, 1200);
             return;
         }
@@ -8845,12 +9016,19 @@ const App: React.FC = () => {
         if (openDataIsFresh && completedDataIsFresh) return;
         if (dashboardAuditLoadScheduledRef.current) return;
         dashboardAuditLoadScheduledRef.current = true;
-        void Promise.allSettled([
-            (openDataIsFresh || isLoadingDashboardAudits) ? Promise.resolve() : loadDashboardAuditSessions(!!dashboardAuditsFetchedAt),
-            (completedDataIsFresh || isLoadingCompletedDashboardAudits) ? Promise.resolve() : loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt)
-        ]).finally(() => {
-            dashboardAuditLoadScheduledRef.current = false;
-        });
+        scheduleBackgroundTask(async () => {
+            try {
+                if (!openDataIsFresh && !isLoadingDashboardAudits) {
+                    await loadDashboardAuditSessions(!!dashboardAuditsFetchedAt);
+                }
+                await new Promise(r => setTimeout(r, 200));
+                if (!completedDataIsFresh && !isLoadingCompletedDashboardAudits) {
+                    await loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt);
+                }
+            } finally {
+                dashboardAuditLoadScheduledRef.current = false;
+            }
+        }, 100);
     }, [
         currentView,
         currentUser,
@@ -8871,23 +9049,32 @@ const App: React.FC = () => {
         ) return;
 
         let active = true;
-        const syncNow = () => {
+        const syncNow = async () => {
             if (!active || document.hidden || !navigator.onLine) return;
             if (dashboardOpenAuditRequestRef.current || dashboardCompletedAuditRequestRef.current) return;
-            void Promise.allSettled([
-                loadDashboardAuditSessions(true),
-                loadCompletedDashboardAuditSessions(true)
-            ]).finally(() => {
-                if (active) setDashboardClockTick(Date.now());
-            });
+            try {
+                await loadDashboardAuditSessions(true);
+            } catch (e) {
+                console.warn('Aviso na sincronização de auditorias abertas:', e);
+            }
+            if (!active) return;
+            // Intervalo suave para não concorrer no Apps Script
+            await new Promise(r => setTimeout(r, 200));
+            if (!active) return;
+            try {
+                await loadCompletedDashboardAuditSessions(true);
+            } catch (e) {
+                console.warn('Aviso na sincronização de auditorias concluídas:', e);
+            }
+            if (active) setDashboardClockTick(Date.now());
         };
         const syncWhenVisible = () => {
-            if (!document.hidden) syncNow();
+            if (!document.hidden) void syncNow();
         };
 
         // Sincroniza ao entrar na aba (dashboard/audit) ou ao recarregar a tela (F5)
         // Sem polling contínuo periódico para máxima fluidez e sem requisições desnecessárias
-        syncNow();
+        void syncNow();
         return () => {
             active = false;
         };
@@ -9173,7 +9360,8 @@ const App: React.FC = () => {
                 user: currentUser,
                 branch: session.branch,
                 userEmail: session.user_email,
-                companies: scopedCompanies
+                companies: scopedCompanies,
+                allowAllAreas: true
             })) return;
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
@@ -9609,7 +9797,8 @@ const App: React.FC = () => {
                 area: branchArea,
                 branch: branchLabel,
                 userEmail: session.user_email,
-                companies: scopedCompanies
+                companies: scopedCompanies,
+                allowAllAreas: true
             })) {
                 return;
             }
@@ -9832,7 +10021,8 @@ const App: React.FC = () => {
                 user: currentUser,
                 branch: session.branch,
                 userEmail: session.user_email,
-                companies: scopedCompanies
+                companies: scopedCompanies,
+                allowAllAreas: true
             })) return;
             const branchLabel = normalizeBranchLabel(session.branch);
             const auditNumber = Number(session.audit_number || 0);
@@ -10258,7 +10448,8 @@ const App: React.FC = () => {
                 area: branchArea,
                 branch: branchLabel,
                 userEmail: session.user_email,
-                companies: scopedCompanies
+                companies: scopedCompanies,
+                allowAllAreas: true
             })) {
                 return;
             }
@@ -11398,11 +11589,14 @@ const App: React.FC = () => {
             CacheService.remove(`${openCacheKey}_meta`),
             CacheService.remove(completedCacheKey),
             CacheService.remove(`${completedCacheKey}_meta`)
-        ]).finally(() => {
-            void Promise.allSettled([
-                loadDashboardAuditSessions(true),
-                loadCompletedDashboardAuditSessions(true)
-            ]);
+        ]).finally(async () => {
+            try {
+                await loadDashboardAuditSessions(true);
+                await new Promise(r => setTimeout(r, 200));
+                await loadCompletedDashboardAuditSessions(true);
+            } catch {
+                /* tratado internamente */
+            }
         });
     }, [
         markAuditManualBranchSelectionRequired,
@@ -11691,10 +11885,15 @@ const App: React.FC = () => {
                                         expanded={isAuditCrossPanelExpanded}
                                         onToggleExpanded={setIsAuditCrossPanelExpanded}
                                         onRefresh={() => {
-                                            void Promise.allSettled([
-                                                loadDashboardAuditSessions(true),
-                                                loadCompletedDashboardAuditSessions(true)
-                                            ]);
+                                            void (async () => {
+                                                try {
+                                                    await loadDashboardAuditSessions(true);
+                                                    await new Promise(r => setTimeout(r, 200));
+                                                    await loadCompletedDashboardAuditSessions(true);
+                                                } catch {
+                                                    /* tratado internamente */
+                                                }
+                                            })();
                                         }}
                                         onExport={(status) => {
                                             if (status === 'completed') {

@@ -273,7 +273,12 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
             const stored = await repository.list<Row>(sheet);
 
             if (this.operation === 'select') {
-                const matching = stored.map(record => record.value).filter(row => this.matches(row));
+                const matching = stored.map(record => {
+                    const row = clone(record.value || {});
+                    if (!row.id && record.id) row.id = record.id;
+                    if (!row.updated_at && record.updatedAt) row.updated_at = record.updatedAt;
+                    return row;
+                }).filter(row => this.matches(row));
                 return this.shapeRows(matching, matching.length);
             }
 
@@ -289,7 +294,7 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                 const keyFields = this.conflictFields || [...GOOGLE_SOURCE_KEY_FIELDS[this.table]];
                 for (const raw of incoming) {
                     const row = clone(raw);
-                    if (!row.id && keyFields.includes('id')) row.id = createId();
+                    if (!row.id) row.id = createId();
                     if (!row.created_at) row.created_at = now;
                     if (!row.updated_at) row.updated_at = now;
                     const existingIndex = next.findIndex(record =>
@@ -300,6 +305,8 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                     }
                     if (existingIndex >= 0) {
                         const existing = next[existingIndex];
+                        if (!row.id && existing.value?.id) row.id = existing.value.id;
+                        else if (!row.id && existing.id) row.id = existing.id;
                         const merged = { ...existing.value, ...row, updated_at: row.updated_at || now };
                         const updatedRecord = {
                             ...existing,
@@ -313,6 +320,7 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
                         affected.push(merged);
                     } else {
                         const id = String(row.id || createId());
+                        row.id = id;
                         const record: StoredSheetRecord<Row> = {
                             id,
                             key: recordKey(row, keyFields),
