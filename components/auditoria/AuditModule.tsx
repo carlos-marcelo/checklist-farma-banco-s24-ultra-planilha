@@ -60,6 +60,7 @@ import {
 const GROUP_UPLOAD_IDS = ['2000', '3000', '4000', '8000', '10000', '66', '67'] as const;
 const AUDIT_CLIENT_NORMALIZED_VERSION = 1;
 const AUDIT_CLASSIFICATION_SCHEMA_VERSION = 2;
+const AUDIT_CLASSIFICATION_MIGRATION_ATTEMPT_VERSION = 6;
 const AUDIT_HISTORY_MEMORY_TTL_MS = 15_000;
 type GroupUploadId = typeof GROUP_UPLOAD_IDS[number];
 
@@ -4192,19 +4193,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 'persist-exact'
             );
 
-            if (!session.id && exactSession?.id) {
-                session = { ...session, id: exactSession.id };
+            // A consulta completa pode exceder o tempo limite em auditorias grandes.
+            // Nesse caso, os metadados leves ainda identificam com segurança a mesma
+            // sessão aberta e evitam que uma atualização seja confundida com criação.
+            const resolvedExistingId = exactSession?.id || (
+                isSameAudit
+                    ? (freshLatest?.id || latestMeta?.id)
+                    : undefined
+            );
+            if (!session.id && resolvedExistingId) {
+                session = { ...session, id: resolvedExistingId };
             }
 
-            if (!allowCreate && !session.id && session.status === 'open') {
-                console.warn(
-                    `Bloqueamos a criação automática do inventário Nº ${session.audit_number} na filial ${branch}.\n\n` +
-                    `Para criar um inventário novo, use o botão de iniciar/carregar inventário.`
-                );
-                return null;
-            }
-
-            if (session.status === 'open' && exactSession?.status === 'completed' && !allowReopen) {
+            const resolvedExistingStatus = exactSession?.status || (isSameAudit ? latestMeta?.status : undefined);
+            if (session.status === 'open' && resolvedExistingStatus === 'completed' && !allowReopen) {
                 alert(
                     `Inventário Nº ${session.audit_number} já está concluído.\n\n` +
                     `Abra em modo consulta ou use a opção Reabrir para alterar esse inventário.`
@@ -4341,7 +4343,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     ? withAuditDataBranch(normalizedIncoming.data as AuditData, branch)
                     : incomingData) as any,
                 updated_at: baseUpdatedAt || undefined
-            }, { allowReopen });
+            }, { allowReopen, requireExisting: !allowCreate });
             if (!saved) {
                 if (session.status === 'completed') return null;
                 if (options?.requireRemote) return null;
@@ -6697,11 +6699,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     : effectiveNextAuditNumber) || 1
             );
             const targetSessionId = shouldReclassifyOpen
-                ? (dbSessionId || (
+                ? ((
                     latestOpenAudit && Number(latestOpenAudit.audit_number || 0) === targetAuditNumber
                         ? latestOpenAudit.id
                         : undefined
-                ))
+                ) || dbSessionId)
                 : dbSessionId;
             const savedSession = await persistAuditSession({
                 id: targetSessionId,
@@ -6774,7 +6776,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         if (!isAuditClassificationOutdated(sourceFiles)) return;
         if (!effectiveStockFile || effectiveGroupFiles.length === 0 || !effectiveDeptIdsFile || !effectiveCatIdsFile) return;
 
-        const migrationKey = `${dbSessionId}|${selectedFilial}|classification-v${AUDIT_CLASSIFICATION_SCHEMA_VERSION}`;
+        const migrationKey = `${dbSessionId}|${selectedFilial}|classification-v${AUDIT_CLASSIFICATION_SCHEMA_VERSION}|attempt-v${AUDIT_CLASSIFICATION_MIGRATION_ATTEMPT_VERSION}`;
         if (automaticClassificationMigrationAttemptsRef.current.has(migrationKey)) return;
         automaticClassificationMigrationAttemptsRef.current.add(migrationKey);
 

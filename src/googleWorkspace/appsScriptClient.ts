@@ -76,6 +76,9 @@ class GoogleAppsScriptClient {
     }
 
     async login(email: string, password: string): Promise<AppsScriptSessionUser> {
+        // Remove o token anterior antes de autenticar. Requisições que já estavam
+        // em voo continuam com uma cópia dele, mas não poderão invalidar a nova sessão.
+        saveSession(null);
         const data = await this.request<StoredSession>('login', { email, password }, false);
         saveSession(data);
         return data.user;
@@ -141,8 +144,18 @@ class GoogleAppsScriptClient {
                     const message = typeof detail === 'string' ? detail : detail.message || 'Falha na API segura do Google.';
                     const code = typeof detail === 'string' ? 'APPS_SCRIPT_ERROR' : detail.code || 'APPS_SCRIPT_ERROR';
                     if (code === 'AUTH_REQUIRED' || code === 'SESSION_EXPIRED') {
-                        this.clearSession();
-                        if (typeof window !== 'undefined') window.dispatchEvent(new Event('checklist-farma:session-expired'));
+                        const currentSession = readSession();
+                        const belongsToCurrentSession = !!(
+                            session?.token &&
+                            currentSession?.token &&
+                            currentSession.token === session.token
+                        );
+                        if (belongsToCurrentSession) {
+                            this.clearSession();
+                            if (typeof window !== 'undefined') {
+                                window.dispatchEvent(new Event('checklist-farma:session-expired'));
+                            }
+                        }
                     }
                     throw Object.assign(new Error(message), { code });
                 }

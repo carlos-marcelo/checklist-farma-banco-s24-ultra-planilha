@@ -1270,7 +1270,7 @@ export async function fetchLatestAuditMetadata(branch: string): Promise<{ id: st
 
 export async function upsertAuditSession(
   session: DbAuditSession,
-  options: { allowReopen?: boolean } = {}
+  options: { allowReopen?: boolean; requireExisting?: boolean } = {}
 ): Promise<DbAuditSession | null> {
   try {
     let safeData = session.data ? JSON.parse(JSON.stringify(session.data)) : null;
@@ -1292,13 +1292,32 @@ export async function upsertAuditSession(
       delete safeData.lastLocalUpdate;
     }
 
-    const { data: existing, error: existingError } = await supabase
-      .from('audit_sessions')
-      .select('id, status, data')
-      .eq('branch', String(session.branch))
-      .eq('audit_number', session.audit_number)
-      .maybeSingle();
-    if (existingError) throw existingError;
+    let existing: Pick<DbAuditSession, 'id' | 'status' | 'data'> | null = null;
+    if (session.id) {
+      const byId = await supabase
+        .from('audit_sessions')
+        .select('id, status, data')
+        .eq('id', session.id)
+        .maybeSingle();
+      if (byId.error) throw byId.error;
+      existing = byId.data;
+    }
+    if (!existing) {
+      const byNaturalKey = await supabase
+        .from('audit_sessions')
+        .select('id, status, data')
+        .eq('branch', String(session.branch))
+        .eq('audit_number', session.audit_number)
+        .maybeSingle();
+      if (byNaturalKey.error) throw byNaturalKey.error;
+      existing = byNaturalKey.data;
+    }
+
+    const legacyStableId = options.requireExisting && !session.id
+      ? `audit-${String(session.branch).trim().replace(/[^a-zA-Z0-9_-]+/g, '-')}-${session.audit_number}`
+      : null;
+    const knownSessionId = session.id || legacyStableId;
+    const useKnownIdentityUpsert = !!(options.requireExisting && !existing?.id && knownSessionId);
 
     if (session.status === 'open' && existing?.status === 'completed' && !options.allowReopen) {
       console.warn(
@@ -1332,6 +1351,30 @@ export async function upsertAuditSession(
       user_email: session.user_email,
       updated_at: new Date().toISOString()
     };
+
+    if (useKnownIdentityUpsert) {
+      // Algumas sessões antigas podem não aparecer no SELECT de visibilidade,
+      // embora seu ID já tenha sido obtido pelo histórico autorizado. O UPSERT
+      // pela chave natural permite ao servidor validar a escrita e atualizar a
+      // linha existente sem criar outro número de inventário.
+      payload.id = knownSessionId;
+      const { data, error } = await supabase
+        .from('audit_sessions')
+        .upsert(payload, { onConflict: 'branch,audit_number' })
+        .select()
+        .single();
+      if (error) throw error;
+      if (!data || String(data.id || '') !== String(knownSessionId)) {
+        console.warn('[AuditFlow] Atualização por identidade não foi confirmada.', {
+          branch: session.branch,
+          auditNumber: session.audit_number,
+          expectedId: knownSessionId,
+          returnedId: data?.id || null
+        });
+        return null;
+      }
+      return data;
+    }
 
     if (existing?.id) {
       // A condição de status faz a proteção no mesmo UPDATE. Se outra aba concluir
