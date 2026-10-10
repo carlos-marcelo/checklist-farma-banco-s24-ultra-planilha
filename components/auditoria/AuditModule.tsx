@@ -1800,26 +1800,34 @@ const isGlobalStockDifferentFromApplied = (sourceFiles: any, globalStockMeta: an
     const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
     if (!Number.isFinite(globalTs)) return false;
 
-    const globalSignature = getStockFileSignature(globalStockMeta);
-    const appliedSignature = getAppliedStockSignature(sourceFiles);
-
-    const globalContentSignature = getStockFileContentSignature(globalStockMeta);
-    const appliedContentSignature = getStockFileContentSignature(sourceFiles?.stock);
-
+    // Se já foi aplicado estoque nesta auditoria por qualquer usuário:
     if (Number.isFinite(appliedTs)) {
-        if (globalTs > appliedTs + 1_000) return true;
-        if (
-            (globalSignature && appliedSignature && globalSignature === appliedSignature) ||
-            (globalContentSignature && appliedContentSignature && globalContentSignature === appliedContentSignature)
-        ) {
+        // Se a base do Cadastro Base não foi enviada APÓS o estoque já ter sido aplicado
+        // (com tolerância de 10s para relógio/jitter de rede), o estoque já está atualizado!
+        if (globalTs <= appliedTs + 10_000) {
             return false;
         }
+
+        // Se globalTs é estritamente maior que appliedTs + 10_000, verificar se na verdade
+        // é o mesmo arquivo (mesma assinatura de upload, mesmo tamanho/conteúdo ou mesmo nome)
+        const globalSignature = getStockFileSignature(globalStockMeta);
+        const appliedSignature = getAppliedStockSignature(sourceFiles);
+        if (globalSignature && appliedSignature && globalSignature === appliedSignature) return false;
+
+        const globalContentSignature = getStockFileContentSignature(globalStockMeta);
+        const appliedContentSignature = getStockFileContentSignature(sourceFiles?.stock);
+        if (globalContentSignature && appliedContentSignature && globalContentSignature === appliedContentSignature) return false;
+
+        const globalFileName = String(globalStockMeta.file_name || globalStockMeta.fileName || globalStockMeta.name || '').trim().toLowerCase();
+        const appliedFileName = String(sourceFiles?.stock?.file_name || sourceFiles?.stock?.fileName || sourceFiles?.stock?.name || '').trim().toLowerCase();
+        if (globalFileName && appliedFileName && globalFileName === appliedFileName && appliedTs >= globalTs - 30_000) {
+            return false;
+        }
+
+        return true;
     }
 
-    if (globalSignature && appliedSignature) return globalSignature !== appliedSignature;
-    if (globalContentSignature && appliedContentSignature) return globalContentSignature !== appliedContentSignature;
-
-    return !Number.isFinite(appliedTs);
+    return true;
 };
 
 const getBaseFileTimestampRaw = (meta: any): string | null =>
@@ -1874,27 +1882,76 @@ const isGlobalBaseFileDifferentFromApplied = (globalMeta: any, applied: any, mod
     }
 
     if (globalSignature && appliedSignature) return globalSignature !== appliedSignature;
-    return true;
+    return false;
 };
 
 const isGlobalAuditStructureDifferentFromApplied = (
     sourceFiles: any,
     groupMeta: Record<GroupUploadId, any>,
     deptMeta: any,
-    catMeta: any
+    catMeta: any,
+    data?: any
 ): boolean => {
+    const hasExistingStructure = !!(data?.groups && data.groups.length > 0 && data.groups.some((g: any) => (g.departments?.length || 0) > 0));
     const appliedGroups = Array.isArray(sourceFiles?.groups) ? sourceFiles.groups : [];
+
     for (const groupId of GROUP_UPLOAD_IDS) {
+        const meta = groupMeta?.[groupId];
+        if (!meta) continue;
         const applied = appliedGroups.find((entry: any) => normalizeScopeId(entry?.groupId) === normalizeScopeId(groupId));
-        if (isGlobalBaseFileDifferentFromApplied(groupMeta?.[groupId], applied, GROUP_GLOBAL_BASE_KEYS[groupId])) return true;
+        if (!applied && hasExistingStructure) {
+            const globalRaw = getBaseFileTimestampRaw(meta);
+            const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
+            const importedTs = sourceFiles?.importedAt ? new Date(sourceFiles.importedAt).getTime() : NaN;
+            if (Number.isFinite(globalTs) && Number.isFinite(importedTs) && globalTs <= importedTs + 60_000) {
+                continue;
+            }
+        }
+        if (isGlobalBaseFileDifferentFromApplied(meta, applied, GROUP_GLOBAL_BASE_KEYS[groupId])) return true;
     }
-    if (isGlobalBaseFileDifferentFromApplied(deptMeta, sourceFiles?.deptIds, AUDIT_DEPT_IDS_GLOBAL_KEY)) return true;
-    if (isGlobalBaseFileDifferentFromApplied(catMeta, sourceFiles?.catIds, AUDIT_CAT_IDS_GLOBAL_KEY)) return true;
+    if (deptMeta) {
+        const isDiff = isGlobalBaseFileDifferentFromApplied(deptMeta, sourceFiles?.deptIds, AUDIT_DEPT_IDS_GLOBAL_KEY);
+        if (isDiff) {
+            if (hasExistingStructure) {
+                const globalRaw = getBaseFileTimestampRaw(deptMeta);
+                const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
+                const importedTs = sourceFiles?.importedAt ? new Date(sourceFiles.importedAt).getTime() : NaN;
+                if (!Number.isFinite(globalTs) || !Number.isFinite(importedTs) || globalTs > importedTs + 60_000) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+    }
+    if (catMeta) {
+        const isDiff = isGlobalBaseFileDifferentFromApplied(catMeta, sourceFiles?.catIds, AUDIT_CAT_IDS_GLOBAL_KEY);
+        if (isDiff) {
+            if (hasExistingStructure) {
+                const globalRaw = getBaseFileTimestampRaw(catMeta);
+                const globalTs = globalRaw ? new Date(globalRaw).getTime() : NaN;
+                const importedTs = sourceFiles?.importedAt ? new Date(sourceFiles.importedAt).getTime() : NaN;
+                if (!Number.isFinite(globalTs) || !Number.isFinite(importedTs) || globalTs > importedTs + 60_000) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+    }
     return false;
 };
 
-const isAuditClassificationOutdated = (sourceFiles: any): boolean =>
-    Number(sourceFiles?.classificationSchemaVersion || 0) < AUDIT_CLASSIFICATION_SCHEMA_VERSION;
+const isAuditClassificationOutdated = (sourceFiles: any, data?: any): boolean => {
+    if (Number(sourceFiles?.classificationSchemaVersion || 0) >= AUDIT_CLASSIFICATION_SCHEMA_VERSION) {
+        return false;
+    }
+    const groups = Array.isArray(data?.groups) ? data.groups : [];
+    if (groups.length > 0 && groups.some((g: any) => Array.isArray(g.departments) && g.departments.length > 0)) {
+        return false;
+    }
+    return true;
+};
 
 const getTermMetricsTimestamp = (metrics: any) => {
     const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
@@ -3231,9 +3288,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                 const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
                                 const baseMeta = globalBaseMetaRef.current;
                                 const hasPendingGlobalBaseAtOpenChoice =
-                                    isAuditClassificationOutdated(sourceFiles) ||
+                                    isAuditClassificationOutdated(sourceFiles, latest.data) ||
                                     isGlobalStockDifferentFromApplied(sourceFiles, baseMeta.stock) ||
-                                    isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat);
+                                    isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat, latest.data);
                                 if (completedCount > 0 && !hasPendingGlobalBaseAtOpenChoice) {
                                     const openActive = window.confirm(
                                         `Existe auditoria em aberto (Nº ${latest.audit_number}) e ${completedCount} inventário(s) concluído(s) nesta filial.\n\n` +
@@ -3317,8 +3374,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                             const bestRaw = officialUploadRaw || sessionTsRaw || latest.created_at || null;
                             const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
                             const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, baseMeta.stock);
-                            const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat);
-                            const hasPendingClassification = isAuditClassificationOutdated(sourceFiles);
+                            const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat, latest.data);
+                            const hasPendingClassification = isAuditClassificationOutdated(sourceFiles, latest.data);
                             return {
                                 latestStockTs: bestRaw,
                                 hasPendingGlobalStock,
@@ -3337,9 +3394,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                             // Estoque manual dentro do módulo foi descontinuado.
                             // Sempre que o Cadastro Base estiver mais novo que o estoque processado da auditoria,
                             // a auditoria em aberto deve voltar para a tela de atualização até o saldo ser aplicado.
+                            const stockTs = latestStockTs ? new Date(latestStockTs).getTime() : NaN;
+                            const syncKey = `${latest.id || 'no_session'}|${requestedFilial}|${currentBaseMeta.stock?.module_key || 'stock'}|${Number.isFinite(stockTs) ? stockTs : latestStockTs || 'pending'}|${currentBaseMeta.structureSignature}`;
+
                             if (hasPendingGlobalBase) {
-                                const stockTs = latestStockTs ? new Date(latestStockTs).getTime() : NaN;
-                                const syncKey = `${latest.id || 'no_session'}|${requestedFilial}|${currentBaseMeta.stock?.module_key || 'stock'}|${Number.isFinite(stockTs) ? stockTs : latestStockTs || 'pending'}|${currentBaseMeta.structureSignature}`;
                                 enterStockUpdateMode({
                                     stockTsRaw: latestStockTs,
                                     syncKey,
@@ -3347,6 +3405,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                     reason: hasPendingClassification ? 'classification' : (hasPendingGlobalStock ? 'stock' : (hasPendingGlobalStructure ? 'structure' : 'base'))
                                 });
                             } else {
+                                lastAutoStockSyncKeyRef.current = syncKey;
                                 setIsUpdatingStock(false);
                             }
                             if (latest.id) markAuditSessionConfirmed(latest.id);
@@ -3803,14 +3862,25 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             if (remoteVersion && remoteVersion === localVersion) return;
 
-            const fullRemoteStock = await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { preferRemote: true });
-            if (activeFilialRef.current !== branch) return;
+            // Define os metadados imediatamente para que a interface reflita o status do estoque sem esperar download pesado
+            setGlobalStockMeta(remoteMeta as DbGlobalBaseFile);
 
-            const decodedStock = fullRemoteStock
-                ? await decodeGlobalFileToBrowserFile(fullRemoteStock as DbGlobalBaseFile)
-                : null;
-            setGlobalStockMeta(fullRemoteStock as DbGlobalBaseFile | null);
-            setGlobalStockFile(decodedStock);
+            try {
+                const fullRemoteStock = await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { preferRemote: true });
+                if (activeFilialRef.current !== branch) return;
+
+                const decodedStock = fullRemoteStock
+                    ? await decodeGlobalFileToBrowserFile(fullRemoteStock as DbGlobalBaseFile)
+                    : null;
+                if (decodedStock) {
+                    setGlobalStockFile(decodedStock);
+                }
+                if (fullRemoteStock) {
+                    setGlobalStockMeta(fullRemoteStock as DbGlobalBaseFile);
+                }
+            } catch (fetchErr) {
+                console.warn('[AuditFlow] Download de arquivo binário completo adiado para momento da ação:', fetchErr);
+            }
         } catch (error) {
             console.warn('[AuditFlow] Falha ao verificar estoque atualizado no Cadastro Base:', error);
         } finally {
@@ -3832,9 +3902,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
         const hasApplied = Number.isFinite(appliedTs);
         const hasPendingBase =
-            isAuditClassificationOutdated(sourceFiles) ||
+            isAuditClassificationOutdated(sourceFiles, data) ||
             isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
-            isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
+            isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta, data);
         return {
             appliedLabel: appliedRaw ? formatGlobalTimestamp(appliedRaw) : 'Nao aplicado',
             baseLabel: baseRaw ? formatGlobalTimestamp(baseRaw) : 'Sem data no Cadastro Base',
@@ -3948,26 +4018,43 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             setIsLoadingStockBase(true);
             try {
                 const stockModuleKey = buildSharedStockModuleKey(requestedFilial);
-                const stockMeta = await CadastrosBaseService.getGlobalBaseFileCached(
-                    companyId,
-                    stockModuleKey,
-                    { forceFresh: true }
-                );
+                // 1. Carrega imediatamente os metadados leves (super rápido, evita travamentos e timeouts de download pesado)
+                const remoteMeta = await fetchGlobalBaseFileMeta(companyId, stockModuleKey);
                 if (cancelled || activeFilialRef.current !== requestedFilial) return;
-                const decodedStock = stockMeta
-                    ? await decodeGlobalFileToBrowserFile(stockMeta as DbGlobalBaseFile)
-                    : null;
-                if (cancelled || activeFilialRef.current !== requestedFilial) return;
-                startTransition(() => {
-                    setGlobalStockMeta(stockMeta as DbGlobalBaseFile | null);
-                    setGlobalStockFile(decodedStock);
-                });
-            } catch (error) {
-                console.error('Erro ao carregar estoque global da filial:', error);
-                if (!cancelled && activeFilialRef.current === requestedFilial) {
-                    setGlobalStockMeta(null);
-                    setGlobalStockFile(null);
+
+                if (remoteMeta) {
+                    startTransition(() => {
+                        setGlobalStockMeta(remoteMeta as DbGlobalBaseFile);
+                    });
+                } else {
+                    startTransition(() => {
+                        setGlobalStockMeta(null);
+                        setGlobalStockFile(null);
+                    });
                 }
+
+                // 2. Se o arquivo existe no Cadastro Base, carrega o arquivo binário em background (cache-first)
+                if (remoteMeta) {
+                    try {
+                        const stockFull = await CadastrosBaseService.getGlobalBaseFileCached(
+                            companyId,
+                            stockModuleKey
+                        );
+                        if (cancelled || activeFilialRef.current !== requestedFilial) return;
+                        if (stockFull) {
+                            const decodedStock = await decodeGlobalFileToBrowserFile(stockFull as DbGlobalBaseFile);
+                            if (cancelled || activeFilialRef.current !== requestedFilial) return;
+                            startTransition(() => {
+                                setGlobalStockFile(decodedStock);
+                                setGlobalStockMeta(stockFull as DbGlobalBaseFile);
+                            });
+                        }
+                    } catch (fullErr) {
+                        console.warn('[AuditFlow] Arquivo binário completo de estoque será obtido se necessário ao iniciar:', fullErr);
+                    }
+                }
+            } catch (error) {
+                console.error('Erro ao carregar metadados do estoque global da filial:', error);
             } finally {
                 if (!cancelled && activeFilialRef.current === requestedFilial) setIsLoadingStockBase(false);
             }
@@ -5746,6 +5833,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const stockUpdates = Array.isArray(prevSourceFiles.stockUpdates) ? prevSourceFiles.stockUpdates : [];
         const nextSourceFiles = {
             ...prevSourceFiles,
+            classificationSchemaVersion: AUDIT_CLASSIFICATION_SCHEMA_VERSION,
             stock: {
                 ...stockMeta,
                 ...(source === 'global_base' ? {
@@ -5845,20 +5933,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         if (!Number.isFinite(globalTs)) return;
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
-        const hasPendingClassification = isAuditClassificationOutdated(sourceFiles);
+        const hasPendingClassification = isAuditClassificationOutdated(sourceFiles, data);
         const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
         const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(
             sourceFiles,
             globalGroupMeta,
             globalDeptIdsMeta,
-            globalCatIdsMeta
+            globalCatIdsMeta,
+            data
         );
         const hasPendingGlobalBase = hasPendingGlobalStock || hasPendingGlobalStructure || hasPendingClassification;
         if (!hasPendingGlobalBase) return;
 
         const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}|${globalStructureBaseSignature}`;
         if (lastAutoStockSyncKeyRef.current === syncKey) {
-            enterStockUpdateMode({ syncKey, showAlert: false });
             return;
         }
 
@@ -5912,12 +6000,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const hasOpenStructure = !!(data && data.groups && data.groups.length > 0);
         const shouldMergeStockOnly = hasOpenStructure;
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
-        const hasPendingClassification = isAuditClassificationOutdated(sourceFiles);
+        const hasPendingClassification = isAuditClassificationOutdated(sourceFiles, data);
         const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(
             sourceFiles,
             globalGroupMeta,
             globalDeptIdsMeta,
-            globalCatIdsMeta
+            globalCatIdsMeta,
+            data
         );
         // Em auditoria aberta, uma base nova precisa reclassificar os itens ainda
         // abertos para incluir/remover produtos, preservando tudo que já foi concluído.
@@ -6773,7 +6862,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         if (completedAuditConsultationRef.current) return;
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
-        if (!isAuditClassificationOutdated(sourceFiles)) return;
+        if (!isAuditClassificationOutdated(sourceFiles, data)) return;
         if (!effectiveStockFile || effectiveGroupFiles.length === 0 || !effectiveDeptIdsFile || !effectiveCatIdsFile) return;
 
         const migrationKey = `${dbSessionId}|${selectedFilial}|classification-v${AUDIT_CLASSIFICATION_SCHEMA_VERSION}|attempt-v${AUDIT_CLASSIFICATION_MIGRATION_ATTEMPT_VERSION}`;

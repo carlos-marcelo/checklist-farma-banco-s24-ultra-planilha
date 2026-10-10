@@ -88,89 +88,54 @@ export const CadastrosBaseService = {
       const startTime = performance.now();
 
       try {
-        // 0. Caminho preferencial remoto: usado em telas sensíveis a "arquivo mais recente" (ex: Auditoria).
-        if (preferRemote) {
-          try {
-            const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
-            if (fullRemoteData) {
-              const preparedData = await attachParsedFile(fullRemoteData);
-              const dataToSave = { ...preparedData, file_data_base64: null };
-              inMemoryCache.set(cacheKey, preparedData);
-              lastValidationAt.set(cacheKey, Date.now());
-              persistBaseCache(cacheKey, dataToSave);
-              return preparedData;
-            }
-          } catch (remoteError) {
-            console.warn(`[CadastrosBaseService] preferRemote falhou para ${moduleKey}, usando cache:`, remoteError);
+        // 1. Verifica cache em memória primeiro (Instantâneo)
+        let localData = inMemoryCache.get(cacheKey) || null;
+
+        // 2. Se não está em memória, verifica IndexedDB
+        if (!localData) {
+          const cachedItem: any = await localforage.getItem(cacheKey);
+          if (cachedItem && (cachedItem.file_data_base64 || cachedItem._blob || cachedItem._parsedFile)) {
+            cadastrosDebugLog(`[CadastrosBaseService] IndexedDB HIT para ${moduleKey}`);
+            localData = await attachParsedFile(cachedItem);
+            inMemoryCache.set(cacheKey, localData);
           }
         }
 
-        // 0. Verifica cache em memória primeiro (Instantâneo)
-        if (inMemoryCache.has(cacheKey)) {
-          cadastrosDebugLog(`[CadastrosBaseService] Memória HIT para ${moduleKey}`);
-          const memData = inMemoryCache.get(cacheKey)!;
+        // Se já temos a base local (em memória ou no IndexedDB):
+        if (localData) {
+          // Se foi solicitado preferRemote ou forceFresh: valida apenas metadados (< 300 bytes, instantâneo, sem 404)
+          if (preferRemote || forceFresh) {
+            try {
+              const remoteMeta = await SupabaseService.fetchGlobalBaseFileMeta(companyId, moduleKey);
+              const remoteUpdated = remoteMeta?.updated_at || remoteMeta?.uploaded_at || '';
+              const currentUpdated = localData.updated_at || localData.uploaded_at || '';
 
-          if (forceFresh) {
-            const remoteMeta = await SupabaseService.fetchGlobalBaseFileMeta(companyId, moduleKey);
-            const remoteUpdated = remoteMeta?.updated_at || remoteMeta?.uploaded_at || '';
-            const localUpdated = memData.updated_at || memData.uploaded_at || '';
-            if (remoteMeta && remoteUpdated && remoteUpdated !== localUpdated) {
-              cadastrosDebugLog(`[CadastrosBaseService] forceFresh: atualizando memória para ${moduleKey}`);
-              const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
-              if (fullRemoteData) {
-                const preparedData = await attachParsedFile(fullRemoteData);
-                const dataToSave = { ...preparedData, file_data_base64: null };
-                inMemoryCache.set(cacheKey, preparedData);
-                lastValidationAt.set(cacheKey, Date.now());
-                persistBaseCache(cacheKey, dataToSave);
-                return preparedData;
+              // Se o servidor tem uma versão estritamente mais nova, baixa o arquivo atualizado
+              if (remoteMeta && remoteUpdated && remoteUpdated !== currentUpdated) {
+                cadastrosDebugLog(`[CadastrosBaseService] Nova versão remota detectada para ${moduleKey}, atualizando...`);
+                const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
+                if (fullRemoteData) {
+                  const preparedData = await attachParsedFile(fullRemoteData);
+                  const dataToSave = { ...preparedData, file_data_base64: null };
+                  inMemoryCache.set(cacheKey, preparedData);
+                  lastValidationAt.set(cacheKey, Date.now());
+                  persistBaseCache(cacheKey, dataToSave);
+                  return preparedData;
+                }
               }
+            } catch (metaErr) {
+              cadastrosDebugLog(`[CadastrosBaseService] Validação de versão remota adiada para ${moduleKey}:`, metaErr);
             }
             lastValidationAt.set(cacheKey, Date.now());
-            return memData;
+            return localData;
           }
 
-          // Background sync
-          this.syncInBackground(companyId, moduleKey, cacheKey, memData);
-          return memData;
+          // Se não exige checagem imediata, agenda background sync e entrega instantaneamente
+          this.syncInBackground(companyId, moduleKey, cacheKey, localData);
+          return localData;
         }
 
-        // 1. Verifica IndexedDB (Cache-First)
-        const cachedData: any = await localforage.getItem(cacheKey);
-
-        if (cachedData && (cachedData.file_data_base64 || cachedData._blob || cachedData._parsedFile)) {
-          cadastrosDebugLog(`[CadastrosBaseService] IndexedDB HIT para ${moduleKey}`);
-          const preparedCachedData = await attachParsedFile(cachedData);
-
-          if (forceFresh) {
-            const remoteMeta = await SupabaseService.fetchGlobalBaseFileMeta(companyId, moduleKey);
-            const remoteUpdated = remoteMeta?.updated_at || remoteMeta?.uploaded_at || '';
-            const localUpdated = preparedCachedData.updated_at || preparedCachedData.uploaded_at || '';
-            if (remoteMeta && remoteUpdated && remoteUpdated !== localUpdated) {
-              cadastrosDebugLog(`[CadastrosBaseService] forceFresh: atualizando IndexedDB para ${moduleKey}`);
-              const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
-              if (fullRemoteData) {
-                const preparedData = await attachParsedFile(fullRemoteData);
-                const dataToSave = { ...preparedData, file_data_base64: null };
-                inMemoryCache.set(cacheKey, preparedData);
-                lastValidationAt.set(cacheKey, Date.now());
-                persistBaseCache(cacheKey, dataToSave);
-                return preparedData;
-              }
-            }
-            lastValidationAt.set(cacheKey, Date.now());
-            return preparedCachedData;
-          }
-
-          inMemoryCache.set(cacheKey, preparedCachedData);
-
-          // Background sync
-          this.syncInBackground(companyId, moduleKey, cacheKey, preparedCachedData);
-
-          return preparedCachedData;
-        }
-
-        // 2. Cache MISS - Baixa do Supabase esperando completar
+        // 3. Cache MISS absoluto: nunca foi baixado nesta máquina. Baixa do servidor:
         cadastrosDebugLog(`[CadastrosBaseService] Cache MISS para ${moduleKey}, baixando...`);
         const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
 

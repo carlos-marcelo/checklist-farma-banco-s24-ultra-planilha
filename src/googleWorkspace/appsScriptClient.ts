@@ -67,7 +67,7 @@ const saveSession = (session: StoredSession | null) => {
  */
 class RequestConcurrencyQueue {
     private running = 0;
-    private readonly maxConcurrent = 2;
+    private readonly maxConcurrent = 3;
     private readonly queue: Array<() => void> = [];
 
     async run<T>(fn: () => Promise<T>): Promise<T> {
@@ -180,6 +180,13 @@ class GoogleAppsScriptClient {
                         envelope = JSON.parse(rawText) as ApiEnvelope<T>;
                     } catch {
                         const isHtml = /^\s*</i.test(rawText);
+                        const is404 = response.status === 404 || /404\s+Not\s+Found/i.test(rawText);
+                        if (is404) {
+                            throw Object.assign(new Error('Recurso não encontrado no serviço do Google (404).'), {
+                                code: 'NOT_FOUND',
+                                status: 404
+                            });
+                        }
                         const errMsg = isHtml
                             ? 'O serviço do Google Apps Script demorou para responder ou retornou página temporária. Tentando novamente...'
                             : 'Resposta inválida do serviço do Google.';
@@ -212,7 +219,7 @@ class GoogleAppsScriptClient {
                     return envelope.data as T;
                 } catch (err: any) {
                     lastError = err;
-                    if (err?.code === 'AUTH_REQUIRED' || err?.code === 'SESSION_EXPIRED' || err?.code === 'INVALID_CREDENTIALS') {
+                    if (err?.code === 'AUTH_REQUIRED' || err?.code === 'SESSION_EXPIRED' || err?.code === 'INVALID_CREDENTIALS' || err?.code === 'NOT_FOUND' || err?.status === 404) {
                         throw err;
                     }
                     const isTransient = err?.code === 'TRANSIENT_HTML_ERROR' ||
