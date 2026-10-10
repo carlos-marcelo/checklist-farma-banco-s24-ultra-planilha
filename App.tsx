@@ -3196,10 +3196,11 @@ const isTransientGoogleSheetsError = (error: unknown): boolean => {
     const status = Number(candidate.status || candidate.statusCode || 0);
     const code = String(candidate.code || '').toUpperCase();
     const message = String(candidate.message || error || '').toLowerCase();
-    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504 ||
+    return status === 404 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504 ||
         status === 520 || status === 521 || status === 522 || status === 523 || status === 524 ||
         code === 'PGRST000' || code === 'PGRST002' ||
-        code === 'TRANSIENT_HTML_ERROR' || code === 'APPS_SCRIPT_TIMEOUT' ||
+        code === 'TRANSIENT_HTML_ERROR' || code === 'TRANSIENT_ECHO_404' || code === 'APPS_SCRIPT_TIMEOUT' ||
+        message.includes('404') ||
         message.includes('bad gateway') ||
         message.includes('service unavailable') ||
         message.includes('schema cache') ||
@@ -4441,18 +4442,18 @@ const App: React.FC = () => {
                 refreshUsersIfChanged(applyDeferred(applyUsers)),
                 CacheService.fetchWithCache(CACHE_KEY_CONFIG, () => SupabaseService.fetchConfig(true), applyDeferred(applyConfig), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'always',
-                    timeoutMs: 6000
+                    revalidate: 'stale',
+                    timeoutMs: 8000
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_COMPANIES, () => SupabaseService.fetchCompanies(true), applyDeferred(applyCompanies), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'always',
+                    revalidate: 'stale',
                     timeoutMs: 8000,
                     compare: (cached, remote) => getCompanyAreasSignature(cached) !== getCompanyAreasSignature(remote)
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_ACCESS, () => SupabaseService.fetchAccessMatrix(true), applyDeferred(applyAccessMatrix), {
                     maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-                    revalidate: 'always',
+                    revalidate: 'stale',
                     timeoutMs: 8000
                 })
             ]);
@@ -4465,19 +4466,19 @@ const App: React.FC = () => {
             await Promise.allSettled([
                 CacheService.fetchWithCache(reportKey, () => SupabaseService.fetchReportsSummary(0, REPORTS_PAGE_SIZE, true), applyDeferred(applyReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
-                    revalidate: 'always',
-                    timeoutMs: 10000
+                    revalidate: 'stale',
+                    timeoutMs: 15000
                 }),
                 CacheService.fetchWithCache(stockKey, () => SupabaseService.fetchStockConferenceReportsSummaryPage(0, STOCK_PAGE_SIZE, true, branchFilters), applyDeferred(applyStockReports), {
                     maxAgeMs: HISTORY_BACKGROUND_CACHE_MS,
-                    revalidate: 'always',
-                    timeoutMs: 10000
+                    revalidate: 'stale',
+                    timeoutMs: 15000
                 }),
                 CacheService.fetchWithCache(CACHE_KEY_TICKETS, () => SupabaseService.fetchTickets(true), (data) => {
                     if (!cancelled) startTransition(() => setTickets(data || []));
                 }, {
                     maxAgeMs: 60 * 1000,
-                    revalidate: 'always',
+                    revalidate: 'stale',
                     timeoutMs: 8000
                 }),
                 loadPendingStockReports()
@@ -4535,7 +4536,7 @@ const App: React.FC = () => {
                         void refreshCoreData();
                         scheduleBackgroundTask(() => {
                             void preloadSecondaryData();
-                        }, 1200);
+                        }, 3000);
                     }
                 }
             }
@@ -4565,7 +4566,7 @@ const App: React.FC = () => {
 
         CacheService.fetchWithCache(CACHE_KEY_CHECKLIST_DEFS, () => SupabaseService.fetchChecklistDefinitions(true), applyChecklistDefinitions, {
             maxAgeMs: STATIC_REFERENCE_CACHE_MS,
-            revalidate: 'always',
+            revalidate: 'stale',
             timeoutMs: 8000
         }).then(applyChecklistDefinitions).catch(error => {
             console.error('Erro ao carregar definições dos checklists:', error);
@@ -5634,7 +5635,9 @@ const App: React.FC = () => {
             }
         };
 
-        performHeartbeat();
+        const initialTimer = window.setTimeout(() => {
+            void performHeartbeat();
+        }, 5000);
         const interval = setInterval(performHeartbeat, HEARTBEAT_INTERVAL_MS);
         let wakeHeartbeatTimer: number | null = null;
         const handleWakeHeartbeat = () => {
@@ -5652,6 +5655,7 @@ const App: React.FC = () => {
         window.addEventListener('focus', handleWakeHeartbeat);
 
         return () => {
+            window.clearTimeout(initialTimer);
             clearInterval(interval);
             if (wakeHeartbeatTimer !== null) window.clearTimeout(wakeHeartbeatTimer);
             document.removeEventListener('visibilitychange', handleWakeHeartbeat);
@@ -8580,7 +8584,7 @@ const App: React.FC = () => {
             // Busca apenas as sessões pendentes/atualizadas em lotes pequenos e sequenciais
             const pendingBranches = Array.from(new Set(toFetchMetadata.map(m => m.branch).filter(Boolean)));
             const fetchedDetails: SupabaseService.DbAuditSession[] = [];
-            const batchSize = 4;
+            const batchSize = 2;
 
             for (let i = 0; i < pendingBranches.length; i += batchSize) {
                 const branchBatch = pendingBranches.slice(i, i + batchSize);
@@ -8601,7 +8605,7 @@ const App: React.FC = () => {
                 }
 
                 if (i + batchSize < pendingBranches.length) {
-                    await new Promise(r => setTimeout(r, 120));
+                    await new Promise(r => setTimeout(r, 200));
                 }
             }
 

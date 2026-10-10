@@ -2934,7 +2934,7 @@ export async function upsertActiveSession(session: Partial<DbActiveSession>): Pr
     if (error) throw error;
     return data || null;
   } catch (error) {
-    console.error('Error upserting active session:', error);
+    console.warn('Aviso transitório ao registrar presença da sessão (heartbeat):', error);
     return null;
   }
 }

@@ -67,7 +67,7 @@ const saveSession = (session: StoredSession | null) => {
  */
 class RequestConcurrencyQueue {
     private running = 0;
-    private readonly maxConcurrent = 3;
+    private readonly maxConcurrent = 2;
     private readonly queue: Array<() => void> = [];
 
     async run<T>(fn: () => Promise<T>): Promise<T> {
@@ -79,8 +79,11 @@ class RequestConcurrencyQueue {
             return await fn();
         } finally {
             this.running--;
-            const next = this.queue.shift();
-            if (next) next();
+            // Pequeno espaçamento para despressurizar o Google Apps Script
+            setTimeout(() => {
+                const next = this.queue.shift();
+                if (next) next();
+            }, 50);
         }
     }
 }
@@ -182,8 +185,8 @@ class GoogleAppsScriptClient {
                         const isHtml = /^\s*</i.test(rawText);
                         const is404 = response.status === 404 || /404\s+Not\s+Found/i.test(rawText);
                         if (is404) {
-                            throw Object.assign(new Error('Recurso não encontrado no serviço do Google (404).'), {
-                                code: 'NOT_FOUND',
+                            throw Object.assign(new Error('Falha temporária no serviço do Google (404). Tentando novamente...'), {
+                                code: 'TRANSIENT_ECHO_404',
                                 status: 404
                             });
                         }
@@ -219,10 +222,11 @@ class GoogleAppsScriptClient {
                     return envelope.data as T;
                 } catch (err: any) {
                     lastError = err;
-                    if (err?.code === 'AUTH_REQUIRED' || err?.code === 'SESSION_EXPIRED' || err?.code === 'INVALID_CREDENTIALS' || err?.code === 'NOT_FOUND' || err?.status === 404) {
+                    if (err?.code === 'AUTH_REQUIRED' || err?.code === 'SESSION_EXPIRED' || err?.code === 'INVALID_CREDENTIALS') {
                         throw err;
                     }
                     const isTransient = err?.code === 'TRANSIENT_HTML_ERROR' ||
+                        err?.code === 'TRANSIENT_ECHO_404' ||
                         err?.code === 'APPS_SCRIPT_TIMEOUT' ||
                         err?.name === 'AbortError' ||
                         err instanceof TypeError ||
