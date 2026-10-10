@@ -157,6 +157,8 @@ class GoogleAppsScriptClient {
                     err instanceof TypeError ||
                     String(err?.message || '').includes('Failed to fetch') ||
                     String(err?.message || '').includes('Unexpected token') ||
+                    String(err?.message || '').includes('CONNECTION_CLOSED') ||
+                    String(err?.message || '').includes('ERR_CONNECTION_CLOSED') ||
                     err?.code === 'OFFLINE';
                 if (attempt < 2 && isTransient) {
                     await new Promise(r => setTimeout(r, 800 * (attempt + 1)));

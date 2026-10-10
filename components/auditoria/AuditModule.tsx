@@ -59,6 +59,7 @@ import {
 
 const GROUP_UPLOAD_IDS = ['2000', '3000', '4000', '8000', '10000', '66', '67'] as const;
 const AUDIT_CLIENT_NORMALIZED_VERSION = 1;
+const AUDIT_CLASSIFICATION_SCHEMA_VERSION = 2;
 const AUDIT_HISTORY_MEMORY_TTL_MS = 15_000;
 type GroupUploadId = typeof GROUP_UPLOAD_IDS[number];
 
@@ -622,108 +623,141 @@ const parseHierarchyCells = (
     };
 };
 
-const normalizeDepartmentClassification = (params: {
-    deptId?: string | number | null;
-    deptName?: string | null;
-    groupId?: string | number | null;
-    row?: any[];
-}): { deptId: string; deptName: string } => {
-    let rawId = String(params.deptId ?? '').trim();
-    let rawName = String(params.deptName ?? '').trim();
-    const gId = String(params.groupId ?? '').trim();
+/**
+ * Lê as linhas separadoras dos relatórios Trier, por exemplo:
+ *   A = "DEPARTAMENTO:", E = 120, G = "- MIP"
+ *   A = "CATEGORIA:",    E = 111, G = "- ..."
+ *
+ * As colunas podem variar por causa de células mescladas, portanto a leitura é
+ * feita pela ordem das células não vazias, e não por F/H fixas.
+ */
+const parseHierarchySectionHeader = (
+    row: any[],
+    prefix: 'DEPARTAMENTO' | 'CATEGORIA'
+): { id: string; name: string } | null => {
+    if (!Array.isArray(row)) return null;
 
-    // 1. Varredura direta na linha do produto por menção explícita a medicamento tarjado ou 121
-    if (Array.isArray(params.row)) {
-        for (let i = 0; i < Math.min(params.row.length, 35); i++) {
-            const cellVal = String(params.row[i] ?? '').trim();
-            const cellNorm = normalizeLookupText(cellVal);
-            if (cellNorm.includes('tarjad') || (cellNorm.includes('medicamento') && cellNorm.includes('tarj'))) {
-                return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
+    const populated = row
+        .map((value, index) => ({ value: String(value ?? '').trim(), index }))
+        .filter(cell => cell.value.length > 0);
+    if (populated.length === 0) return null;
+
+    const headerIndex = populated.findIndex(cell => {
+        const normalized = normalizeLookupText(cell.value).replace(/\s+/g, ' ').trim();
+        return normalized === normalizeLookupText(prefix) || normalized.startsWith(`${normalizeLookupText(prefix)}:`);
+    });
+    if (headerIndex < 0) return null;
+
+    const headerValue = populated[headerIndex].value;
+    const inlineValue = headerValue.replace(new RegExp(`^${prefix}\\s*:?\\s*`, 'i'), '').trim();
+    let id = '';
+    let name = '';
+
+    if (inlineValue) {
+        const parsedInline = parseHierarchyCell(inlineValue, '');
+        id = parsedInline.numericId;
+        if (/[A-Za-zÀ-ÿ]/.test(parsedInline.name)) name = parsedInline.name;
+    }
+
+    for (let i = headerIndex + 1; i < populated.length; i += 1) {
+        const candidate = populated[i].value;
+        const normalized = normalizeLookupText(candidate);
+        if (!candidate || normalized === 'todos' || normalized === 'todas') continue;
+
+        if (!id) {
+            const numeric = parseSheetNumericCode(candidate);
+            if (numeric !== null) {
+                id = String(numeric);
+                continue;
             }
-            if (cellVal === '121') {
-                rawId = '121';
-                rawName = 'MEDICAMENTO TARJADO';
-                break;
-            }
         }
-    }
 
-    const normName = normalizeLookupText(rawName);
-
-    // 2. Se for identificado como Tarjado
-    if (rawId === '121' || normName.includes('tarjad') || (normName.includes('medicamento') && normName.includes('tarj'))) {
-        return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
-    }
-
-    // 3. Se for Seção 8 do Trier ou MIP
-    if (rawId === '8' || rawId === '120' || normName === 'mip' || normName.includes('isento') || normName.includes('medicamento isento')) {
-        // Se pertencer ao Grupo 3000 ("Medicamentos RX"), os medicamentos sob prescrição são Tarjados (121).
-        // No Trier, a Seção 8 frequentemente é lida por engano no lugar do departamento 121.
-        if (gId === '3000') {
-            return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
+        if (!name && /[A-Za-zÀ-ÿ]/.test(candidate)) {
+            name = candidate.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').replace(/\s+/g, ' ').trim();
         }
-        return { deptId: '120', deptName: 'MIP' };
+
+        if (id && name) break;
     }
 
-    // 4. Se pertencer ao Grupo 3000 ("Medicamentos RX") e o departamento for genérico/vazio/placeholder:
-    // O padrão do catálogo RX é departamento 121 (MEDICAMENTO TARJADO)
-    if (gId === '3000') {
-        if (!rawId || rawId === '8' || rawId === '99999' || isHierarchyPlaceholderName(rawName, ['OUTROS', 'GERAL', 'DIVERSOS'])) {
-            return { deptId: '121', deptName: 'MEDICAMENTO TARJADO' };
-        }
-    }
-
-    // 5. Se sobrou ID 8 em qualquer outro grupo (Seção 8 da Trier = MIP):
-    if (rawId === '8') {
-        return { deptId: '120', deptName: 'MIP' };
-    }
-
-    return { deptId: rawId, deptName: rawName || 'OUTROS' };
+    if (!id || !name || isHierarchyPlaceholderName(name, ['OUTROS', 'GERAL', 'DIVERSOS'])) return null;
+    return { id, name };
 };
 
-const detectHierarchyColumnsInRows = (rows: any[][]) => {
-    let deptCodeCol = -1;
-    let deptNameCol = -1;
-    let catCodeCol = -1;
-    let catNameCol = -1;
+type GroupCadastroColumns = {
+    headerRowIndex: number;
+    codeCol: number;
+    nameCol: number;
+    barcodeCol: number;
+    deptCol: number;
+    catCol: number;
+};
 
-    const maxScan = Math.min(rows.length, 30);
-    for (let r = 0; r < maxScan; r++) {
-        const row = rows[r];
-        if (!Array.isArray(row) || row.length < 4) continue;
-        for (let c = 0; c < row.length; c++) {
-            const text = normalizeHeaderText(row[c]);
-            if (!text) continue;
-            
-            // Departamento
-            if (deptCodeCol < 0 && (
-                (text.includes('cod') || text.includes('cd.')) &&
-                (text.includes('dep') || text.includes('depto') || text.includes('departamento'))
-            )) {
-                deptCodeCol = c;
-            } else if (deptNameCol < 0 && (
-                (text === 'departamento' || text === 'depto' || text.includes('nome dep') || text.includes('descr. dep') || text.includes('descrição dep')) &&
-                !text.includes('cod') && !text.includes('cd.')
-            )) {
-                deptNameCol = c;
-            }
-            
-            // Categoria
-            if (catCodeCol < 0 && (
-                (text.includes('cod') || text.includes('cd.')) &&
-                (text.includes('cat') || text.includes('categoria'))
-            )) {
-                catCodeCol = c;
-            } else if (catNameCol < 0 && (
-                (text === 'categoria' || text.includes('nome cat') || text.includes('descr. cat') || text.includes('descrição cat')) &&
-                !text.includes('cod') && !text.includes('cd.')
-            )) {
-                catNameCol = c;
-            }
+const detectGroupCadastroColumns = (rows: any[][]): GroupCadastroColumns => {
+    const normalizeHeader = (value: unknown) => normalizeLookupText(value).replace(/[^a-z0-9]+/g, ' ').trim();
+    const maxHeaderRows = Math.min(rows.length, 40);
+    let headerRowIndex = -1;
+
+    for (let r = 0; r < maxHeaderRows; r += 1) {
+        const cells = (rows[r] || []).map(normalizeHeader);
+        const hasCode = cells.some(text => text.includes('codigo') || text.includes('reduz'));
+        const hasDescription = cells.some(text => text.includes('descricao') || text.includes('produto'));
+        const hasDepartment = cells.some(text => text.includes('departamento'));
+        const hasCategory = cells.some(text => text.includes('categoria'));
+        if (hasCode && hasDescription && hasDepartment && hasCategory) {
+            headerRowIndex = r;
+            break;
         }
     }
 
-    return { deptCodeCol, deptNameCol, catCodeCol, catNameCol };
+    if (headerRowIndex < 0) {
+        return { headerRowIndex: -1, codeCol: 1, nameCol: 2, barcodeCol: 9, deptCol: 17, catCol: 21 };
+    }
+
+    const header = (rows[headerRowIndex] || []).map(normalizeHeader);
+    const findHeader = (predicate: (text: string) => boolean, fallback: number) => {
+        const index = header.findIndex(predicate);
+        return index >= 0 ? index : fallback;
+    };
+    const codeHeaderCol = findHeader(text => text.includes('codigo'), 1);
+    const nameHeaderCol = findHeader(text => text.includes('descricao') || text === 'produto', 2);
+    const barcodeHeaderCol = findHeader(text => text.includes('cod barras') || text.includes('codigo barras'), 10);
+    const deptHeaderCol = findHeader(text => text.includes('departamento'), 18);
+    const catHeaderCol = findHeader(text => text.includes('categoria'), 22);
+
+    const sampleStart = headerRowIndex + 2;
+    const sampleEnd = Math.min(rows.length, sampleStart + 300);
+    const chooseDataColumn = (
+        headerCol: number,
+        validator: (value: unknown) => boolean
+    ) => {
+        const candidates = Array.from(new Set([headerCol, headerCol - 1, headerCol + 1].filter(col => col >= 0)));
+        let bestCol = headerCol;
+        let bestScore = -1;
+        candidates.forEach(col => {
+            let score = 0;
+            for (let r = sampleStart; r < sampleEnd; r += 1) {
+                if (validator(rows[r]?.[col])) score += 1;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestCol = col;
+            }
+        });
+        return bestCol;
+    };
+
+    const hasText = (value: unknown) => /[A-Za-zÀ-ÿ]/.test(String(value ?? '').trim());
+    const hasProductCode = (value: unknown) => /^'?\d+(?:[.,]0+)?$/.test(String(value ?? '').trim());
+    const hasBarcode = (value: unknown) => normalizeProductLookupCode(value).length >= 8;
+
+    return {
+        headerRowIndex,
+        codeCol: chooseDataColumn(codeHeaderCol, hasProductCode),
+        nameCol: chooseDataColumn(nameHeaderCol, hasText),
+        barcodeCol: chooseDataColumn(barcodeHeaderCol, hasBarcode),
+        deptCol: chooseDataColumn(deptHeaderCol, hasText),
+        catCol: chooseDataColumn(catHeaderCol, hasText)
+    };
 };
 
 const findBarcodeInRow = (row: any[]): string => {
@@ -1858,6 +1892,9 @@ const isGlobalAuditStructureDifferentFromApplied = (
     return false;
 };
 
+const isAuditClassificationOutdated = (sourceFiles: any): boolean =>
+    Number(sourceFiles?.classificationSchemaVersion || 0) < AUDIT_CLASSIFICATION_SCHEMA_VERSION;
+
 const getTermMetricsTimestamp = (metrics: any) => {
     const raw = metrics?.sourceUploadedAt || metrics?.financialDiffVerifiedAt || metrics?.updatedAt;
     const time = raw ? Date.parse(String(raw)) : 0;
@@ -2706,6 +2743,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     const activeAuditOpenChoicePendingRef = useRef<Map<string, Promise<'open' | 'completed'>>>(new Map());
     const partialFinalizeInFlightRef = useRef(false);
     const foregroundQuietUntilRef = useRef(0);
+    const automaticClassificationMigrationAttemptsRef = useRef<Set<string>>(new Set());
     const globalBaseMetaRef = useRef<{
         stock: DbGlobalBaseFile | null;
         groups: Record<GroupUploadId, DbGlobalBaseFile | null>;
@@ -2720,7 +2758,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         structureSignature: ''
     });
 
-    function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean; reason?: 'stock' | 'structure' | 'base' }) {
+    function enterStockUpdateMode(options?: { stockTsRaw?: string | null; syncKey?: string | null; showAlert?: boolean; reason?: 'stock' | 'structure' | 'classification' | 'base' }) {
         const syncKey = String(options?.syncKey || '').trim();
         if (syncKey) {
             lastAutoStockSyncKeyRef.current = syncKey;
@@ -2736,9 +2774,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             const stockTsLabel = options.stockTsRaw
                 ? new Date(options.stockTsRaw).toLocaleString('pt-BR')
                 : 'nao informada';
-            const changeLabel = options.reason === 'structure'
-                ? 'Nova base de classificação detectada'
-                : 'Nova base detectada';
+            const changeLabel = options.reason === 'classification'
+                ? 'Classificação antiga detectada'
+                : options.reason === 'structure'
+                    ? 'Nova base de classificação detectada'
+                    : 'Nova base detectada';
             const alertBranch = selectedFilial;
             const alertSyncKey = syncKey;
             window.setTimeout(() => {
@@ -3190,6 +3230,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                 const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
                                 const baseMeta = globalBaseMetaRef.current;
                                 const hasPendingGlobalBaseAtOpenChoice =
+                                    isAuditClassificationOutdated(sourceFiles) ||
                                     isGlobalStockDifferentFromApplied(sourceFiles, baseMeta.stock) ||
                                     isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat);
                                 if (completedCount > 0 && !hasPendingGlobalBaseAtOpenChoice) {
@@ -3276,17 +3317,19 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                             const sourceFiles = ((latest.data as any)?.sourceFiles || {}) as any;
                             const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, baseMeta.stock);
                             const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(sourceFiles, baseMeta.groups, baseMeta.dept, baseMeta.cat);
+                            const hasPendingClassification = isAuditClassificationOutdated(sourceFiles);
                             return {
                                 latestStockTs: bestRaw,
                                 hasPendingGlobalStock,
                                 hasPendingGlobalStructure,
-                                hasPendingGlobalBase: hasPendingGlobalStock || hasPendingGlobalStructure
+                                hasPendingClassification,
+                                hasPendingGlobalBase: hasPendingGlobalStock || hasPendingGlobalStructure || hasPendingClassification
                             };
                         };
 
                         if (canUseAuditMasterTools) {
                             const currentBaseMeta = globalBaseMetaRef.current;
-                            const { latestStockTs, hasPendingGlobalStock, hasPendingGlobalStructure, hasPendingGlobalBase } = resolveLatestStockTimestampForPrompt(
+                            const { latestStockTs, hasPendingGlobalStock, hasPendingGlobalStructure, hasPendingClassification, hasPendingGlobalBase } = resolveLatestStockTimestampForPrompt(
                                 latest.data?.sourceFiles?.stock?.syncedAt || latest.data?.sourceFiles?.lastStockUpdateAt || latest.created_at
                             );
 
@@ -3299,8 +3342,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                 enterStockUpdateMode({
                                     stockTsRaw: latestStockTs,
                                     syncKey,
-                                    showAlert: true,
-                                    reason: hasPendingGlobalStock ? 'stock' : (hasPendingGlobalStructure ? 'structure' : 'base')
+                                    showAlert: !hasPendingClassification,
+                                    reason: hasPendingClassification ? 'classification' : (hasPendingGlobalStock ? 'stock' : (hasPendingGlobalStructure ? 'structure' : 'base'))
                                 });
                             } else {
                                 setIsUpdatingStock(false);
@@ -3788,6 +3831,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const appliedTs = appliedRaw ? new Date(appliedRaw).getTime() : NaN;
         const hasApplied = Number.isFinite(appliedTs);
         const hasPendingBase =
+            isAuditClassificationOutdated(sourceFiles) ||
             isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
             isGlobalAuditStructureDifferentFromApplied(sourceFiles, globalGroupMeta, globalDeptIdsMeta, globalCatIdsMeta);
         return {
@@ -5407,6 +5451,29 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     });
                 }
 
+                const deptIdByName: Record<string, string> = {};
+                const catIdByName: Record<string, string> = {};
+                const loadHierarchyIds = async (
+                    file: File | null,
+                    prefix: 'DEPARTAMENTO' | 'CATEGORIA',
+                    target: Record<string, string>
+                ) => {
+                    if (!file) return;
+                    const hierarchyRows = await readExcel(file);
+                    hierarchyRows.forEach(row => {
+                        const parsed = parseHierarchySectionHeader(row, prefix);
+                        if (!parsed) return;
+                        const key = normalizeLookupText(parsed.name);
+                        if (key && !target[key]) target[key] = parsed.id;
+                    });
+                };
+
+                await Promise.all([
+                    loadHierarchyIds(globalDeptIdsFile, 'DEPARTAMENTO', deptIdByName),
+                    loadHierarchyIds(globalCatIdsFile, 'CATEGORIA', catIdByName)
+                ]);
+                if (cancelled) return;
+
                 // 2. Enriquece com info de dept/cat dos arquivos de cadastro de grupo
                 for (const { groupId: gUploadId, file } of groupFiles) {
                     if (cancelled) return;
@@ -5414,36 +5481,29 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     if (cancelled) return;
                     const gIdNorm = normalizeScopeId(gUploadId);
                     const gName = GROUP_CONFIG_DEFAULTS[gIdNorm] || `Grupo ${gIdNorm}`;
-                    rows.forEach(row => {
+                    const columns = detectGroupCadastroColumns(rows);
+                    const firstProductRow = columns.headerRowIndex >= 0 ? columns.headerRowIndex + 2 : 0;
+                    rows.slice(firstProductRow).forEach(row => {
                         if (!row || row.length < 4) return;
-                        // col[2] = reduzido, col[11] = barcode, col[18] = dept, col[22] = cat
-                        const reduced = normalizeBarcode(row[2]);
+                        const reduced = normalizeBarcode(row[columns.codeCol]);
                         if (!reduced) return;
-                        const barcode = normalizeBarcode(row[11]);
-                        const deptRaw = String(row[18] ?? '').trim();
-                        const catRaw = String(row[22] ?? '').trim();
+                        const barcode = normalizeBarcode(row[columns.barcodeCol]);
+                        const deptRaw = String(row[columns.deptCol] ?? '').trim();
+                        const catRaw = String(row[columns.catCol] ?? '').trim();
                         if (!deptRaw && !catRaw) return;
-                        const deptParsedRaw = parseHierarchyCells(row[18], row[19], 'DIVERSOS', ['GERAL']);
-                        const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS', ['GERAL']);
-                        const normalizedDept = normalizeDepartmentClassification({
-                            deptId: deptParsedRaw.numericId,
-                            deptName: deptParsedRaw.name,
-                            groupId: gIdNorm,
-                            row
-                        });
-                        const deptParsed = {
-                            numericId: normalizedDept.deptId,
-                            name: normalizedDept.deptName
-                        };
+                        const deptParsed = parseHierarchyCells(deptRaw, '', 'DIVERSOS', ['GERAL']);
+                        const catParsed = parseHierarchyCells(catRaw, '', 'DIVERSOS', ['GERAL']);
+                        const resolvedDeptId = deptParsed.numericId || deptIdByName[normalizeLookupText(deptParsed.name)] || '';
+                        const resolvedCatId = catParsed.numericId || catIdByName[normalizeLookupText(catParsed.name)] || '';
 
                         const key = normalizeProductLookupCode(reduced);
                         if (!key) return;
                         const existing = index.get(key);
                         if (existing) {
                             // Enriquece com dept/cat do cadastro
-                            if (!existing.deptId && deptParsed.numericId) existing.deptId = normalizeScopeId(deptParsed.numericId);
+                            if (!existing.deptId && resolvedDeptId) existing.deptId = normalizeScopeId(resolvedDeptId);
                             if (!existing.deptName && deptParsed.name) existing.deptName = deptParsed.name;
-                            if (!existing.catId && catParsed.numericId) existing.catId = normalizeScopeId(catParsed.numericId);
+                            if (!existing.catId && resolvedCatId) existing.catId = normalizeScopeId(resolvedCatId);
                             if (!existing.catName && catParsed.name) existing.catName = catParsed.name;
                             if (!existing.groupId) existing.groupId = gIdNorm;
                             if (!existing.groupName) existing.groupName = gName;
@@ -5451,14 +5511,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                         } else {
                             // Produto presente no cadastro mas nao no estoque
                             const entry: CadastroBaseEntry = {
-                                productName: String(row[3] ?? row[4] ?? '').trim(),
+                                productName: String(row[columns.nameCol] ?? '').trim(),
                                 unitCost: 0,
                                 stockQty: 0,
                                 groupId: gIdNorm,
                                 groupName: gName,
-                                deptId: normalizeScopeId(deptParsed.numericId),
+                                deptId: normalizeScopeId(resolvedDeptId),
                                 deptName: deptParsed.name,
-                                catId: normalizeScopeId(catParsed.numericId),
+                                catId: normalizeScopeId(resolvedCatId),
                                 catName: catParsed.name,
                                 barcode: barcode || '',
                                 reducedCode: reduced,
@@ -5482,7 +5542,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
         void buildIndex();
         return () => { cancelled = true; };
-    }, [globalStockFile, globalGroupFiles]);
+    }, [globalStockFile, globalGroupFiles, globalDeptIdsFile, globalCatIdsFile]);
 
     const barcodeAliasToReduced = useMemo(() => {
         const next: Record<string, string> = {};
@@ -5531,6 +5591,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 : previousGlobalStockProcessedAt);
         return {
             mode: 'initial-structure-import',
+            classificationSchemaVersion: AUDIT_CLASSIFICATION_SCHEMA_VERSION,
             importedAt: nowIso,
             lastStockUpdateAt: nowIso,
             globalStockProcessedAt,
@@ -5782,6 +5843,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         if (!Number.isFinite(globalTs)) return;
 
         const sourceFiles = ((data as any).sourceFiles || {}) as any;
+        const hasPendingClassification = isAuditClassificationOutdated(sourceFiles);
         const hasPendingGlobalStock = isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta);
         const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(
             sourceFiles,
@@ -5789,7 +5851,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             globalDeptIdsMeta,
             globalCatIdsMeta
         );
-        const hasPendingGlobalBase = hasPendingGlobalStock || hasPendingGlobalStructure;
+        const hasPendingGlobalBase = hasPendingGlobalStock || hasPendingGlobalStructure || hasPendingClassification;
         if (!hasPendingGlobalBase) return;
 
         const syncKey = `${dbSessionId || 'no_session'}|${selectedFilial}|${globalStockMeta.module_key}|${globalTs}|${globalStructureBaseSignature}`;
@@ -5798,13 +5860,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             return;
         }
 
-        // Ao detectar estoque global novo, manter a tela de atualização aberta.
-        // A reclassificação só deve ocorrer no clique do botão (handleStartAudit).
+        // Base nova mantém a tela de atualização aberta. Snapshots do classificador
+        // anterior são migrados automaticamente pelo efeito após handleStartAudit.
         enterStockUpdateMode({
             stockTsRaw: globalTsRaw,
             syncKey,
-            showAlert: true,
-            reason: hasPendingGlobalStock ? 'stock' : 'structure'
+            showAlert: !hasPendingClassification,
+            reason: hasPendingClassification ? 'classification' : (hasPendingGlobalStock ? 'stock' : 'structure')
         });
     }, [
         selectedFilial,
@@ -5824,7 +5886,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         branchAuditsHistory
     ]);
 
-    const handleStartAudit = async () => {
+    const handleStartAudit = async (options?: unknown) => {
+        const automaticClassificationMigration = !!(
+            options &&
+            typeof options === 'object' &&
+            'automaticClassificationMigration' in options &&
+            (options as { automaticClassificationMigration?: boolean }).automaticClassificationMigration
+        );
         if (isReadOnlyCompletedView) {
             alert("Modo consulta ativo: este inventário concluído não pode ser editado.");
             return;
@@ -5842,6 +5910,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const hasOpenStructure = !!(data && data.groups && data.groups.length > 0);
         const shouldMergeStockOnly = hasOpenStructure;
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
+        const hasPendingClassification = isAuditClassificationOutdated(sourceFiles);
         const hasPendingGlobalStructure = isGlobalAuditStructureDifferentFromApplied(
             sourceFiles,
             globalGroupMeta,
@@ -5851,6 +5920,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         // Em auditoria aberta, uma base nova precisa reclassificar os itens ainda
         // abertos para incluir/remover produtos, preservando tudo que já foi concluído.
         const shouldReclassifyOpen = hasOpenStructure && hasStructureFiles && (
+            hasPendingClassification ||
             isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
             hasPendingGlobalStructure
         );
@@ -6085,7 +6155,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         }
 
         if (shouldReclassifyOpen && data) {
-            if (!window.confirm("Reclassificar a estrutura aberta com os novos arquivos carregados?")) {
+            if (!automaticClassificationMigration && !window.confirm("Reclassificar a estrutura aberta com os novos arquivos carregados?")) {
                 return;
             }
         } else if (!shouldMergeStockOnly) {
@@ -6137,28 +6207,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             const superClean = (str: unknown) => 
                 normalizeDescriptionKey(str).replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
 
-            const isStrictBarcode = (val: any, index?: number) => {
-                if (val == null || val === '') return false;
-                let s = String(val).trim().replace(/^'/, '');
-                if (/^\d+(?:-\d+)?(?:[.,]0+)?$/.test(s)) {
-                    const numOnly = s.replace(/\D/g, '');
-                    return numOnly.length >= (index === 1 ? 1 : 3);
-                }
-                return false;
-            };
-
             const fillIdByDescription = (
                 rows: any[][],
                 output: Record<string, string>,
-                entries: Array<{ key: string; id: string }>
+                entries: Array<{ key: string; id: string }>,
+                prefix: 'DEPARTAMENTO' | 'CATEGORIA'
             ) => {
                 rows.forEach(row => {
                     if (!row) return;
-                    const idNum = parseSheetNumericCode(row[5]); // F = numero
-                    const descKey = normalizeDescriptionKey(row[7]); // H = descricao
-                    if (idNum === null || !descKey) return;
-                    if (!output[descKey]) output[descKey] = String(idNum);
-                    entries.push({ key: descKey, id: String(idNum) });
+                    const parsed = parseHierarchySectionHeader(row, prefix);
+                    if (!parsed) return;
+                    const descKey = normalizeDescriptionKey(parsed.name);
+                    if (!descKey) return;
+                    if (!output[descKey]) output[descKey] = parsed.id;
+                    entries.push({ key: descKey, id: parsed.id });
                 });
             };
 
@@ -6182,68 +6244,39 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             if (effectiveDeptIdsFile) {
                 const rowsDept = await readExcel(effectiveDeptIdsFile);
-                fillIdByDescription(rowsDept, deptIdByDescription, deptDescEntries);
+                fillIdByDescription(rowsDept, deptIdByDescription, deptDescEntries, 'DEPARTAMENTO');
+                const deptColumns = detectGroupCadastroColumns(rowsDept);
                 let lastDeptId = "";
                 let lastDeptName = "";
                 rowsDept.forEach(row => {
                     if (!row) return;
-                    const deptIdNow = parseSheetNumericCode(row[5]); // F
-                    if (deptIdNow !== null) lastDeptId = String(deptIdNow);
-                    const deptNameNowRaw = String(row[7] ?? '').trim(); // H
-                    if (deptNameNowRaw) lastDeptName = deptNameNowRaw.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').trim();
-
-                    const firstCell = String(row[0] ?? '').trim();
-                    if (firstCell.toUpperCase().startsWith("DEPARTAMENTO") || /^\d+\s*-\s*[A-Z]/.test(firstCell)) {
-                        const parsed = parseHierarchyCell(firstCell.replace(/^DEPARTAMENTO:?\s*/i, ""), "");
-                        if (parsed.name && parsed.name !== "OUTROS" && parsed.name !== "GERAL") {
-                            lastDeptId = parsed.numericId || lastDeptId;
-                            lastDeptName = parsed.name;
-                        }
+                    const section = parseHierarchySectionHeader(row, 'DEPARTAMENTO');
+                    if (section) {
+                        lastDeptId = section.id;
+                        lastDeptName = section.name;
                     }
-                    
+
                     let inlineDeptId = lastDeptId;
                     let inlineDeptName = lastDeptName;
-                    
-                    const cellId18 = parseSheetNumericCode(row[18]);
-                    const cellName18 = parseHierarchyCell(row[18], "").name;
-                    const cellName19 = String(row[19] || "").trim();
 
-                    if (cellId18 !== null && cellId18 !== 8) {
-                        inlineDeptId = String(cellId18);
+                    const rowDeptName = String(row[deptColumns.deptCol] ?? '').trim();
+                    if (rowDeptName && !isHierarchyPlaceholderName(rowDeptName, ['OUTROS', 'GERAL'])) {
+                        inlineDeptName = rowDeptName;
                     }
-                    if (cellName19 && cellName19.toUpperCase() !== "OUTROS" && cellName19.toUpperCase() !== "MIP") {
-                        inlineDeptName = cellName19;
-                    } else if (cellName18 && cellName18.toUpperCase() !== "OUTROS" && cellName18.toUpperCase() !== "MIP") {
-                        inlineDeptName = cellName18;
-                    }
-                    
-                    // Clear numeric ID if it's an unclassified bucket to prevent collision
+
                     if (inlineDeptName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineDeptName.toUpperCase().includes('SEM CATEGORIA') || inlineDeptName.toUpperCase() === 'OUTROS') {
                         inlineDeptId = "";
                     }
-                    
-                    let rowName = "";
-                    for (let i = 0; i < Math.min(row.length, 10); i++) {
-                        const val = String(row[i] || "").trim().replace(/^'/, '');
-                        if (val.length > 3 && /[a-zA-Z]/.test(val) && val.length > rowName.length) {
-                            rowName = val;
-                        }
-                    }
+
+                    const rowName = String(row[deptColumns.nameCol] ?? '').trim();
                     const nameKey = superClean(rowName);
 
-                    const normalizedDept = normalizeDepartmentClassification({
-                        deptId: inlineDeptId,
-                        deptName: inlineDeptName,
-                        row
-                    });
-                    const deptData = { deptId: normalizedDept.deptId, deptName: normalizedDept.deptName };
+                    const deptData = { deptId: inlineDeptId, deptName: inlineDeptName };
 
-                    for (let i = 0; i < Math.min(row.length, 20); i++) {
-                        if (isStrictBarcode(row[i], i)) {
-                            const red = normalizeBarcode(row[i]);
-                            if (red) deptReportByReduced[red] = deptData;
-                        }
-                    }
+                    [row[deptColumns.codeCol], row[deptColumns.barcodeCol]].forEach(value => {
+                        const code = normalizeBarcode(value);
+                        if (code) deptReportByReduced[code] = deptData;
+                    });
 
                     if (nameKey) deptReportByName[nameKey] = deptData;
                 });
@@ -6251,68 +6284,40 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             if (effectiveCatIdsFile) {
                 const rowsCat = await readExcel(effectiveCatIdsFile);
-                fillIdByDescription(rowsCat, catIdByDescription, catDescEntries);
+                fillIdByDescription(rowsCat, catIdByDescription, catDescEntries, 'CATEGORIA');
+                const catColumns = detectGroupCadastroColumns(rowsCat);
                 let lastCatId = "";
                 let lastCatName = "";
                 rowsCat.forEach(row => {
                     if (!row) return;
-                    const catIdNow = parseSheetNumericCode(row[5]); // F
-                    if (catIdNow !== null) lastCatId = String(catIdNow);
-                    const catNameNowRaw = String(row[7] ?? '').trim(); // H
-                    if (catNameNowRaw) lastCatName = catNameNowRaw.replace(/^\s*(?:-|:|\/|\.)+\s*/, '').trim();
-                    
-                    const firstCell = String(row[0] ?? '').trim();
-                    if (firstCell.toUpperCase().startsWith("CATEGORIA") || /^\d+\s*-\s*[A-Z]/.test(firstCell)) {
-                        const parsed = parseHierarchyCell(firstCell.replace(/^CATEGORIA:?\s*/i, ""), "");
-                        if (parsed.name && parsed.name !== "OUTROS" && parsed.name !== "GERAL") {
-                            lastCatId = parsed.numericId || lastCatId;
-                            lastCatName = parsed.name;
-                        }
+                    const section = parseHierarchySectionHeader(row, 'CATEGORIA');
+                    if (section) {
+                        lastCatId = section.id;
+                        lastCatName = section.name;
                     }
 
                     let inlineCatId = lastCatId;
                     let inlineCatName = lastCatName;
-                    
-                    const cellId22 = parseSheetNumericCode(row[22]);
-                    const cellName22 = parseHierarchyCell(row[22], "").name;
-                    const cellName23 = String(row[23] || "").trim();
 
-                    if (cellId22 !== null) {
-                        inlineCatId = String(cellId22);
+                    const rowCatName = String(row[catColumns.catCol] ?? '').trim();
+                    if (rowCatName && !isHierarchyPlaceholderName(rowCatName, ['OUTROS', 'GERAL'])) {
+                        inlineCatName = rowCatName;
                     }
-                    if (cellName23 && cellName23.toUpperCase() !== "GERAL") {
-                        inlineCatName = cellName23;
-                    } else if (cellName22 && cellName22.toUpperCase() !== "GERAL") {
-                        inlineCatName = cellName22;
-                    }
-                    
-                    // Clear numeric ID if it's an unclassified bucket to prevent collision
+
                     if (inlineCatName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineCatName.toUpperCase().includes('SEM CATEGORIA') || inlineCatName.toUpperCase() === 'OUTROS' || inlineCatName.toUpperCase() === 'GERAL') {
                         inlineCatId = "";
                     }
 
-                    let rowName = "";
-                    for (let i = 0; i < Math.min(row.length, 10); i++) {
-                        const val = String(row[i] || "").trim().replace(/^'/, '');
-                        if (val.length > 3 && /[a-zA-Z]/.test(val) && val.length > rowName.length) {
-                            rowName = val;
-                        }
-                    }
+                    const rowName = String(row[catColumns.nameCol] ?? '').trim();
                     const nameKey = superClean(rowName);
 
-                    let deptName = String(row[19] ?? '').trim(); // T
-                    if (!deptName && row[18]) {
-                        deptName = parseHierarchyCell(row[18], "").name;
-                    }
-
+                    const deptName = String(row[catColumns.deptCol] ?? '').trim();
                     const catData = { catId: inlineCatId, catName: inlineCatName, deptName };
 
-                    for (let i = 0; i < Math.min(row.length, 20); i++) {
-                        if (isStrictBarcode(row[i], i)) {
-                            const red = normalizeBarcode(row[i]);
-                            if (red) catReportByReduced[red] = catData;
-                        }
-                    }
+                    [row[catColumns.codeCol], row[catColumns.barcodeCol]].forEach(value => {
+                        const code = normalizeBarcode(value);
+                        if (code) catReportByReduced[code] = catData;
+                    });
 
                     if (nameKey) catReportByName[nameKey] = catData;
                 });
@@ -6410,45 +6415,31 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             groupFileRows.forEach(({ groupId, rows }) => {
                 const groupName = GROUP_CONFIG_DEFAULTS[groupId] || `Grupo ${groupId}`;
-                const detectedCols = detectHierarchyColumnsInRows(rows);
+                const columns = detectGroupCadastroColumns(rows);
+                const firstProductRow = columns.headerRowIndex >= 0 ? columns.headerRowIndex + 2 : 0;
 
-                rows.forEach((row) => {
+                rows.slice(firstProductRow).forEach((row) => {
                     if (!row || row.length < 4) return;
 
-                    const productCodeCandidates = collectProductCodeCandidates(row, 12);
+                    const productCodeCandidates = Array.from(new Set([
+                        normalizeBarcode(row[columns.codeCol]),
+                        normalizeBarcode(row[columns.barcodeCol])
+                    ].filter(Boolean)));
                     if (productCodeCandidates.length === 0) return;
 
-                    let productNameKeyStr = "";
-                    for (let i = 0; i < Math.min(row.length, 10); i++) {
-                        const val = String(row[i] || "").trim().replace(/^'/, '');
-                        if (val.length > 3 && /[a-zA-Z]/.test(val) && val.length > productNameKeyStr.length) {
-                            productNameKeyStr = val;
-                        }
-                    }
+                    const productNameKeyStr = String(row[columns.nameCol] || '').trim();
                     const productNameKey = superClean(productNameKeyStr);
 
-                    const rawDeptCol = detectedCols.deptCodeCol >= 0 ? row[detectedCols.deptCodeCol] : row[18];
-                    const rawDeptNameCol = detectedCols.deptNameCol >= 0 ? row[detectedCols.deptNameCol] : row[19];
-                    const rawCatCol = detectedCols.catCodeCol >= 0 ? row[detectedCols.catCodeCol] : row[22];
-                    const rawCatNameCol = detectedCols.catNameCol >= 0 ? row[detectedCols.catNameCol] : row[23];
-
-                    const deptCell = parseHierarchyCells(rawDeptCol, rawDeptNameCol, "OUTROS", ['GERAL']);
-                    const catCell = parseHierarchyCells(rawCatCol, rawCatNameCol, "GERAL", ['GERAL']);
-                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name || rawDeptNameCol || rawDeptCol, deptIdByDescription, deptDescEntries);
-                    const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name || rawCatNameCol || rawCatCol, catIdByDescription, catDescEntries);
-
-                    const normalizedDept = normalizeDepartmentClassification({
-                        deptId: deptResolvedId,
-                        deptName: deptCell.name,
-                        groupId,
-                        row
-                    });
+                    const deptCell = parseHierarchyCells(row[columns.deptCol], '', "OUTROS", ['GERAL']);
+                    const catCell = parseHierarchyCells(row[columns.catCol], '', "GERAL", ['GERAL']);
+                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name, deptIdByDescription, deptDescEntries);
+                    const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name, catIdByDescription, catDescEntries);
 
                     const scope: ProductScope = {
                         groupId,
                         groupName,
-                        deptId: normalizedDept.deptId,
-                        deptName: normalizedDept.deptName,
+                        deptId: deptResolvedId,
+                        deptName: deptCell.name,
                         catId: catResolvedId,
                         catName: catCell.name
                     };
@@ -6613,14 +6604,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     }
                 }
 
-                const normalizedFinalDept = normalizeDepartmentClassification({
-                    deptId: resolvedScope.deptId,
-                    deptName: resolvedScope.deptName,
-                    groupId: resolvedScope.groupId
-                });
-                resolvedScope.deptId = normalizedFinalDept.deptId;
-                resolvedScope.deptName = normalizedFinalDept.deptName;
-
                 const finalGroupId = resolvedScope.groupId;
                 const finalGroupName = resolvedScope.groupName;
                 const finalGroupKey = resolveGroupKey(finalGroupId, finalGroupName);
@@ -6781,6 +6764,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         }
         finally { setIsProcessing(false); }
     };
+
+    useEffect(() => {
+        if (!selectedFilial || !dbSessionId || !data || isProcessing) return;
+        if (!canUseAuditMasterTools || isReadOnlyCompletedView || consultingAuditNumber !== null) return;
+        if (completedAuditConsultationRef.current) return;
+
+        const sourceFiles = ((data as any).sourceFiles || {}) as any;
+        if (!isAuditClassificationOutdated(sourceFiles)) return;
+        if (!effectiveStockFile || effectiveGroupFiles.length === 0 || !effectiveDeptIdsFile || !effectiveCatIdsFile) return;
+
+        const migrationKey = `${dbSessionId}|${selectedFilial}|classification-v${AUDIT_CLASSIFICATION_SCHEMA_VERSION}`;
+        if (automaticClassificationMigrationAttemptsRef.current.has(migrationKey)) return;
+        automaticClassificationMigrationAttemptsRef.current.add(migrationKey);
+
+        void handleStartAudit({ automaticClassificationMigration: true });
+    }, [
+        selectedFilial,
+        dbSessionId,
+        data,
+        isProcessing,
+        canUseAuditMasterTools,
+        isReadOnlyCompletedView,
+        consultingAuditNumber,
+        effectiveStockFile,
+        effectiveGroupFiles,
+        effectiveDeptIdsFile,
+        effectiveCatIdsFile
+    ]);
 
     const handleLoadFromTrier = async () => {
         if (isReadOnlyCompletedView) {
@@ -9039,26 +9050,24 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     try {
                         const rows = await readExcel(file);
                         const groupName = GROUP_CONFIG_DEFAULTS[groupId] || `Grupo ${groupId}`;
+                        const columns = detectGroupCadastroColumns(rows);
+                        const firstProductRow = columns.headerRowIndex >= 0 ? columns.headerRowIndex + 2 : 0;
 
-                        rows.forEach((row: any[]) => {
+                        rows.slice(firstProductRow).forEach((row: any[]) => {
                             if (!row || row.length < 4) return;
 
-                            const deptRaw = String(row[18] ?? '').trim(); // Col S = departamento
-                            const catRaw = String(row[22] ?? '').trim(); // Col W = categoria
+                            const deptRaw = String(row[columns.deptCol] ?? '').trim();
+                            const catRaw = String(row[columns.catCol] ?? '').trim();
                             if (!deptRaw && !catRaw) return;
 
-                            const deptParsedRaw = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
-                            const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
-                            const normalizedDept = normalizeDepartmentClassification({
-                                deptId: deptParsedRaw.numericId,
-                                deptName: deptParsedRaw.name,
-                                groupId,
-                                row
-                            });
-                            const deptName = normalizedDept.deptName;
-                            const deptId = normalizedDept.deptId;
+                            const deptParsed = parseHierarchyCells(deptRaw, '', 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                            const catParsed = parseHierarchyCells(catRaw, '', 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
+                            const deptName = deptParsed.name;
 
-                            const codes = collectProductCodeCandidates(row, 12);
+                            const codes = Array.from(new Set([
+                                normalizeBarcode(row[columns.codeCol]),
+                                normalizeBarcode(row[columns.barcodeCol])
+                            ].filter(Boolean)));
                             codes.forEach(code => {
                                 if (!code) return;
                                 addUniqueHierarchyEntry(universalRegistry, code, {
@@ -9067,7 +9076,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                     deptId: normalizeScopeId(deptParsed.numericId),
                                     deptName,
                                     catId: normalizeScopeId(catParsed.numericId),
-                                    catName
+                                    catName: catParsed.name
                                 });
                             });
                         });
@@ -9237,36 +9246,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     } else {
                         try {
                             const cadastroRows = await readExcel(cadastroFile);
-                            cadastroRows.forEach((row: any[]) => {
+                            const columns = detectGroupCadastroColumns(cadastroRows);
+                            const firstProductRow = columns.headerRowIndex >= 0 ? columns.headerRowIndex + 2 : 0;
+                            cadastroRows.slice(firstProductRow).forEach((row: any[]) => {
                                 if (!row || row.length < 4) return;
 
-                                const deptRaw = String(row[18] ?? '').trim(); // Col S = departamento
-                                const catRaw = String(row[22] ?? '').trim(); // Col W = categoria
+                                const deptRaw = String(row[columns.deptCol] ?? '').trim();
+                                const catRaw = String(row[columns.catCol] ?? '').trim();
 
                                 // Skip rows where both dept and cat are empty (header/blank rows)
                                 if (!deptRaw && !catRaw) return;
 
-                                const deptParsedRaw = parseHierarchyCells(row[18], row[19], 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
-                                const catParsed = parseHierarchyCells(row[22], row[23], 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
-                                const normalizedDept = normalizeDepartmentClassification({
-                                    deptId: deptParsedRaw.numericId,
-                                    deptName: deptParsedRaw.name,
-                                    groupId: primaryScopeGroupId,
-                                    row
-                                });
-                                const deptName = normalizedDept.deptName;
-                                const deptId = normalizedDept.deptId;
+                                const deptParsed = parseHierarchyCells(deptRaw, '', 'DIVERSOS (SEM DEPARTAMENTO)', ['GERAL']);
+                                const catParsed = parseHierarchyCells(catRaw, '', 'DIVERSOS (SEM CATEGORIA)', ['GERAL']);
+                                const deptName = deptParsed.name;
 
-                                const rowCodes = collectProductCodeCandidates(row, 12);
+                                const rowCodes = Array.from(new Set([
+                                    normalizeBarcode(row[columns.codeCol]),
+                                    normalizeBarcode(row[columns.barcodeCol])
+                                ].filter(Boolean)));
                                 rowCodes.forEach((codeCandidate) => {
                                     if (!codeCandidate) return;
                                     const candidate = {
                                         groupId: normalizeScopeId(primaryScopeGroupId),
                                         groupName: GROUP_CONFIG_DEFAULTS[normalizeScopeId(primaryScopeGroupId)] || `Grupo ${primaryScopeGroupId}`,
-                                        deptId: normalizeScopeId(deptId),
+                                        deptId: normalizeScopeId(deptParsed.numericId),
                                         deptName,
                                         catId: normalizeScopeId(catParsed.numericId),
-                                        catName
+                                        catName: catParsed.name
                                     };
                                     const current = cadastroLookup.get(codeCandidate);
                                     const chosen = current ? pickBestHierarchyEntry([current as any, candidate as any], primaryScopeGroupId) as any : candidate;
