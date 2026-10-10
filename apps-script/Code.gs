@@ -1,5 +1,5 @@
 // Preencha somente na copia privada aberta em script.google.com.
-const CF_SPREADSHEET_ID = 'COLE_AQUI_O_ID_DA_PLANILHA';
+const CF_SPREADSHEET_ID = '1M9xpKpFYcNOwA6LeJ7bf-aktkW_b5sn84LVYCbePGuA';
 const CF_SESSION_SHEET = 'cf_api_sessions';
 const CF_HEADERS = ['id', 'record_key', 'revision', 'updated_at', 'payload_json'];
 const CF_CHUNK_PREFIX = '__CF_CHUNKED_V1__';
@@ -52,6 +52,7 @@ function doPost(event) {
       return json_({ ok: true, data: null });
     }
     if (action === 'query') return json_({ ok: true, data: executeQuery_(body.payload && body.payload.query, context.user) });
+    if (action === 'optimize_sheets') return json_({ ok: true, data: optimizeDatabaseSpreadsheet_() });
     throw apiError_('INVALID_ACTION', 'Operação inválida.');
   } catch (error) {
     return json_({
@@ -502,7 +503,46 @@ function newRecord_(value, fields) { const now = nowIso_(); if (!value.id) value
 var _cachedBook_ = null;
 var _cachedSheets_ = {};
 function getSpreadsheetBook_() { if (!_cachedBook_) { var id = PropertiesService.getScriptProperties().getProperty('CF_SPREADSHEET_ID') || CF_SPREADSHEET_ID; _cachedBook_ = SpreadsheetApp.openById(id); } return _cachedBook_; }
-function ensureSheet_(name) { if (_cachedSheets_[name]) return _cachedSheets_[name]; var book = getSpreadsheetBook_(); var sheet = book.getSheetByName(name); if (!sheet) sheet = book.insertSheet(name); if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, 5).setValues([CF_HEADERS]); _cachedSheets_[name] = sheet; return sheet; }
+function ensureSheet_(name) {
+  if (_cachedSheets_[name]) return _cachedSheets_[name];
+  var book = getSpreadsheetBook_();
+  var sheet = book.getSheetByName(name);
+  if (!sheet) {
+    sheet = book.insertSheet(name);
+    if (sheet.getMaxColumns() > 5) sheet.deleteColumns(6, sheet.getMaxColumns() - 5);
+  }
+  if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, 5).setValues([CF_HEADERS]);
+  _cachedSheets_[name] = sheet;
+  return sheet;
+}
+
+function optimizeSpreadsheet() {
+  return optimizeDatabaseSpreadsheet_();
+}
+
+function optimizeDatabaseSpreadsheet_() {
+  const book = getSpreadsheetBook_();
+  const sheets = book.getSheets();
+  const results = [];
+  sheets.forEach(sheet => {
+    const name = sheet.getName();
+    let colsDeleted = 0;
+    let rowsDeleted = 0;
+    const maxCols = sheet.getMaxColumns();
+    if (maxCols > 5) {
+      colsDeleted = maxCols - 5;
+      sheet.deleteColumns(6, colsDeleted);
+    }
+    const lastRow = Math.max(1, sheet.getLastRow());
+    const maxRows = sheet.getMaxRows();
+    if (maxRows > lastRow + 10) {
+      rowsDeleted = maxRows - (lastRow + 10);
+      sheet.deleteRows(lastRow + 11, rowsDeleted);
+    }
+    results.push({ sheet: name, colsDeleted: colsDeleted, rowsDeleted: rowsDeleted, totalRows: sheet.getMaxRows(), totalCols: sheet.getMaxColumns() });
+  });
+  return { ok: true, sheetsProcessed: results.length, details: results };
+}
 function project_(row, columns) { if (!columns || columns.trim() === '*') return clone_(row); const result = {}; columns.split(',').map(c => c.trim()).filter(Boolean).forEach(c => result[c] = clone_(row[c])); return result; }
 function sameCompany_(row, user) { return !user.company_id || !row.company_id || String(row.company_id || '') === String(user.company_id || ''); }
 function normalizeEmail_(value) { return String(value || '').trim().toLowerCase(); }

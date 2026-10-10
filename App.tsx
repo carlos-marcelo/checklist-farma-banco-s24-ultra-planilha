@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Camera, FileText, CheckSquare, Printer, Clipboard, ClipboardList, Image as ImageIcon, Trash2, Menu, X, ChevronRight, Download, Star, AlertTriangle, CheckCircle, AlertCircle, LayoutDashboard, FileCheck, Settings, LogOut, Users, Palette, Upload, UserPlus, History, RotateCcw, Save, Search, Eye, EyeOff, Phone, User as UserIcon, Ban, Check, Filter, UserX, Undo2, CheckSquare as CheckSquareIcon, Trophy, Frown, PartyPopper, Lock, Loader2, Building2, MapPin, Store, MessageSquare, Send, ThumbsUp, ThumbsDown, Clock, CheckCheck, Lightbulb, MessageSquareQuote, Package, ArrowRight, ArrowLeft, ShieldCheck, HelpCircle, Info, LayoutGrid, UserCircle, FileSearch, ChevronDown, Calendar, RefreshCw, UserCircle2, Plus, SearchX, WifiOff, LineChart } from 'lucide-react';
-import { FileSpreadsheet } from 'lucide-react';
+import { FileSpreadsheet, Sparkles } from 'lucide-react';
 import { CHECKLISTS as BASE_CHECKLISTS, THEMES, ACCESS_MODULES, ACCESS_LEVELS, INPUT_TYPE_LABELS, generateId } from './constants';
 import { ChecklistData, ChecklistImages, InputType, ChecklistSection, ChecklistDefinition, ChecklistItem, ThemeColor, AppConfig, User, ReportHistoryItem, StockConferenceHistoryItem, CompanyArea, AccessLevelId, AccessModule, AccessLevelMeta, UserRole, StockConferenceSummary } from './types';
 import SignaturePad from './components/SignaturePad';
@@ -27,6 +27,7 @@ import {
     stabilizeCompanyAreas
 } from './src/branchDirectory';
 import { encodeFileForStorage } from './src/filePayload';
+import { optimizeBaseFileForStorage } from './src/cadastrosBase/cadastrosBaseOptimizer';
 import { GoogleDriveConnectionPanel } from './components/GoogleDriveConnectionPanel';
 import { googleAppsScriptClient, googleWorkspaceService, isGoogleAppsScriptConfigured } from './src/googleWorkspace';
 
@@ -3421,6 +3422,7 @@ const App: React.FC = () => {
     const [globalBaseFiles, setGlobalBaseFiles] = useState<SupabaseService.DbGlobalBaseFile[]>([]);
     const [isLoadingGlobalBaseFiles, setIsLoadingGlobalBaseFiles] = useState(false);
     const [uploadingGlobalBaseKey, setUploadingGlobalBaseKey] = useState<string | null>(null);
+    const [isOptimizingSheets, setIsOptimizingSheets] = useState(false);
 
     // Master User Management State
     const [newUserName, setNewUserName] = useState('');
@@ -4985,13 +4987,14 @@ const App: React.FC = () => {
         }
         setUploadingGlobalBaseKey(slotKey);
         try {
-            const encodedFile = await encodeFileForStorage(file);
+            const fileToProcess = await optimizeBaseFileForStorage(slotKey, file);
+            const encodedFile = await encodeFileForStorage(fileToProcess);
             const saved = await SupabaseService.upsertGlobalBaseFile({
                 company_id: companyId,
                 module_key: slotKey,
                 file_name: file.name,
-                mime_type: file.type || 'application/octet-stream',
-                file_size: file.size,
+                mime_type: fileToProcess.type || file.type || 'application/octet-stream',
+                file_size: fileToProcess.size,
                 file_data_base64: encodedFile.dataUrl,
                 uploaded_by: currentUser?.email || 'admin'
             });
@@ -5032,6 +5035,20 @@ const App: React.FC = () => {
             alert('Erro ao carregar arquivo base.');
         } finally {
             setUploadingGlobalBaseKey(null);
+        }
+    };
+
+    const handleOptimizeDriveSpreadsheet = async () => {
+        if (!confirm('Deseja otimizar as abas da planilha do Google Drive agora?\\nIsso removerá colunas vazias (F a Z) e linhas excedentes, deixando o banco mais leve e rápido.')) return;
+        setIsOptimizingSheets(true);
+        try {
+            const res = await (googleAppsScriptClient as any).request('optimize_sheets', {}, true);
+            alert(`Planilha do Google Drive otimizada com sucesso!\\n${res?.sheetsProcessed || 0} abas verificadas e compactadas.`);
+        } catch (err: any) {
+            console.error('Erro ao otimizar planilha:', err);
+            alert('Não foi possível otimizar a planilha agora. Verifique a conexão com o Google Apps Script.');
+        } finally {
+            setIsOptimizingSheets(false);
         }
     };
 
@@ -14167,14 +14184,27 @@ const App: React.FC = () => {
                                         Carregue aqui os arquivos fixos dos módulos. Eles ficam centralizados por empresa e disponíveis para todas as filiais.
                                     </p>
                                 </div>
-                                <button
-                                    onClick={() => void loadGlobalBaseFiles(true)}
-                                    disabled={isLoadingGlobalBaseFiles}
-                                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-gray-200 bg-white text-gray-700 text-xs font-black uppercase tracking-wider hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-colors"
-                                >
-                                    <RefreshCw size={14} className={isLoadingGlobalBaseFiles ? 'animate-spin' : ''} />
-                                    {isLoadingGlobalBaseFiles ? 'Atualizando...' : 'Atualizar Lista'}
-                                </button>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    {currentUser?.role === 'MASTER' && (
+                                        <button
+                                            onClick={() => void handleOptimizeDriveSpreadsheet()}
+                                            disabled={isOptimizingSheets}
+                                            title="Remove colunas extras (F a Z) e linhas excedentes na planilha do Google Drive"
+                                            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-indigo-200 bg-indigo-50 text-indigo-700 text-xs font-black uppercase tracking-wider hover:bg-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-colors shadow-sm"
+                                        >
+                                            <Sparkles size={14} className={isOptimizingSheets ? 'animate-spin text-indigo-600' : 'text-indigo-600'} />
+                                            {isOptimizingSheets ? 'Otimizando Drive...' : 'Otimizar Planilha (Drive)'}
+                                        </button>
+                                    )}
+                                    <button
+                                        onClick={() => void loadGlobalBaseFiles(true)}
+                                        disabled={isLoadingGlobalBaseFiles}
+                                        className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-gray-200 bg-white text-gray-700 text-xs font-black uppercase tracking-wider hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                                    >
+                                        <RefreshCw size={14} className={isLoadingGlobalBaseFiles ? 'animate-spin' : ''} />
+                                        {isLoadingGlobalBaseFiles ? 'Atualizando...' : 'Atualizar Lista'}
+                                    </button>
+                                </div>
                             </div>
 
                             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
