@@ -716,7 +716,7 @@ const detectGroupCadastroColumns = (rows: any[][]): GroupCadastroColumns => {
 
     const header = (rows[headerRowIndex] || []).map(normalizeHeader);
     const findHeader = (predicate: (text: string) => boolean, fallback: number) => {
-        const index = header.findIndex(predicate);
+        const index = header.findIndex(text => Boolean(text && predicate(text)));
         return index >= 0 ? index : fallback;
     };
     const codeHeaderCol = findHeader(text => text.includes('codigo'), 1);
