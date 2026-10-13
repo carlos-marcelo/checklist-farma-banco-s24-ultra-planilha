@@ -11027,9 +11027,16 @@ const App: React.FC = () => {
             const isOpen = !isCompleted && openCount > 0;
             const branchBase = `${shortBranch}${isCompleted ? '✅' : ''} - mix ${formatInt(totals.mix)} | itens ${formatInt(totals.units)}`;
 
+            const effectiveDiffCost = Math.abs(Number(financial.diffCost || 0)) > 0.001
+                ? Number(financial.diffCost || 0)
+                : (Math.abs(Number(branchMetric.diffCost || 0)) > 0.001 ? Number(branchMetric.diffCost || 0) : 0);
+            const effectiveDivergencePct = Math.abs(Number(financial.diffCost || 0)) > 0.001
+                ? Number(financial.divergencePct || 0)
+                : (Math.abs(Number(branchMetric.diffCost || 0)) > 0.001 ? Number(branchMetric.divergencePct || 0) : 0);
+
             if (isCompleted) {
                 completedBranchLabels.push(shortBranch);
-                branchLines.push(`${branchBase} | ${formatDivergence(financial.diffCost, financial.divergencePct)}`);
+                branchLines.push(`${branchBase} | ${formatDivergence(effectiveDiffCost, effectiveDivergencePct)}`);
             } else {
                 pendingBranchLabels.push(shortBranch);
                 branchLines.push(`${branchBase}${isOpen ? ' | em andamento' : ''}`);
