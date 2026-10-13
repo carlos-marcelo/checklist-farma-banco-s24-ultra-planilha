@@ -114,6 +114,8 @@ type AppStep = 'setup' | 'conference' | 'divergence' | 'report';
 interface StockConferenceProps {
   userEmail?: string;
   userName?: string;
+  initialCompanyId?: string;
+  initialBranch?: string;
   companies?: SupabaseService.DbCompany[];
   onReportSaved?: () => Promise<void>;
   pendingReportsCount?: number;
@@ -141,12 +143,25 @@ type StockSummaryPayload = {
 const GLOBAL_CADASTRO_MODULE_KEY = 'shared_cadastro_produtos';
 
 const decodeGlobalFileToBrowserFile = async (file: SupabaseService.DbGlobalBaseFile): Promise<File | null> => {
+  if (!file) return null;
+  const originalName = file.file_name || `${file.module_key || 'base'}.xlsx`;
+  const fileName = originalName.startsWith('[GLOBAL] ')
+    ? originalName
+    : `[GLOBAL] ${originalName}`;
+
   if ((file as any)._parsedFile) return (file as any)._parsedFile;
+
+  if ((file as any)._blob) {
+    try {
+      const mime = (file as any)._blob.type || file.mime_type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      return new File([(file as any)._blob], fileName, { type: mime });
+    } catch (e) {
+      console.warn('Erro ao converter _blob para File:', e);
+    }
+  }
+
   try {
-    const originalName = file.file_name || `${file.module_key || 'base'}.xlsx`;
-    const fileName = originalName.startsWith('[GLOBAL] ')
-      ? originalName
-      : `[GLOBAL] ${originalName}`;
+    if (!file.file_data_base64) return null;
     return await decodeStoredFilePayloadToFile(file.file_data_base64, fileName, file.mime_type);
   } catch (error) {
     console.error('Erro ao decodificar arquivo global de conferência:', error);
@@ -625,6 +640,8 @@ const detectStockExcelLayout = (rows: any[], controlledStock: boolean): StockExc
 export const StockConference: React.FC<StockConferenceProps> = ({ 
   userEmail, 
   userName, 
+  initialCompanyId,
+  initialBranch,
   companies = [], 
   onReportSaved,
   pendingReportsCount = 0,
@@ -632,6 +649,15 @@ export const StockConference: React.FC<StockConferenceProps> = ({
 }) => {
   const [step, setStep] = useState<AppStep>('setup');
   const [isSyncingManual, setIsSyncingManual] = useState(false);
+
+  // Header Info State
+  const defaultCompanyId = initialCompanyId || (companies.length === 1 ? companies[0].id : '');
+  const [branch, setBranch] = useState(initialBranch || '');
+  const [selectedCompanyId, setSelectedCompanyId] = useState(defaultCompanyId);
+  const [selectedAreaName, setSelectedAreaName] = useState('');
+  const [pharmacist, setPharmacist] = useState(userName || '');
+  const [manager, setManager] = useState('');
+  const [globalProductLoadError, setGlobalProductLoadError] = useState<string | null>(null);
 
   const resetConferenceState = useCallback(async () => {
     setStep('setup');
@@ -643,11 +669,12 @@ export const StockConference: React.FC<StockConferenceProps> = ({
     setRecountTargets(new Set());
     setPharmSignature(null);
     setManagerSignature(null);
-    setPharmacist('');
+    setPharmacist(userName || '');
     setManager('');
-    setBranch('');
-    setSelectedCompanyId('');
+    setBranch(initialBranch || '');
+    setSelectedCompanyId(defaultCompanyId);
     setSelectedAreaName('');
+    setGlobalProductLoadError(null);
     setSessionId(null);
     setLastSavedReportId(null);
     setLastSavedSummary(null);
@@ -669,7 +696,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
         console.error("Erro ao limpar sessão no Supabase durante reset:", e);
       }
     }
-  }, [userEmail]);
+  }, [userEmail, userName, initialBranch, defaultCompanyId]);
 
   const handleManualSyncClick = async () => {
     if (!onManualSync) return;
@@ -680,13 +707,6 @@ export const StockConference: React.FC<StockConferenceProps> = ({
       setIsSyncingManual(false);
     }
   };
-
-  // Header Info State
-  const [branch, setBranch] = useState('');
-  const [selectedCompanyId, setSelectedCompanyId] = useState('');
-  const [selectedAreaName, setSelectedAreaName] = useState('');
-  const [pharmacist, setPharmacist] = useState('');
-  const [manager, setManager] = useState('');
 
   // Data State
   const [masterProducts, setMasterProducts] = useState<Map<string, Product>>(new Map()); // Key: ReducedCode
@@ -2074,44 +2094,72 @@ export const StockConference: React.FC<StockConferenceProps> = ({
     return date.toLocaleString('pt-BR');
   }, []);
 
+  // 1. Auto-seleciona empresa se companies for carregado ou atualizado
   useEffect(() => {
     if (!selectedCompanyId) {
+      if (initialCompanyId && companies.some(c => c.id === initialCompanyId)) {
+        setSelectedCompanyId(initialCompanyId);
+      } else if (companies.length === 1) {
+        setSelectedCompanyId(companies[0].id);
+      }
+    }
+  }, [companies, initialCompanyId, selectedCompanyId]);
+
+  // 2. Auto-seleciona filial e área a partir de initialBranch ou caso haja apenas uma opção
+  useEffect(() => {
+    if (selectedCompanyId && initialBranch && (!branch || branch.trim().toLowerCase() !== initialBranch.trim().toLowerCase())) {
+      const match = branchOptions.find(opt => opt.branch.trim().toLowerCase() === initialBranch.trim().toLowerCase());
+      if (match) {
+        setBranch(match.branch);
+        setSelectedAreaName(match.area || '');
+      }
+    } else if (selectedCompanyId && !branch && branchOptions.length === 1) {
+      setBranch(branchOptions[0].branch);
+      setSelectedAreaName(branchOptions[0].area || '');
+    }
+  }, [selectedCompanyId, initialBranch, branch, branchOptions]);
+
+  // 3. Carregamento resiliente da base de produtos global
+  const loadGlobalCadastro = useCallback(async (isRetry = false) => {
+    const effectiveCompanyId = selectedCompanyId || initialCompanyId || (companies && companies.length > 0 ? companies[0].id : '');
+    if (!effectiveCompanyId) {
       setGlobalProductMeta(null);
       setGlobalProductFile(null);
+      setIsLoadingGlobalProduct(false);
       return;
     }
 
-    let cancelled = false;
-    const loadGlobalCadastro = async () => {
-      setIsLoadingGlobalProduct(true);
-      try {
-        const globalCadastro = await CadastrosBaseService.getGlobalBaseFileCached(selectedCompanyId, GLOBAL_CADASTRO_MODULE_KEY);
-        if (cancelled) return;
-        setGlobalProductMeta(globalCadastro);
-        if (globalCadastro) {
-          const decoded = await decodeGlobalFileToBrowserFile(globalCadastro);
-          setGlobalProductFile(decoded);
-        } else {
-          setGlobalProductFile(null);
+    setIsLoadingGlobalProduct(true);
+    setGlobalProductLoadError(null);
+    try {
+      const globalCadastro = await CadastrosBaseService.getGlobalBaseFileCached(
+        effectiveCompanyId,
+        GLOBAL_CADASTRO_MODULE_KEY,
+        { preferRemote: isRetry }
+      );
+      setGlobalProductMeta(globalCadastro);
+      if (globalCadastro) {
+        const decoded = await decodeGlobalFileToBrowserFile(globalCadastro);
+        setGlobalProductFile(decoded);
+        if (!decoded) {
+          setGlobalProductLoadError('Não foi possível ler o arquivo global salvo.');
         }
-      } catch (error) {
-        console.error('Erro ao carregar base global da conferência:', error);
-        if (!cancelled) {
-          setGlobalProductMeta(null);
-          setGlobalProductFile(null);
-        }
-      } finally {
-        if (!cancelled) {
-          setIsLoadingGlobalProduct(false);
-        }
+      } else {
+        setGlobalProductFile(null);
       }
-    };
+    } catch (error: any) {
+      console.error('Erro ao carregar base global da conferência:', error);
+      setGlobalProductMeta(null);
+      setGlobalProductFile(null);
+      setGlobalProductLoadError(error?.message || 'Falha ao buscar base global.');
+    } finally {
+      setIsLoadingGlobalProduct(false);
+    }
+  }, [selectedCompanyId, initialCompanyId, companies]);
 
+  useEffect(() => {
     loadGlobalCadastro();
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedCompanyId]);
+  }, [loadGlobalCadastro]);
 
   const handleBranchValueChange = (value: string) => {
     setBranch(value);
@@ -2270,13 +2318,30 @@ export const StockConference: React.FC<StockConferenceProps> = ({
             />
           </label>
           {isLoadingGlobalProduct && !productFile && (
-            <p className="mt-2 text-[10px] text-blue-600 font-semibold">Verificando base global...</p>
+            <div className="mt-2 flex items-center gap-1.5 text-[10px] text-blue-600 font-semibold animate-pulse">
+              <Clock className="w-3 h-3 animate-spin" />
+              <span>Verificando base global...</span>
+            </div>
           )}
-          {!productFile && globalProductMeta && (
+          {!productFile && globalProductMeta && effectiveProductFile && (
             <p className="mt-2 text-[10px] text-emerald-700 font-semibold text-center">
-              Já carregado em Cadastros Base Globais
+              ✓ Já carregado em Cadastros Base Globais
               {formatGlobalTimestamp(globalProductMeta.updated_at || globalProductMeta.uploaded_at) ? ` • ${formatGlobalTimestamp(globalProductMeta.updated_at || globalProductMeta.uploaded_at)}` : ''}
             </p>
+          )}
+          {!productFile && !isLoadingGlobalProduct && !effectiveProductFile && (
+            <div className="mt-2 flex flex-col items-center gap-1 text-center">
+              <span className="text-[10px] text-gray-400">
+                {globalProductLoadError ? globalProductLoadError : 'Nenhuma base global detectada automaticamente.'}
+              </span>
+              <button
+                type="button"
+                onClick={() => loadGlobalCadastro(true)}
+                className="text-[10px] text-blue-600 hover:text-blue-800 font-bold underline cursor-pointer"
+              >
+                Buscar base global novamente
+              </button>
+            </div>
           )}
           {productFile && globalProductMeta && (
             <p className="mt-2 text-[10px] text-amber-700 font-semibold text-center">

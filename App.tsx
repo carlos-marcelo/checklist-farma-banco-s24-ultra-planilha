@@ -11872,6 +11872,8 @@ const App: React.FC = () => {
                                     key={`stock-${currentUser?.email || 'anon'}-${currentUser?.company_id || 'all'}-${currentUser?.filial || 'none'}`}
                                     userEmail={currentUser?.email || ''}
                                     userName={currentUser?.name || ''}
+                                    initialCompanyId={currentUser?.company_id || ''}
+                                    initialBranch={currentUser?.filial || ''}
                                     companies={scopedCompanies}
                                     onReportSaved={async () => { await refreshStockConferenceReports(); }}
                                     pendingReportsCount={pendingStockReports.length}

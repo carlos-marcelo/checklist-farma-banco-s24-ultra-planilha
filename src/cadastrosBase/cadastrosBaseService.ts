@@ -23,11 +23,30 @@ const cadastrosDebugLog = (...args: any[]) => {
   if (CADASTROS_DEBUG) console.log(...args);
 };
 
+const sanitizeForIndexedDb = (data: any) => {
+  if (!data) return null;
+  return {
+    id: data.id,
+    company_id: data.company_id,
+    module_key: data.module_key,
+    file_name: data.file_name,
+    mime_type: data.mime_type,
+    file_size: data.file_size,
+    uploaded_by: data.uploaded_by,
+    uploaded_at: data.uploaded_at,
+    updated_at: data.updated_at,
+    _blob: data._blob || null,
+    // Se temos _blob, dispensamos a string base64 pesada; se não temos _blob, mantemos a string
+    file_data_base64: data._blob ? null : (data.file_data_base64 || null)
+  };
+};
+
 const persistBaseCache = (cacheKey: string, data: unknown) => {
   const scheduledGeneration = baseCacheGeneration;
+  const cleanData = sanitizeForIndexedDb(data);
   const persist = () => {
     if (scheduledGeneration !== baseCacheGeneration) return;
-    void localforage.setItem(cacheKey, data).catch(error => {
+    void localforage.setItem(cacheKey, cleanData).catch(error => {
       console.warn(`[CadastrosBaseService] Falha ao persistir cache ${cacheKey}:`, error);
     });
   };
@@ -53,7 +72,7 @@ async function attachParsedFile(data: DbGlobalBaseFile & { _blob?: Blob, _parsed
 
     if (blob) {
       data._parsedFile = new File([blob], data.file_name || `${data.module_key || 'base'}.xlsx`, {
-        type: blob.type || data.mime_type || 'application/octet-stream'
+        type: blob.type || data.mime_type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       });
     }
   } catch (err) {
@@ -85,7 +104,6 @@ export const CadastrosBaseService = {
 
     const fetchPromise = (async () => {
       cadastrosDebugLog(`[CadastrosBaseService] Início de getGlobalBaseFileCached para ${moduleKey} (Cache-First)`);
-      const startTime = performance.now();
 
       try {
         // 1. Verifica cache em memória primeiro (Instantâneo)
@@ -98,6 +116,22 @@ export const CadastrosBaseService = {
             cadastrosDebugLog(`[CadastrosBaseService] IndexedDB HIT para ${moduleKey}`);
             localData = await attachParsedFile(cachedItem);
             inMemoryCache.set(cacheKey, localData);
+          } else {
+            // Fallback no IndexedDB: se não achou para a empresa específica, procura por qualquer chave salva deste moduleKey
+            try {
+              const allKeys = await localforage.keys();
+              const matchingKey = allKeys.find(k => k.endsWith(`_${moduleKey}`));
+              if (matchingKey) {
+                const fallbackItem: any = await localforage.getItem(matchingKey);
+                if (fallbackItem && (fallbackItem.file_data_base64 || fallbackItem._blob || fallbackItem._parsedFile)) {
+                  cadastrosDebugLog(`[CadastrosBaseService] IndexedDB Fallback HIT para ${moduleKey} via chave ${matchingKey}`);
+                  localData = await attachParsedFile(fallbackItem);
+                  inMemoryCache.set(cacheKey, localData);
+                }
+              }
+            } catch (kErr) {
+              // Ignore fallback key search error
+            }
           }
         }
 
@@ -116,10 +150,9 @@ export const CadastrosBaseService = {
                 const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
                 if (fullRemoteData) {
                   const preparedData = await attachParsedFile(fullRemoteData);
-                  const dataToSave = { ...preparedData, file_data_base64: null };
                   inMemoryCache.set(cacheKey, preparedData);
                   lastValidationAt.set(cacheKey, Date.now());
-                  persistBaseCache(cacheKey, dataToSave);
+                  persistBaseCache(cacheKey, preparedData);
                   return preparedData;
                 }
               }
@@ -135,16 +168,27 @@ export const CadastrosBaseService = {
           return localData;
         }
 
-        // 3. Cache MISS absoluto: nunca foi baixado nesta máquina. Baixa do servidor:
-        cadastrosDebugLog(`[CadastrosBaseService] Cache MISS para ${moduleKey}, baixando...`);
-        const fullRemoteData = await SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey);
+        // 3. Cache MISS absoluto: nunca foi baixado nesta máquina. Baixa do servidor com proteção de timeout:
+        cadastrosDebugLog(`[CadastrosBaseService] Cache MISS para ${moduleKey}, baixando do servidor...`);
+        const fetchRemoteWithTimeout = async () => {
+          return Promise.race([
+            SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey),
+            new Promise<null>((_, reject) =>
+              setTimeout(() => reject(new Error(`Timeout ao baixar base ${moduleKey}`)), 25000)
+            )
+          ]);
+        };
+
+        const fullRemoteData = await fetchRemoteWithTimeout().catch(err => {
+          console.warn(`[CadastrosBaseService] Falha ou timeout no download remoto de ${moduleKey}:`, err);
+          return null;
+        });
 
         if (fullRemoteData) {
           const preparedData = await attachParsedFile(fullRemoteData);
-          const dataToSave = { ...preparedData, file_data_base64: null };
           inMemoryCache.set(cacheKey, preparedData);
           lastValidationAt.set(cacheKey, Date.now());
-          persistBaseCache(cacheKey, dataToSave);
+          persistBaseCache(cacheKey, preparedData);
           return preparedData;
         }
 

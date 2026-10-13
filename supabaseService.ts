@@ -2258,14 +2258,29 @@ export async function fetchGlobalBaseFileMeta(
   throwOnError = false
 ): Promise<Partial<DbGlobalBaseFile> | null> {
   try {
-    const { data, error } = await supabase
+    if (companyId) {
+      const { data, error } = await supabase
+        .from('global_base_files')
+        .select('id, company_id, module_key, file_name, file_size, uploaded_by, uploaded_at, updated_at')
+        .eq('company_id', companyId)
+        .eq('module_key', moduleKey)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error && error.code !== 'PGRST116') throw error;
+      if (data) return data;
+    }
+
+    // Fallback: se não achar pelo company_id específico, busca a versão mais recente deste module_key
+    const { data: fallbackData, error: fallbackError } = await supabase
       .from('global_base_files')
       .select('id, company_id, module_key, file_name, file_size, uploaded_by, uploaded_at, updated_at')
-      .eq('company_id', companyId)
       .eq('module_key', moduleKey)
-      .single();
-    if (error && error.code !== 'PGRST116') throw error;
-    return data || null;
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (fallbackError && fallbackError.code !== 'PGRST116') throw fallbackError;
+    return fallbackData || null;
   } catch (error) {
     console.error('Error fetching global base file metadata:', error);
     if (throwOnError) throw error;
@@ -2275,14 +2290,29 @@ export async function fetchGlobalBaseFileMeta(
 
 export async function fetchGlobalBaseFileFull(companyId: string, moduleKey: string): Promise<DbGlobalBaseFile | null> {
   try {
-    const { data, error } = await supabase
+    if (companyId) {
+      const { data, error } = await supabase
+        .from('global_base_files')
+        .select('*')
+        .eq('company_id', companyId)
+        .eq('module_key', moduleKey)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error && error.code !== 'PGRST116') throw error;
+      if (data) return data;
+    }
+
+    // Fallback: se não achar pelo company_id específico, busca a versão mais recente deste module_key
+    const { data: fallbackData, error: fallbackError } = await supabase
       .from('global_base_files')
       .select('*')
-      .eq('company_id', companyId)
       .eq('module_key', moduleKey)
-      .single();
-    if (error && error.code !== 'PGRST116') throw error;
-    return data || null;
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (fallbackError && fallbackError.code !== 'PGRST116') throw fallbackError;
+    return fallbackData || null;
   } catch (error) {
     console.error('Error fetching global base file full:', error);
     return null;
