@@ -337,8 +337,11 @@ class GoogleSheetsQueryBuilder implements PromiseLike<QueryResult> {
             } else if (this.operation === 'update') {
                 const updates = clone(this.payload || {}) as Row;
                 next = next.map(record => {
-                    if (!this.matches(record.value)) return record;
-                    const value = { ...record.value, ...updates };
+                    const row = clone(record.value || {});
+                    if (!row.id && record.id) row.id = record.id;
+                    if (!row.updated_at && record.updatedAt) row.updated_at = record.updatedAt;
+                    if (!this.matches(row)) return record;
+                    const value = { ...record.value, ...updates, id: updates.id || row.id || record.id };
                     affected.push(value);
                     const updatedRecord = { ...record, revision: record.revision + 1, updatedAt: now, value };
                     updated.push(updatedRecord);

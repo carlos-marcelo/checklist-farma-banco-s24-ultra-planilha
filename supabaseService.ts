@@ -1343,6 +1343,7 @@ export async function upsertAuditSession(
     }
 
     const payload: any = {
+      id: existing?.id || session.id || undefined,
       branch: String(session.branch), // Ensure string
       audit_number: session.audit_number,
       status: session.status,
@@ -1386,8 +1387,26 @@ export async function upsertAuditSession(
       if (session.status === 'open' && !options.allowReopen) {
         updateQuery = updateQuery.neq('status', 'completed');
       }
-      const { data, error } = await updateQuery.select().maybeSingle();
+      let { data, error } = await updateQuery.select().maybeSingle();
       if (error) throw error;
+
+      // Fallback: se não encontrou por ID (ex: ID guardado apenas na coluna A da planilha e ausente do JSON interno),
+      // atualiza pela chave natural (filial + número de inventário)
+      if (!data) {
+        let fallbackQuery = supabase
+          .from('audit_sessions')
+          .update(payload)
+          .eq('branch', String(session.branch))
+          .eq('audit_number', session.audit_number);
+        if (session.status === 'open' && !options.allowReopen) {
+          fallbackQuery = fallbackQuery.neq('status', 'completed');
+        }
+        const fallbackRes = await fallbackQuery.select().maybeSingle();
+        if (fallbackRes.data) {
+          data = fallbackRes.data;
+        }
+      }
+
       if (!data && session.status === 'open' && !options.allowReopen) {
         console.warn(
           `[AuditFlow] Gravação aberta cancelada: o inventário Nº ${session.audit_number} foi concluído durante a sincronização.`

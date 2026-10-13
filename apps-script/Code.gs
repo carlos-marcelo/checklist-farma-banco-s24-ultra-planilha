@@ -215,6 +215,8 @@ function executeQuery_(query, user) {
     } else {
       visible.forEach(record => {
         const safe = sanitizeRow_(table, record.value);
+        if (!safe.id && record.id) safe.id = record.id;
+        if (!safe.updated_at && record.updatedAt) safe.updated_at = record.updatedAt;
         if (!matches_(safe, query.filters || [])) return;
         if (operation === 'delete') {
           assertWrite_(table, record.value, null, {}, user, operation);

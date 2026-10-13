@@ -3158,6 +3158,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 !!latestMeta &&
                 candidate.id === latestMeta.id &&
                 candidate.audit_number === latestMeta.audit_number &&
+                (!latestMeta.status || candidate.status === latestMeta.status) &&
                 String(candidate.updated_at || '') === String(latestMeta.updated_at || '') &&
                 !!candidate.data
             ) || null;
@@ -3183,14 +3184,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 latest = cachedMatchingMeta;
             } else if (latestMeta && latestMeta.status === 'completed') {
                 latest = { ...latestMeta, branch: selectedFilial, data: null } as any;
+                if (cachedCurrent && cachedCurrent.status !== 'completed' && cachedCurrent.audit_number === latestMeta.audit_number) {
+                    void CacheService.remove(cacheKey);
+                }
             } else {
                 const fallbackCandidates = [cachedCurrent, cachedBackup].filter(Boolean) as DbAuditSession[];
                 if (fallbackCandidates.length > 0) {
                     const safeFallbackCandidates = fallbackCandidates.filter(candidate => {
                         if (candidate.status === 'completed') return true;
-                        // Auditoria aberta só pode ser restaurada do cache depois que o
-                        // metadado remoto confirmar que o banco está respondendo.
-                        return !!latestMeta && isAuditSessionConfirmed(candidate.id);
+                        // Auditoria aberta só pode ser restaurada do cache se o remoto não estiver concluído
+                        return !!latestMeta && latestMeta.status !== 'completed' && isAuditSessionConfirmed(candidate.id);
                     });
                     const pool = safeFallbackCandidates.length > 0 ? safeFallbackCandidates : fallbackCandidates.filter(c => c.status === 'completed');
                     if (pool.length === 0) {
@@ -5997,7 +6000,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         }
 
         const hasStructureFiles = effectiveGroupFiles.length > 0;
-        const hasOpenStructure = !!(data && data.groups && data.groups.length > 0);
+        const hasOpenStructure = !isReadOnlyCompletedView && !!latestOpenAudit && !!(data && data.groups && data.groups.length > 0);
         const shouldMergeStockOnly = hasOpenStructure;
         const sourceFiles = ((data as any)?.sourceFiles || {}) as any;
         const hasPendingClassification = isAuditClassificationOutdated(sourceFiles, data);
