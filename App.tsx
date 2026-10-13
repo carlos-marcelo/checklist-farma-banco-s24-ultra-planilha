@@ -7766,6 +7766,16 @@ const App: React.FC = () => {
             handleCloseReport(); // Clear history view if going back to draft
             setShowErrors(false);
         }
+        if (view === 'audit') {
+            const isUserAdminOrMaster = currentUser?.role === 'MASTER' || currentUser?.role === 'ADMINISTRATIVO' || currentUser?.role === 'ADMIN' || (currentUser?.role as any) === 'ADMINISTRADOR';
+            if (isUserAdminOrMaster) {
+                markAuditManualBranchSelectionRequired();
+                setAuditJumpFilial('');
+                setAuditJumpArea('');
+                setAuditJumpCompanyId('');
+                setAuditJumpCompanyName('');
+            }
+        }
         setCurrentView(view);
         window.scrollTo(0, 0);
         setIsSidebarOpen(isMobileLayout());
@@ -11983,28 +11993,33 @@ const App: React.FC = () => {
                                         }}
                                     />
                                     <div className="min-w-0 flex-1">
-                                        <AuditModule
-                                            key={`audit-${currentUser?.email || 'anon'}-${currentUser?.role || 'user'}-${currentUser?.company_id || 'all'}-${currentUser?.area || 'all'}-${currentUser?.filial || 'none'}-${auditJumpCompanyId || 'none'}-${auditJumpFilial || 'manual'}`}
-                                            userEmail={currentUser?.email || ''}
-                                            userName={currentUser?.name || ''}
-                                            userRole={currentUser?.role || 'USER'}
-                                            userCompanyId={currentUser?.company_id || null}
-                                            userArea={currentUser?.area || null}
-                                            userFilial={currentUser?.filial || null}
-                                            companies={scopedCompanies}
-                                            initialFilial={auditJumpFilial}
-                                            initialArea={auditJumpArea}
-                                            initialCompanyId={auditJumpCompanyId || null}
-                                            initialCompanyName={auditJumpCompanyName || (currentUser?.company_id ? companies.find(c => c.id === currentUser.company_id)?.name : null) || null}
-                                            forceManualFilialSelection={auditManualBranchSelectionRequired && !auditJumpFilial}
-                                            knownAuditSessions={[...dashboardAuditSessions, ...dashboardCompletedAuditSessions]}
-                                            onAuditExited={handleAuditExited}
-                                            onAuditSessionChanged={handleAuditSessionChanged}
-                                            onFilialSelected={() => {
-                                                setIsAuditCrossPanelExpanded(false);
-                                                clearAuditManualBranchSelectionRequired();
-                                            }}
-                                        />
+                                        {(() => {
+                                            const isCurrentUserAdminOrMaster = currentUser?.role === 'MASTER' || currentUser?.role === 'ADMINISTRATIVO' || currentUser?.role === 'ADMIN' || (currentUser?.role as any) === 'ADMINISTRADOR';
+                                            return (
+                                                <AuditModule
+                                                    key={`audit-${currentUser?.email || 'anon'}-${currentUser?.role || 'user'}-${currentUser?.company_id || 'all'}-${currentUser?.area || 'all'}-${currentUser?.filial || 'none'}-${auditJumpCompanyId || 'none'}-${auditJumpFilial || 'manual'}`}
+                                                    userEmail={currentUser?.email || ''}
+                                                    userName={currentUser?.name || ''}
+                                                    userRole={currentUser?.role || 'USER'}
+                                                    userCompanyId={currentUser?.company_id || null}
+                                                    userArea={currentUser?.area || null}
+                                                    userFilial={isCurrentUserAdminOrMaster ? null : (currentUser?.filial || null)}
+                                                    companies={scopedCompanies}
+                                                    initialFilial={auditJumpFilial}
+                                                    initialArea={auditJumpArea}
+                                                    initialCompanyId={auditJumpCompanyId || null}
+                                                    initialCompanyName={auditJumpCompanyName || (currentUser?.company_id ? companies.find(c => c.id === currentUser.company_id)?.name : null) || null}
+                                                    forceManualFilialSelection={isCurrentUserAdminOrMaster ? (!auditJumpFilial) : (auditManualBranchSelectionRequired && !auditJumpFilial)}
+                                                    knownAuditSessions={[...dashboardAuditSessions, ...dashboardCompletedAuditSessions]}
+                                                    onAuditExited={handleAuditExited}
+                                                    onAuditSessionChanged={handleAuditSessionChanged}
+                                                    onFilialSelected={() => {
+                                                        setIsAuditCrossPanelExpanded(false);
+                                                        clearAuditManualBranchSelectionRequired();
+                                                    }}
+                                                />
+                                            );
+                                        })()}
                                     </div>
                                 </div>
                             </Suspense>

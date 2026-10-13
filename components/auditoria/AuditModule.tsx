@@ -2544,8 +2544,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     onAuditSessionChanged,
     onFilialSelected
 }) => {
-    const isMaster = userRole === 'MASTER';
-    const isAdmin = userRole === 'ADMINISTRATIVO';
+    const normalizedRole = String(userRole || '').trim().toUpperCase();
+    const isMaster = normalizedRole === 'MASTER';
+    const isAdmin = normalizedRole === 'ADMINISTRATIVO' || normalizedRole === 'ADMIN' || normalizedRole === 'ADMINISTRADOR';
     const canUseAuditMasterTools = isMaster || isAdmin;
     const canManageAuditLifecycle = canUseAuditMasterTools;
     const [data, setData] = useState<AuditData | null>(null);
@@ -2684,6 +2685,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     const [selectedEmpresa, setSelectedEmpresa] = useState(() => String(initialCompanyName || "Drogaria Cidade"));
     const [selectedFilial, setSelectedFilial] = useState(() => {
         const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
+        // Para ADMIN e MASTER: nunca auto-selecionar filial do perfil/configurações ao entrar no módulo
+        if (canUseAuditMasterTools) return forcedInitialFilial || '';
         const manualSelectionLocked = typeof window !== 'undefined' && window.sessionStorage.getItem('APP_AUDIT_MANUAL_BRANCH_SELECTION_REQUIRED') === '1';
         if ((forceManualFilialSelection || manualSelectionLocked) && !forcedInitialFilial) return '';
         return toAuditBranchValue(forcedInitialFilial || userFilial || '');
@@ -2729,7 +2732,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     }, [isMaster, selectedCompany?.areas, initialFilial, userArea, userFilial]);
     const allowedAuditBranchSet = useMemo(() => new Set(allowedAuditBranches), [allowedAuditBranches]);
     const [branchAuditsHistory, setBranchAuditsHistory] = useState<DbAuditSession[]>(() => {
-        const target = toAuditBranchValue(initialFilial || userFilial || '');
+        const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
+        const target = canUseAuditMasterTools ? forcedInitialFilial : (forcedInitialFilial || toAuditBranchValue(userFilial || ''));
         if (!target || !knownAuditSessions || knownAuditSessions.length === 0) return [];
         const matching = knownAuditSessions.filter(s => toAuditBranchValue(s.branch) === target);
         return [...matching].sort((a, b) => {
@@ -2747,7 +2751,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     const [allowActiveAuditAutoOpen, setAllowActiveAuditAutoOpen] = useState(false);
     const [isTermsPanelCollapsed, setIsTermsPanelCollapsed] = useState(true);
     const [nextAuditNumber, setNextAuditNumber] = useState<number>(() => {
-        const target = toAuditBranchValue(initialFilial || userFilial || '');
+        const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
+        const target = canUseAuditMasterTools ? forcedInitialFilial : (forcedInitialFilial || toAuditBranchValue(userFilial || ''));
         if (!target || !knownAuditSessions || knownAuditSessions.length === 0) return 1;
         const matching = knownAuditSessions.filter(s => toAuditBranchValue(s.branch) === target);
         const open = matching.find(s => s.status !== 'completed');
@@ -3018,15 +3023,21 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
     useEffect(() => {
         const normalized = toAuditBranchValue(initialFilial || '');
-        if (!normalized) return;
+        if (!normalized) {
+            if (canUseAuditMasterTools && !activeFilialRef.current) {
+                setSelectedFilial('');
+            }
+            return;
+        }
         if (!isMaster && allowedAuditBranches.length > 0 && !allowedAuditBranchSet.has(normalized)) return;
         activeFilialRef.current = normalized;
         setSelectedFilial(prev => (prev === normalized ? prev : normalized));
-    }, [initialFilial, initialArea, isMaster, allowedAuditBranches.length, allowedAuditBranchSet]);
+    }, [initialFilial, initialArea, isMaster, canUseAuditMasterTools, allowedAuditBranches.length, allowedAuditBranchSet]);
 
     useEffect(() => {
         const forcedInitialFilial = toAuditBranchValue(initialFilial || '');
-        if (!forceManualFilialSelection || forcedInitialFilial) return;
+        if ((!forceManualFilialSelection && !canUseAuditMasterTools) || forcedInitialFilial) return;
+        if (canUseAuditMasterTools && activeFilialRef.current) return;
         activeFilialRef.current = '';
         setSelectedFilial('');
         setData(null);
@@ -3035,7 +3046,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         setIsReadOnlyCompletedView(false);
         setConsultingAuditNumber(null);
         setView({ level: 'groups' });
-    }, [forceManualFilialSelection, initialFilial]);
+    }, [forceManualFilialSelection, initialFilial, canUseAuditMasterTools]);
 
     useEffect(() => {
         if (isMaster || !selectedFilial || allowedAuditBranches.length === 0) return;
@@ -4137,15 +4148,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 const forcedInitialFilial = String(initialFilial || '').trim();
                 const savedBranch = toAuditBranchValue(savedData.filial || '');
                 const manualSelectionLocked = typeof window !== 'undefined' && window.sessionStorage.getItem(MANUAL_BRANCH_SELECTION_KEY) === '1';
-                if (!manualSelectionLocked && !forceManualFilialSelection && !forcedInitialFilial && savedBranch && !activeFilialRef.current) {
+                if (!canUseAuditMasterTools && !manualSelectionLocked && !forceManualFilialSelection && !forcedInitialFilial && savedBranch && !activeFilialRef.current) {
                     activeFilialRef.current = savedBranch;
                     setSelectedFilial(savedBranch);
                 }
-                if (savedData.inventoryNumber) setInventoryNumber(savedData.inventoryNumber);
+                if (!canUseAuditMasterTools && savedData.inventoryNumber) setInventoryNumber(savedData.inventoryNumber);
             }
         };
         loadLocal();
-    }, [forceManualFilialSelection, initialFilial]);
+    }, [forceManualFilialSelection, initialFilial, canUseAuditMasterTools]);
 
     useEffect(() => {
         if (data) {

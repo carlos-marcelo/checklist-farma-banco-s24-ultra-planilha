@@ -19,7 +19,7 @@ type CacheMeta = {
 
 type FetchWithCacheOptions<T> = {
     maxAgeMs?: number;
-    revalidate?: 'always' | 'stale' | 'never';
+    revalidate?: 'always' | 'once' | 'stale' | 'never';
     timeoutMs?: number;
     compare?: false | ((cachedData: T, remoteData: T) => boolean);
 };
@@ -29,6 +29,9 @@ const inFlightRequests = new Map<string, Promise<any>>();
 const memoryCache = new Map<string, unknown>();
 const memoryMeta = new Map<string, CacheMeta>();
 const scheduledRevalidations = new Set<string>();
+// Uma leitura remota bem-sucedida por chave e por carregamento da página é suficiente.
+// O Set vive apenas em memória: F5 cria uma nova sessão e volta a consultar o Drive.
+const completedRevalidations = new Set<string>();
 const pendingPersistentWrites = new Map<string, { data: unknown; meta: CacheMeta }>();
 let persistentWriteHandle: number | null = null;
 let remoteFailureStreak = 0;
@@ -260,10 +263,14 @@ export const CacheService = {
                 CacheService.getMeta(key)
             ]);
 
-        const revalidate = options.revalidate || 'always';
+        const revalidate = options.revalidate || 'once';
         const isFresh = !!cachedMeta?.savedAt && !!options.maxAgeMs && Date.now() - cachedMeta.savedAt < options.maxAgeMs;
 
-        if (cachedData !== null && (revalidate === 'never' || (revalidate === 'stale' && isFresh))) {
+        if (cachedData !== null && (
+            revalidate === 'never' ||
+            (revalidate === 'once' && completedRevalidations.has(key)) ||
+            (revalidate === 'stale' && (isFresh || completedRevalidations.has(key)))
+        )) {
             return cachedData;
         }
 
@@ -285,6 +292,7 @@ export const CacheService = {
                 .then(async (remoteData) => {
                     registerRemoteSuccess();
                     if (remoteData !== null) {
+                        completedRevalidations.add(key);
                         const changed = hasDataChanged(cachedData, cachedMeta, remoteData, options.compare);
                         await CacheService.set(key, remoteData);
 
@@ -406,6 +414,7 @@ export const CacheService = {
         memoryMeta.delete(key);
         pendingPersistentWrites.delete(key);
         scheduledRevalidations.delete(key);
+        completedRevalidations.delete(key);
         await Promise.all([
             generalStore.removeItem(key),
             generalStore.removeItem(`${META_PREFIX}${key}`)
@@ -420,6 +429,7 @@ export const CacheService = {
         memoryMeta.clear();
         pendingPersistentWrites.clear();
         scheduledRevalidations.clear();
+        completedRevalidations.clear();
         await generalStore.clear();
     }
 };

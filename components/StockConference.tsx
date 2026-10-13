@@ -2121,13 +2121,7 @@ export const StockConference: React.FC<StockConferenceProps> = ({
 
   // 3. Carregamento resiliente da base de produtos global
   const loadGlobalCadastro = useCallback(async (isRetry = false) => {
-    const effectiveCompanyId = selectedCompanyId || initialCompanyId || (companies && companies.length > 0 ? companies[0].id : '');
-    if (!effectiveCompanyId) {
-      setGlobalProductMeta(null);
-      setGlobalProductFile(null);
-      setIsLoadingGlobalProduct(false);
-      return;
-    }
+    const effectiveCompanyId = selectedCompanyId || initialCompanyId || (companies && companies.length > 0 ? companies[0].id : '') || 'all';
 
     setIsLoadingGlobalProduct(true);
     setGlobalProductLoadError(null);

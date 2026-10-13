@@ -92,6 +92,37 @@ class GoogleAppsScriptClient {
     private readonly endpoint = getGoogleWorkspaceConfig().appsScriptUrl || '';
     private readonly queue = new RequestConcurrencyQueue();
     private readonly inFlightReadQueries = new Map<string, Promise<unknown>>();
+    private readonly completedReadQueries = new Map<string, unknown>();
+    private readCacheGeneration = 0;
+    private readonly maxCompletedReadQueries = 160;
+
+    private getReadQueryKey(query: Record<string, unknown>): string {
+        const sessionEmail = readSession()?.user?.email || 'anonymous';
+        return `${sessionEmail}|${String(query.table || '')}|${JSON.stringify(query)}`;
+    }
+
+    /** Limpa leituras guardadas apenas durante a página atual. */
+    clearReadCache(table?: string): void {
+        this.readCacheGeneration++;
+        if (!table) {
+            this.completedReadQueries.clear();
+            return;
+        }
+        const tableMarker = `|${table}|`;
+        for (const key of this.completedReadQueries.keys()) {
+            if (key.includes(tableMarker)) this.completedReadQueries.delete(key);
+        }
+    }
+
+    private rememberRead(queryKey: string, value: unknown): void {
+        if (this.completedReadQueries.has(queryKey)) this.completedReadQueries.delete(queryKey);
+        this.completedReadQueries.set(queryKey, value);
+        while (this.completedReadQueries.size > this.maxCompletedReadQueries) {
+            const oldest = this.completedReadQueries.keys().next().value;
+            if (oldest === undefined) break;
+            this.completedReadQueries.delete(oldest);
+        }
+    }
 
     isConfigured(): boolean {
         return /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/i.test(this.endpoint);
@@ -108,6 +139,7 @@ class GoogleAppsScriptClient {
     async login(email: string, password: string): Promise<AppsScriptSessionUser> {
         // Remove o token anterior antes de autenticar. Requisições que já estavam
         // em voo continuam com uma cópia dele, mas não poderão invalidar a nova sessão.
+        this.clearReadCache();
         saveSession(null);
         const data = await this.request<StoredSession>('login', { email, password }, false);
         saveSession(data);
@@ -124,6 +156,7 @@ class GoogleAppsScriptClient {
     }
 
     clearSession(): void {
+        this.clearReadCache();
         saveSession(null);
         if (typeof window !== 'undefined') {
             window.localStorage.removeItem('APP_CURRENT_EMAIL');
@@ -133,19 +166,43 @@ class GoogleAppsScriptClient {
     async query<T>(query: Record<string, unknown>): Promise<T> {
         const isSelect = query.operation === 'select';
         if (isSelect) {
-            // Deduplica queries de leitura idênticas que disparam no mesmo instante
-            const queryKey = JSON.stringify(query);
+            // Reaproveita consultas idênticas durante toda a vida desta página.
+            // A chave inclui o usuário para nunca compartilhar dados entre sessões.
+            const queryKey = this.getReadQueryKey(query);
+            if (this.completedReadQueries.has(queryKey)) {
+                const cached = this.completedReadQueries.get(queryKey);
+                // Promove para o fim do LRU.
+                this.completedReadQueries.delete(queryKey);
+                this.completedReadQueries.set(queryKey, cached);
+                return cached as T;
+            }
             const inFlight = this.inFlightReadQueries.get(queryKey);
             if (inFlight) {
                 return inFlight as Promise<T>;
             }
-            const promise = this.request<T>('query', { query }, true).finally(() => {
-                this.inFlightReadQueries.delete(queryKey);
-            });
+            const generation = this.readCacheGeneration;
+            const promise = this.request<T>('query', { query }, true)
+                .then(result => {
+                    const resultError = result && typeof result === 'object' && 'error' in (result as object)
+                        ? (result as { error?: unknown }).error
+                        : null;
+                    if (!resultError && generation === this.readCacheGeneration) {
+                        this.rememberRead(queryKey, result);
+                    }
+                    return result;
+                })
+                .finally(() => {
+                    this.inFlightReadQueries.delete(queryKey);
+                });
             this.inFlightReadQueries.set(queryKey, promise);
             return promise;
         }
-        return this.request<T>('query', { query }, true);
+        const result = await this.request<T>('query', { query }, true);
+        const resultError = result && typeof result === 'object' && 'error' in (result as object)
+            ? (result as { error?: unknown }).error
+            : null;
+        if (!resultError) this.clearReadCache(String(query.table || '') || undefined);
+        return result;
     }
 
     private async request<T>(action: string, payload: Record<string, unknown>, authenticated: boolean): Promise<T> {
