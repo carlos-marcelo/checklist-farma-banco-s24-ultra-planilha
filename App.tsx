@@ -11480,23 +11480,47 @@ const App: React.FC = () => {
         return finalItems;
     }, [dashboardAuditSessions, dashboardAuditOverviewBase.allBranches, openAuditNumberFilter, showAreaPartialWhatsappPanel]);
 
-    const areaPartialWhatsappHistoryItems = useMemo(() => (
-        Array.from([...areaPartialWhatsappSessionHistory, ...areaPartialWhatsappHistory]
-            .filter(item => (
-                !!areaPartialDialog?.areaName &&
-                normalizeAreaKey(item.areaName) === normalizeAreaKey(areaPartialDialog.areaName)
-            ))
+    const areaPartialWhatsappHistoryItems = useMemo(() => {
+        const selectedAreaKey = normalizeAreaKey(areaPartialDialog?.areaName || '');
+        if (!selectedAreaKey) return [];
+
+        const normalizeScopeList = (value: string) => parseAuditScopeInputList(value)
+            .map(normalizeAuditScopeValue)
+            .filter(Boolean)
+            .sort()
+            .join(',');
+        const historyIdentity = (item: AreaPartialWhatsappHistoryItem) => {
+            const openedAtMs = new Date(item.openedAt).getTime();
+            // A tela exibe o horÃ¡rio atÃ© os segundos. HistÃ³rico persistido e
+            // local podem carregar o mesmo lote com milissegundos diferentes.
+            const openedAtSecond = Number.isFinite(openedAtMs)
+                ? Math.floor(openedAtMs / 1000)
+                : String(item.openedAt || '').trim();
+            return [
+                normalizeAreaKey(item.areaName),
+                normalizeScopeList(item.groupInput),
+                normalizeScopeList(item.deptInput),
+                normalizeScopeList(item.catInput),
+                openedAtSecond
+            ].join('|');
+        };
+
+        // A fonte persistida vem primeiro e prevalece sobre a cÃ³pia legada do
+        // localStorage quando ambas representam a mesma abertura.
+        const unique = [...areaPartialWhatsappSessionHistory, ...areaPartialWhatsappHistory]
+            .filter(item => normalizeAreaKey(item.areaName) === selectedAreaKey)
             .reduce((acc, item) => {
-                const key = [item.areaName, item.groupInput, item.deptInput, item.catInput, item.openedAt].join('|');
+                const key = historyIdentity(item);
                 if (!acc.has(key)) acc.set(key, item);
                 return acc;
-            }, new Map<string, AreaPartialWhatsappHistoryItem>())
-            .values()).sort((a, b) => {
+            }, new Map<string, AreaPartialWhatsappHistoryItem>());
+
+        return Array.from(unique.values()).sort((a, b) => {
             const aTime = new Date(a.openedAt).getTime() || 0;
             const bTime = new Date(b.openedAt).getTime() || 0;
             return bTime - aTime;
-        })
-    ), [areaPartialDialog?.areaName, areaPartialWhatsappHistory, areaPartialWhatsappSessionHistory]);
+        });
+    }, [areaPartialDialog?.areaName, areaPartialWhatsappHistory, areaPartialWhatsappSessionHistory]);
 
     const areaPartialWhatsappHistoryPreviews = useMemo(() => (
         areaPartialWhatsappHistoryItems.map(item => ({
