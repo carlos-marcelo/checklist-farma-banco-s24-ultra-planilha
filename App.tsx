@@ -10736,7 +10736,10 @@ const App: React.FC = () => {
         const includeCompletionSummary = options?.includeCompletionSummary === true;
         const scopeConfig = buildAuditScopeConfig(config.groupInput, config.deptInput, config.catInput);
         const { scope } = scopeConfig;
-        const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
+        const selectedAreaKey = normalizeAreaKey(cleanAreaName);
+        const areaBranches = dashboardAuditOverview.branches.filter(
+            branch => normalizeAreaKey(branch.area) === selectedAreaKey
+        );
         const willOpen: Array<{ branch: string; categories: number; mix: number; units: number }> = [];
         const ignored: Array<{ branch: string; reason: string }> = [];
         const branchLines: string[] = [];
@@ -11081,7 +11084,10 @@ const App: React.FC = () => {
 
         const { scope } = buildAuditScopeConfig(config.groupInput, config.deptInput, config.catInput);
 
-        const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
+        const selectedAreaKey = normalizeAreaKey(cleanAreaName);
+        const areaBranches = dashboardAuditOverview.branches.filter(
+            branch => normalizeAreaKey(branch.area) === selectedAreaKey
+        );
         if (areaBranches.length === 0) {
             alert('Não há auditorias abertas nessa área.');
             return;
@@ -11246,7 +11252,10 @@ const App: React.FC = () => {
 
         const { scope } = buildAuditScopeConfig(item.groupInput, item.deptInput, item.catInput);
 
-        const areaBranches = dashboardAuditOverview.branches.filter(branch => branch.area === cleanAreaName);
+        const selectedAreaKey = normalizeAreaKey(cleanAreaName);
+        const areaBranches = dashboardAuditOverview.branches.filter(
+            branch => normalizeAreaKey(branch.area) === selectedAreaKey
+        );
         if (areaBranches.length === 0) {
             alert('Não há auditorias abertas nessa área.');
             return;
@@ -11473,6 +11482,10 @@ const App: React.FC = () => {
 
     const areaPartialWhatsappHistoryItems = useMemo(() => (
         Array.from([...areaPartialWhatsappSessionHistory, ...areaPartialWhatsappHistory]
+            .filter(item => (
+                !!areaPartialDialog?.areaName &&
+                normalizeAreaKey(item.areaName) === normalizeAreaKey(areaPartialDialog.areaName)
+            ))
             .reduce((acc, item) => {
                 const key = [item.areaName, item.groupInput, item.deptInput, item.catInput, item.openedAt].join('|');
                 if (!acc.has(key)) acc.set(key, item);
@@ -11483,7 +11496,7 @@ const App: React.FC = () => {
             const bTime = new Date(b.openedAt).getTime() || 0;
             return bTime - aTime;
         })
-    ), [areaPartialWhatsappHistory, areaPartialWhatsappSessionHistory]);
+    ), [areaPartialDialog?.areaName, areaPartialWhatsappHistory, areaPartialWhatsappSessionHistory]);
 
     const areaPartialWhatsappHistoryPreviews = useMemo(() => (
         areaPartialWhatsappHistoryItems.map(item => ({
