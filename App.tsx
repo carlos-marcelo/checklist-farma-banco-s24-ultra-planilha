@@ -10912,7 +10912,35 @@ const App: React.FC = () => {
                         diffCost: roundAuditMoney(termMetrics?.diffCost),
                         countedCost: roundAuditMoney(termMetrics?.countedCost)
                     }
-                    : { diffQty: 0, diffCost: 0, countedCost: scopeCost });
+                    : (() => {
+                        let catDiffQty = 0;
+                        let catDiffCost = 0;
+                        let catCountedCost = 0;
+                        let hasCounted = false;
+                        entries.forEach(({ cat }) => {
+                            const products = Array.isArray(cat?.products) ? cat.products : [];
+                            products.forEach((p: any) => {
+                                const counted = p?.counted !== undefined && p?.counted !== null && p?.counted !== '' ? Number(p.counted) : null;
+                                if (counted !== null && !isNaN(counted)) {
+                                    hasCounted = true;
+                                    const qty = Number(p?.quantity || 0);
+                                    const diff = counted - qty;
+                                    const cost = Number(p?.cost || 0);
+                                    catDiffQty += diff;
+                                    catDiffCost += diff * cost;
+                                    catCountedCost += counted * cost;
+                                }
+                            });
+                        });
+                        if (hasCounted) {
+                            return {
+                                diffQty: catDiffQty,
+                                diffCost: roundAuditMoney(catDiffCost),
+                                countedCost: roundAuditMoney(catCountedCost > 0 ? catCountedCost : scopeCost)
+                            };
+                        }
+                        return { diffQty: 0, diffCost: 0, countedCost: scopeCost };
+                    })());
             const officialExactDiffCost = exactMetrics ? getOfficialAuditTermDiffCost(termMetrics) : null;
             const existingAdjustmentTotals = (termMetrics as any)?.postAuditAdjustmentTotals;
             const computedAdjustmentTotals = !auditMetricsContainsPostAuditAdjustments(termMetrics)

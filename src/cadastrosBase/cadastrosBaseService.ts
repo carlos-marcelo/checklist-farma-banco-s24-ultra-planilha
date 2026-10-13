@@ -174,7 +174,7 @@ export const CadastrosBaseService = {
           return Promise.race([
             SupabaseService.fetchGlobalBaseFileFull(companyId, moduleKey),
             new Promise<null>((_, reject) =>
-              setTimeout(() => reject(new Error(`Timeout ao baixar base ${moduleKey}`)), 25000)
+              setTimeout(() => reject(new Error(`Timeout ao baixar base ${moduleKey}`)), 60000)
             )
           ]);
         };

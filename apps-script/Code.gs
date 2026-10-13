@@ -296,6 +296,7 @@ function canRead_(table, row, user) {
   }
   if (table === 'companies') return !user.company_id || String(row.id || '') === String(user.company_id || '');
   if (['access_matrix', 'configs', 'checklist_definitions'].indexOf(table) >= 0) return true;
+  if (table === 'global_base_files') return !row.company_id || sameCompany_(row, user);
   if (row.company_id && !sameCompany_(row, user)) return false;
   if (role === 'ADMINISTRATIVO') return !row.company_id || sameCompany_(row, user);
   if (row.user_email && normalizeEmail_(row.user_email) === normalizeEmail_(user.email)) return true;
