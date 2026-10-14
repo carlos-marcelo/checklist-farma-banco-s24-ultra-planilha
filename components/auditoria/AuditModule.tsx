@@ -24,6 +24,7 @@ import {
     type DbGlobalBaseFile,
     type DbAuditSession
 } from '../../supabaseService';
+import { supabase } from '../../supabaseClient';
 import { BRANCH_DIRECTORY } from '../../src/branchDirectory';
 import { CadastrosBaseService } from '../../src/cadastrosBase/cadastrosBaseService';
 import { CacheService } from '../../src/cacheService';
@@ -54,7 +55,8 @@ import {
     Check,
     Loader2,
     Plus,
-    Trash2
+    Trash2,
+    Square
 } from 'lucide-react';
 
 const GROUP_UPLOAD_IDS = ['2000', '3000', '4000', '8000', '10000', '66', '67'] as const;
@@ -4080,6 +4082,54 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         };
     }, [selectedCompany?.id, selectedFilial]);
 
+    interface BranchStockStatus {
+        branch: string;
+        openAuditNumber: number | null;
+        openAuditSessionId?: string;
+        openAuditUpdatedAt?: string | null;
+        openAuditSyncedStockAt?: string | null;
+        remoteStockMeta?: DbGlobalBaseFile | null;
+        remoteStockUpdatedAt?: string | null;
+        isPendingStock: boolean;
+        isPendingClassification?: boolean;
+        isPendingStructure?: boolean;
+        hasOpenAudit: boolean;
+        hasRemoteStock: boolean;
+        status: 'idle' | 'loading' | 'up_to_date' | 'pending' | 'no_open_audit' | 'no_base_stock' | 'processing' | 'success' | 'error';
+        errorMessage?: string;
+    }
+
+    const [branchesStockStatus, setBranchesStockStatus] = useState<Record<string, BranchStockStatus>>({});
+    const [hasCheckedBranchesStock, setHasCheckedBranchesStock] = useState<boolean>(false);
+    const [isLoadingBranchesStock, setIsLoadingBranchesStock] = useState<boolean>(false);
+    const [isMassReclassifying, setIsMassReclassifying] = useState<boolean>(false);
+    const [massProgress, setMassProgress] = useState<{ current: number; total: number; currentBranch: string } | null>(null);
+
+    const abortMassReclassifyRef = useRef<boolean>(false);
+    const cancelStockCheckRef = useRef<boolean>(false);
+
+    const handleStopSync = useCallback(() => {
+        if (isMassReclassifying) {
+            abortMassReclassifyRef.current = true;
+        }
+        if (isLoadingBranchesStock) {
+            cancelStockCheckRef.current = true;
+            setIsLoadingBranchesStock(false);
+            setBranchesStockStatus(prev => {
+                const updated: Record<string, BranchStockStatus> = { ...prev };
+                allowedAuditBranches.forEach(b => {
+                    if (updated[b]?.status === 'loading') {
+                        updated[b] = {
+                            ...updated[b],
+                            status: 'idle'
+                        };
+                    }
+                });
+                return updated;
+            });
+        }
+    }, [isMassReclassifying, isLoadingBranchesStock, allowedAuditBranches]);
+
     const hasAuditDataLoaded = !!data;
 
     useEffect(() => {
@@ -5680,17 +5730,26 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         };
     };
 
-    const buildStructureSourceMeta = (options?: { stockSyncedAt?: string | null }) => {
+    const buildStructureSourceMeta = (options?: {
+        stockSyncedAt?: string | null;
+        stockMeta?: DbGlobalBaseFile | null;
+        stockFile?: File | null;
+        branch?: string;
+        prevSourceFiles?: any;
+    }) => {
         const nowIso = new Date().toISOString();
-        const stockSource = globalStockMeta ? 'global_base' : 'none';
-        const prevSourceFiles = ((data as any)?.sourceFiles || {}) as any;
+        const activeStockMeta = options?.stockMeta !== undefined ? options.stockMeta : globalStockMeta;
+        const activeStockFile = options?.stockFile !== undefined ? options.stockFile : effectiveStockFile;
+        const targetBranch = options?.branch || selectedFilial;
+        const stockSource = activeStockMeta ? 'global_base' : 'none';
+        const prevSourceFiles = options?.prevSourceFiles || ((data as any)?.sourceFiles || {}) as any;
         const forcedStockSyncedAt = options?.stockSyncedAt || null;
         const previousGlobalStockProcessedAt = prevSourceFiles?.globalStockProcessedAt || null;
-        const stockSignature = getStockFileSignature(globalStockMeta || effectiveStockFile);
+        const stockSignature = getStockFileSignature(activeStockMeta || activeStockFile);
         const globalStockProcessedAt = forcedStockSyncedAt
             ? forcedStockSyncedAt
             : (stockSource === 'global_base'
-                ? (getGlobalStockTimestampRaw(globalStockMeta) || previousGlobalStockProcessedAt || nowIso)
+                ? (getGlobalStockTimestampRaw(activeStockMeta) || previousGlobalStockProcessedAt || nowIso)
                 : previousGlobalStockProcessedAt);
         return {
             mode: 'initial-structure-import',
@@ -5710,16 +5769,16 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     GROUP_GLOBAL_BASE_KEYS[groupId]
                 )
             })),
-            stock: effectiveStockFile ? {
-                ...toUploadedFileMeta(effectiveStockFile),
-                id: globalStockMeta?.id || null,
-                module_key: globalStockMeta?.module_key || buildSharedStockModuleKey(selectedFilial),
-                file_name: globalStockMeta?.file_name || effectiveStockFile.name,
-                file_size: globalStockMeta?.file_size ?? effectiveStockFile.size,
-                uploaded_at: globalStockMeta?.uploaded_at || null,
-                updated_at: globalStockMeta?.updated_at || null,
+            stock: activeStockFile ? {
+                ...toUploadedFileMeta(activeStockFile),
+                id: activeStockMeta?.id || null,
+                module_key: activeStockMeta?.module_key || buildSharedStockModuleKey(targetBranch),
+                file_name: activeStockMeta?.file_name || activeStockFile.name,
+                file_size: activeStockMeta?.file_size ?? activeStockFile.size,
+                uploaded_at: activeStockMeta?.uploaded_at || null,
+                updated_at: activeStockMeta?.updated_at || null,
                 source: stockSource,
-                syncedAt: forcedStockSyncedAt || getGlobalStockTimestampRaw(globalStockMeta),
+                syncedAt: forcedStockSyncedAt || getGlobalStockTimestampRaw(activeStockMeta),
                 signature: stockSignature
             } : null,
             deptIds: effectiveDeptIdsFile ? {
@@ -5990,6 +6049,1212 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         branchAuditsHistory
     ]);
 
+    const mergePreservingDone = (
+        baseData: AuditData,
+        rebuiltData: AuditData
+    ): {
+        merged: AuditData;
+        ignored: {
+            closedGroups: number;
+            closedDepartments: number;
+            categories: number;
+            skus: number;
+            units: number;
+        };
+    } => {
+        const cloneCategory = (cat: Category): Category => ({ ...cat, products: [...(cat.products || [])] });
+        const cloneDepartment = (dept: Department): Department => ({
+            ...dept,
+            categories: (dept.categories || []).map(cloneCategory)
+        });
+        const cloneGroup = (group: Group): Group => ({
+            ...group,
+            departments: (group.departments || []).map(cloneDepartment)
+        });
+
+        const normalizeRawKey = (value: unknown) => String(value ?? '').trim();
+        const normalizeDigitsKey = (value: unknown) =>
+            normalizeRawKey(value).replace(/\D/g, '').replace(/^0+/, '');
+        const normalizeLabelKey = (value: unknown) => normalizeLookupText(String(value ?? ''));
+
+        const isSameGroup = (a: Group, b: Group) => {
+            const aIdRaw = normalizeRawKey(a.id);
+            const bIdRaw = normalizeRawKey(b.id);
+            const aIdDigits = normalizeDigitsKey(a.id);
+            const bIdDigits = normalizeDigitsKey(b.id);
+            const byRawId = !!aIdRaw && !!bIdRaw && aIdRaw === bIdRaw;
+            const byDigits = !!aIdDigits && !!bIdDigits && aIdDigits === bIdDigits;
+            if ((aIdRaw || aIdDigits) && (bIdRaw || bIdDigits)) {
+                return byRawId || byDigits;
+            }
+            const byName = normalizeLabelKey(a.name) && normalizeLabelKey(a.name) === normalizeLabelKey(b.name);
+            return byRawId || byDigits || byName;
+        };
+
+        const isSameDept = (a: Department, b: Department) => {
+            const aIdRaw = normalizeRawKey(a.id);
+            const bIdRaw = normalizeRawKey(b.id);
+            const aNumRaw = normalizeRawKey((a as any).numericId);
+            const bNumRaw = normalizeRawKey((b as any).numericId);
+            const aNumDigits = normalizeDigitsKey(aNumRaw || aIdRaw);
+            const bNumDigits = normalizeDigitsKey(bNumRaw || bIdRaw);
+            const byRawId = !!aIdRaw && !!bIdRaw && aIdRaw === bIdRaw;
+            const byNumeric = !!aNumDigits && !!bNumDigits && aNumDigits === bNumDigits;
+            const byName = normalizeLabelKey(a.name) && normalizeLabelKey(a.name) === normalizeLabelKey(b.name);
+            return byRawId || byNumeric || byName;
+        };
+
+        const findBaseGroup = (group: Group) =>
+            (baseData.groups || []).find(bg => isSameGroup(bg, group));
+        const findBaseDept = (baseGroup: Group | undefined, dept: Department) =>
+            (baseGroup?.departments || []).find(bd => isSameDept(bd, dept));
+        const isDeptClosed = (dept?: Department) =>
+            !!dept && (dept.categories || []).length > 0 && (dept.categories || []).every(c => isDoneStatus(c.status));
+        const isGroupClosed = (group?: Group) => {
+            if (!group) return false;
+            const cats = (group.departments || []).flatMap(d => d.categories || []);
+            return cats.length > 0 && cats.every(c => isDoneStatus(c.status));
+        };
+        const summarizeCategories = (categories: Category[] = []) => categories.reduce((acc, cat) => {
+            acc.categories += 1;
+            acc.skus += Number(cat.itemsCount || 0);
+            acc.units += Number(cat.totalQuantity || 0);
+            return acc;
+        }, { categories: 0, skus: 0, units: 0 });
+        const summarizeDepartment = (dept?: Department) =>
+            summarizeCategories((dept?.categories || []) as Category[]);
+        const summarizeGroup = (group?: Group) => (group?.departments || []).reduce((acc, dept) => {
+            const current = summarizeDepartment(dept);
+            acc.categories += current.categories;
+            acc.skus += current.skus;
+            acc.units += current.units;
+            return acc;
+        }, { categories: 0, skus: 0, units: 0 });
+        const ignored = {
+            closedGroups: 0,
+            closedDepartments: 0,
+            categories: 0,
+            skus: 0,
+            units: 0
+        };
+
+        const rebuiltFilteredGroups = rebuiltData.groups.map(group => {
+            const baseGroup = findBaseGroup(group);
+            if (isGroupClosed(baseGroup)) {
+                // Grupo concluído: congela a estrutura inteira como estava.
+                const blockedGroup = summarizeGroup(group);
+                ignored.closedGroups += 1;
+                ignored.categories += blockedGroup.categories;
+                ignored.skus += blockedGroup.skus;
+                ignored.units += blockedGroup.units;
+                return cloneGroup(baseGroup!);
+            }
+
+            const nextDepartments = group.departments.map(dept => {
+                const baseDept = findBaseDept(baseGroup, dept);
+                if (isDeptClosed(baseDept)) {
+                    // Departamento concluído: não aceita categoria nova.
+                    const blockedDept = summarizeDepartment(dept);
+                    ignored.closedDepartments += 1;
+                    ignored.categories += blockedDept.categories;
+                    ignored.skus += blockedDept.skus;
+                    ignored.units += blockedDept.units;
+                    return cloneDepartment(baseDept!);
+                }
+                return {
+                    ...dept,
+                    categories: (dept.categories || []).map(cloneCategory)
+                };
+            });
+
+            // Garante manutenção de departamentos já concluídos que não vieram no rebuild.
+            (baseGroup?.departments || []).forEach(baseDept => {
+                if (!isDeptClosed(baseDept)) return;
+                const alreadyIncluded = nextDepartments.some(
+                    d => d.id === baseDept.id || d.name === baseDept.name
+                );
+                if (!alreadyIncluded) nextDepartments.push(cloneDepartment(baseDept));
+            });
+
+            return {
+                ...group,
+                departments: nextDepartments
+            };
+        });
+
+        const merged: AuditData = {
+            ...rebuiltData,
+            termDrafts: baseData.termDrafts,
+            postAuditAdjustments: normalizePostAuditAdjustments((baseData as any).postAuditAdjustments),
+            partialStarts: baseData.partialStarts,
+            partialCompleted: baseData.partialCompleted,
+            lastPartialBatchId: baseData.lastPartialBatchId,
+            groups: rebuiltFilteredGroups
+        };
+        const ensureGroup = (groupId: string, groupName: string) => {
+            const probe: Group = { id: groupId, name: groupName, departments: [] };
+            let g = merged.groups.find(x => isSameGroup(x, probe));
+            if (!g) {
+                g = { id: groupId, name: groupName, departments: [] };
+                merged.groups.push(g);
+            }
+            return g;
+        };
+        const ensureDept = (group: Group, dept: Department) => {
+            let d = group.departments.find(x => isSameDept(x, dept));
+            if (!d) {
+                d = { ...dept, categories: [] };
+                group.departments.push(d);
+            }
+            return d;
+        };
+
+        baseData.groups.forEach(oldGroup => {
+            oldGroup.departments.forEach(oldDept => {
+                oldDept.categories.forEach(oldCat => {
+                    if (!isDoneStatus(oldCat.status)) return;
+                    const group = ensureGroup(String(oldGroup.id), oldGroup.name);
+                    const dept = ensureDept(group, oldDept);
+                    const catId = oldCat.id;
+                    const idx = dept.categories.findIndex(c => c.id === catId || c.name === oldCat.name);
+                    if (idx >= 0) dept.categories[idx] = { ...oldCat };
+                    else dept.categories.push({ ...oldCat });
+                });
+            });
+        });
+        const dedupedGroups: Group[] = [];
+        merged.groups.forEach(group => {
+            let targetGroup = dedupedGroups.find(existing => isSameGroup(existing, group));
+            if (!targetGroup) {
+                dedupedGroups.push(cloneGroup(group));
+                return;
+            }
+
+            group.departments.forEach(dept => {
+                let targetDept = targetGroup!.departments.find(existing => isSameDept(existing, dept));
+                if (!targetDept) {
+                    targetGroup!.departments.push(cloneDepartment(dept));
+                    return;
+                }
+
+                (dept.categories || []).forEach(cat => {
+                    const catIdx = (targetDept!.categories || []).findIndex(existing =>
+                        existing.id === cat.id || existing.name === cat.name
+                    );
+                    if (catIdx >= 0) {
+                        const existingCat = targetDept!.categories[catIdx];
+                        const incomingStatus = normalizeAuditStatus(cat.status);
+                        const existingStatus = normalizeAuditStatus(existingCat.status);
+                        const statusRank = (s: AuditStatus) =>
+                            s === AuditStatus.DONE ? 3 : s === AuditStatus.IN_PROGRESS ? 2 : 1;
+                        const keepIncoming =
+                            statusRank(incomingStatus) > statusRank(existingStatus) ||
+                            (statusRank(incomingStatus) === statusRank(existingStatus) &&
+                                (cat.products?.length || 0) > (existingCat.products?.length || 0));
+                        if (keepIncoming) {
+                            targetDept!.categories[catIdx] = cloneCategory(cat);
+                        }
+                    } else {
+                        targetDept!.categories.push(cloneCategory(cat));
+                    }
+                });
+            });
+        });
+        merged.groups = dedupedGroups;
+        return { merged, ignored };
+    };
+
+    const buildAuditStructureFromExcelRows = async (params: {
+        rowsGroupsByFile: any[][][];
+        groupFilesList: Array<{ groupId: GroupUploadId; file: File }>;
+        rowsStock: any[][];
+        rowsDept?: any[][] | null;
+        rowsCat?: any[][] | null;
+        selectedEmpresa: string;
+        selectedFilial: string;
+        inventoryNumber: string;
+        cadastroAliases?: Record<string, string[]>;
+        existingOpenData?: AuditData | null;
+    }): Promise<AuditData> => {
+        const {
+            rowsGroupsByFile,
+            groupFilesList,
+            rowsStock,
+            rowsDept,
+            rowsCat,
+            selectedEmpresa,
+            selectedFilial,
+            inventoryNumber,
+            cadastroAliases = cadastroBarcodeAliasesByReduced,
+            existingOpenData
+        } = params;
+
+        type ProductScope = { groupId: string; groupName: string; deptId: string; deptName: string; catId: string; catName: string };
+        const productsByReduced: Record<string, ProductScope[]> = {};
+        const productsByName: Record<string, ProductScope[]> = {};
+        const catReportByReduced: Record<string, { catId: string; catName: string; deptName: string }> = {};
+        const deptReportByReduced: Record<string, { deptId: string; deptName: string }> = {};
+        const deptReportByName: Record<string, { deptId: string; deptName: string }> = {};
+        const catReportByName: Record<string, { catId: string; catName: string; deptName: string }> = {};
+        const deptIdByDescription: Record<string, string> = {};
+        const catIdByDescription: Record<string, string> = {};
+        const deptDescEntries: Array<{ key: string; id: string }> = [];
+        const catDescEntries: Array<{ key: string; id: string }> = [];
+
+        const normalizeDescriptionKey = (value: unknown) =>
+            normalizeLookupText(cleanDescription(String(value ?? '')));
+
+        const superClean = (str: unknown) => 
+            normalizeDescriptionKey(str).replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+
+        const fillIdByDescription = (
+            rows: any[][],
+            output: Record<string, string>,
+            entries: Array<{ key: string; id: string }>,
+            prefix: 'DEPARTAMENTO' | 'CATEGORIA'
+        ) => {
+            rows.forEach(row => {
+                if (!row) return;
+                const parsed = parseHierarchySectionHeader(row, prefix);
+                if (!parsed) return;
+                const descKey = normalizeDescriptionKey(parsed.name);
+                if (!descKey) return;
+                if (!output[descKey]) output[descKey] = parsed.id;
+                entries.push({ key: descKey, id: parsed.id });
+            });
+        };
+
+        const resolveIdByDescription = (
+            rawDesc: unknown,
+            map: Record<string, string>,
+            entries: Array<{ key: string; id: string }>
+        ) => {
+            const key = normalizeDescriptionKey(rawDesc);
+            if (!key) return '';
+            if (map[key]) return map[key];
+            const candidates = entries.filter(e =>
+                e.key === key ||
+                e.key.includes(key) ||
+                key.includes(e.key)
+            );
+            if (candidates.length === 1) return candidates[0].id;
+            return '';
+        };
+
+        if (rowsDept) {
+            fillIdByDescription(rowsDept, deptIdByDescription, deptDescEntries, 'DEPARTAMENTO');
+            const deptColumns = detectGroupCadastroColumns(rowsDept);
+            let lastDeptId = "";
+            let lastDeptName = "";
+            rowsDept.forEach(row => {
+                if (!row) return;
+                const section = parseHierarchySectionHeader(row, 'DEPARTAMENTO');
+                if (section) {
+                    lastDeptId = section.id;
+                    lastDeptName = section.name;
+                }
+
+                let inlineDeptId = lastDeptId;
+                let inlineDeptName = lastDeptName;
+
+                const rowDeptName = String(row[deptColumns.deptCol] ?? '').trim();
+                if (rowDeptName && !isHierarchyPlaceholderName(rowDeptName, ['OUTROS', 'GERAL'])) {
+                    inlineDeptName = rowDeptName;
+                }
+
+                if (inlineDeptName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineDeptName.toUpperCase().includes('SEM CATEGORIA') || inlineDeptName.toUpperCase() === 'OUTROS') {
+                    inlineDeptId = "";
+                }
+
+                const rowName = String(row[deptColumns.nameCol] ?? '').trim();
+                const nameKey = superClean(rowName);
+
+                const deptData = { deptId: inlineDeptId, deptName: inlineDeptName };
+
+                [row[deptColumns.codeCol], row[deptColumns.barcodeCol]].forEach(value => {
+                    const code = normalizeBarcode(value);
+                    if (code) deptReportByReduced[code] = deptData;
+                });
+
+                if (nameKey) deptReportByName[nameKey] = deptData;
+            });
+        }
+
+        if (rowsCat) {
+            fillIdByDescription(rowsCat, catIdByDescription, catDescEntries, 'CATEGORIA');
+            const catColumns = detectGroupCadastroColumns(rowsCat);
+            let lastCatId = "";
+            let lastCatName = "";
+            rowsCat.forEach(row => {
+                if (!row) return;
+                const section = parseHierarchySectionHeader(row, 'CATEGORIA');
+                if (section) {
+                    lastCatId = section.id;
+                    lastCatName = section.name;
+                }
+
+                let inlineCatId = lastCatId;
+                let inlineCatName = lastCatName;
+
+                const rowCatName = String(row[catColumns.catCol] ?? '').trim();
+                if (rowCatName && !isHierarchyPlaceholderName(rowCatName, ['OUTROS', 'GERAL'])) {
+                    inlineCatName = rowCatName;
+                }
+
+                if (inlineCatName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineCatName.toUpperCase().includes('SEM CATEGORIA') || inlineCatName.toUpperCase() === 'OUTROS' || inlineCatName.toUpperCase() === 'GERAL') {
+                    inlineCatId = "";
+                }
+
+                const rowName = String(row[catColumns.nameCol] ?? '').trim();
+                const nameKey = superClean(rowName);
+
+                const deptName = String(row[catColumns.deptCol] ?? '').trim();
+                const catData = { catId: inlineCatId, catName: inlineCatName, deptName };
+
+                [row[catColumns.codeCol], row[catColumns.barcodeCol]].forEach(value => {
+                    const code = normalizeBarcode(value);
+                    if (code) catReportByReduced[code] = catData;
+                });
+
+                if (nameKey) catReportByName[nameKey] = catData;
+            });
+        }
+
+        const addScope = (bucket: Record<string, ProductScope[]>, key: string, scope: ProductScope) => {
+            if (!key) return;
+            const deptKey = scope.deptId || scope.deptName;
+            const catKey = scope.catId || scope.catName;
+            const scopeKey = `${scope.groupId}|${deptKey}|${catKey}`;
+            const list = bucket[key] || [];
+            if (!list.some(s => {
+                const existingDeptKey = s.deptId || s.deptName;
+                const existingCatKey = s.catId || s.catName;
+                return `${s.groupId}|${existingDeptKey}|${existingCatKey}` === scopeKey;
+            })) {
+                list.push(scope);
+                bucket[key] = list;
+            }
+        };
+
+        const normalizeHierarchyLabel = (value: unknown) =>
+            normalizeLookupText(String(value ?? ''));
+        const isPlaceholderDeptName = (value: unknown) => {
+            const label = normalizeHierarchyLabel(value);
+            return !label || label === 'outros' || label === 'geral' || isDiversosLabel(String(value ?? ''));
+        };
+        const isPlaceholderCatName = (value: unknown) => {
+            const label = normalizeHierarchyLabel(value);
+            return !label || label === 'geral' || label === 'outros' || isDiversosLabel(String(value ?? ''));
+        };
+        const scopeFallbackBuckets = new Map<string, { scope: ProductScope; count: number }>();
+        const deptFallbackBuckets = new Map<string, { scope: ProductScope; count: number }>();
+        const groupFallbackScopeById: Record<string, ProductScope> = {};
+        const deptFallbackScopeByKey: Record<string, ProductScope> = {};
+        const upsertFallbackBucket = (
+            bucket: Map<string, { scope: ProductScope; count: number }>,
+            key: string,
+            scope: ProductScope
+        ) => {
+            if (!key) return;
+            const current = bucket.get(key);
+            if (current) {
+                current.count += 1;
+            } else {
+                bucket.set(key, { scope, count: 1 });
+            }
+        };
+        const registerFallbackScope = (scope: ProductScope) => {
+            if (!scope.groupId || isPlaceholderDeptName(scope.deptName) || isPlaceholderCatName(scope.catName)) return;
+            const groupKey = normalizeScopeId(scope.groupId);
+            if (!groupKey || !ALLOWED_IDS.includes(Number(groupKey))) return;
+            const scopeKey = `${groupKey}|${normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName)}|${normalizeScopeId(scope.catId) || normalizeHierarchyLabel(scope.catName)}`;
+            upsertFallbackBucket(scopeFallbackBuckets, scopeKey, scope);
+            const deptKey = `${groupKey}|${normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName)}|${scopeKey}`;
+            upsertFallbackBucket(deptFallbackBuckets, deptKey, scope);
+        };
+        const rebuildFallbackScopes = () => {
+            const bestByGroup = new Map<string, { scope: ProductScope; count: number }>();
+            scopeFallbackBuckets.forEach(entry => {
+                const groupKey = normalizeScopeId(entry.scope.groupId);
+                const current = bestByGroup.get(groupKey);
+                if (!current || entry.count > current.count) bestByGroup.set(groupKey, entry);
+            });
+            bestByGroup.forEach((entry, groupKey) => {
+                groupFallbackScopeById[groupKey] = entry.scope;
+            });
+
+            const bestByDept = new Map<string, { scope: ProductScope; count: number }>();
+            deptFallbackBuckets.forEach((entry, key) => {
+                const [groupKey, deptKey] = key.split('|');
+                const bestKey = `${groupKey}|${deptKey}`;
+                const current = bestByDept.get(bestKey);
+                if (!current || entry.count > current.count) bestByDept.set(bestKey, entry);
+            });
+            bestByDept.forEach((entry, key) => {
+                deptFallbackScopeByKey[key] = entry.scope;
+            });
+        };
+        const getHierarchyFallbackScope = (scope: ProductScope) => {
+            const groupKey = normalizeScopeId(scope.groupId);
+            if (!groupKey) return null;
+            const deptKey = normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName);
+            if (deptKey) {
+                const deptFallback = deptFallbackScopeByKey[`${groupKey}|${deptKey}`];
+                if (deptFallback) return deptFallback;
+            }
+            return groupFallbackScopeById[groupKey] || null;
+        };
+
+        const groupFileRows = groupFilesList.map((entry, idx) => ({
+            groupId: entry.groupId,
+            rows: rowsGroupsByFile[idx] || []
+        }));
+
+        groupFileRows.forEach(({ groupId, rows }) => {
+            const groupName = GROUP_CONFIG_DEFAULTS[groupId] || `Grupo ${groupId}`;
+            const columns = detectGroupCadastroColumns(rows);
+            const firstProductRow = columns.headerRowIndex >= 0 ? columns.headerRowIndex + 2 : 0;
+
+            rows.slice(firstProductRow).forEach((row) => {
+                if (!row || row.length < 4) return;
+
+                const productCodeCandidates = Array.from(new Set([
+                    normalizeBarcode(row[columns.codeCol]),
+                    normalizeBarcode(row[columns.barcodeCol])
+                ].filter(Boolean)));
+                if (productCodeCandidates.length === 0) return;
+
+                const productNameKeyStr = String(row[columns.nameCol] || '').trim();
+                const productNameKey = superClean(productNameKeyStr);
+
+                const deptCell = parseHierarchyCells(row[columns.deptCol], '', "OUTROS", ['GERAL']);
+                const catCell = parseHierarchyCells(row[columns.catCol], '', "GERAL", ['GERAL']);
+                const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name, deptIdByDescription, deptDescEntries);
+                const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name, catIdByDescription, catDescEntries);
+
+                const scope: ProductScope = {
+                    groupId,
+                    groupName,
+                    deptId: deptResolvedId,
+                    deptName: deptCell.name,
+                    catId: catResolvedId,
+                    catName: catCell.name
+                };
+
+                productCodeCandidates.forEach(codeCandidate => addScope(productsByReduced, codeCandidate, scope));
+                addScope(productsByName, productNameKey, scope);
+                registerFallbackScope(scope);
+            });
+        });
+
+        rebuildFallbackScopes();
+
+        const stockCols = detectStockColumns(rowsStock);
+        const stockAcc: Record<string, { q: number; costAmount: number; name: string; groupId: string; barcodeAliases: string[] }> = {};
+        const groupsMap: Record<string, Group> = {};
+        const startRow = stockCols.headerRowIndex >= 0 ? stockCols.headerRowIndex + 1 : 0;
+        for (let r = startRow; r < rowsStock.length; r++) {
+            const row = rowsStock[r];
+            if (!row) continue;
+            const reduced = normalizeBarcode(row[stockCols.codeCol]);
+            if (!reduced) continue;
+            const barcodeAliases = collectProductCodeCandidates(row, 12, stockCols.codeCol).filter(code => code && code !== reduced);
+            const productName = row[stockCols.nameCol]?.toString() || row[stockCols.nameCol + 2]?.toString() || "Sem Descrição";
+            const stockQty = parseStockNumber(row[stockCols.qtyCol]);
+            const stockCost = parseStockNumber(row[stockCols.costCol]);
+            const groupRaw = row[stockCols.groupCol] ?? row[stockCols.isNewFormat ? 3 : 4] ?? row[6];
+            const stockGroupNum = parseSheetNumericCode(groupRaw) ?? parseSheetNumericCode(row[6]);
+            const stockGroupId = stockGroupNum !== null ? String(stockGroupNum) : '';
+            if (stockQty <= 0) continue;
+
+            const prev = stockAcc[reduced] || { q: 0, costAmount: 0, name: productName, groupId: stockGroupId, barcodeAliases: [] };
+            stockAcc[reduced] = {
+                q: prev.q + stockQty,
+                costAmount: prev.costAmount + (stockQty * stockCost),
+                name: prev.name || productName,
+                groupId: prev.groupId || stockGroupId,
+                barcodeAliases: Array.from(new Set([...prev.barcodeAliases, ...barcodeAliases]))
+            };
+        }
+
+        const UNCLASSIFIED_GROUP_ID = '99999';
+        const UNCLASSIFIED_GROUP_NAME = 'NAO CLASSIFICADO (SEM GRUPO)';
+        const UNCLASSIFIED_DEPT_NAME = 'NAO CLASSIFICADO (SEM DEPARTAMENTO)';
+        const UNCLASSIFIED_CAT_NAME = 'NAO CLASSIFICADO (SEM CATEGORIA)';
+        const normalizeKeyRaw = (value: unknown) => String(value ?? '').trim();
+        const normalizeKeyDigits = (value: unknown) =>
+            normalizeKeyRaw(value).replace(/\D/g, '').replace(/^0+/, '');
+        const normalizeKeyLabel = (value: unknown) => normalizeLookupText(String(value ?? ''));
+        const resolveGroupKey = (groupId: unknown, groupName: unknown) =>
+            normalizeKeyDigits(groupId) || normalizeKeyLabel(groupName) || normalizeKeyRaw(groupId);
+        const resolveDeptKey = (deptId: unknown, deptName: unknown) =>
+            normalizeKeyDigits(deptId) || normalizeKeyLabel(deptName) || normalizeKeyRaw(deptId);
+        const closedGroupKeys = new Set<string>();
+        const closedDeptKeys = new Set<string>();
+
+        if (existingOpenData) {
+            (existingOpenData.groups || []).forEach(oldGroup => {
+                const oldGroupKey = resolveGroupKey(oldGroup.id, oldGroup.name);
+                const oldGroupCats = (oldGroup.departments || []).flatMap(d => d.categories || []);
+                const isOldGroupClosed = oldGroupCats.length > 0 && oldGroupCats.every(c => isDoneStatus(c.status));
+                if (isOldGroupClosed) {
+                    closedGroupKeys.add(oldGroupKey);
+                }
+
+                (oldGroup.departments || []).forEach(oldDept => {
+                    const oldDeptCats = oldDept.categories || [];
+                    const isOldDeptClosed = oldDeptCats.length > 0 && oldDeptCats.every(c => isDoneStatus(c.status));
+                    if (!isOldDeptClosed) return;
+                    const oldDeptKey = resolveDeptKey((oldDept as any).numericId || oldDept.id, oldDept.name);
+                    closedDeptKeys.add(`${oldGroupKey}|${oldDeptKey}`);
+                });
+            });
+        }
+
+        Object.entries(stockAcc).forEach(([reduced, acc]) => {
+            const avgCost = acc.q > 0 ? (acc.costAmount / acc.q) : 0;
+            const nameKey = superClean(acc.name || "");
+            const scopesByReduced = productsByReduced[reduced] || [];
+            const scopesByName = nameKey ? (productsByName[nameKey] || []) : [];
+            const scopes = scopesByReduced.length > 0 ? scopesByReduced : scopesByName;
+            const manualClassification = PRODUCT_CLASSIFICATION_FIXES_BY_CODE[reduced];
+
+            let chosenScope: ProductScope | null = manualClassification
+                ? { ...manualClassification }
+                : null;
+            if (!chosenScope) {
+                if (scopes.length > 0) {
+                    chosenScope = scopes.find(s => String(s.groupId) === String(acc.groupId)) || scopes[0];
+                } else {
+                    const catFallback = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
+                    if (catFallback && acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId))) {
+                        const deptFallback = parseHierarchyCell(catFallback.deptName, "OUTROS");
+                        chosenScope = {
+                            groupId: acc.groupId,
+                            groupName: GROUP_CONFIG_DEFAULTS[acc.groupId] || `Grupo ${acc.groupId}`,
+                            deptId: deptFallback.numericId,
+                            deptName: deptFallback.name || "OUTROS",
+                            catId: catFallback.catId || "",
+                            catName: catFallback.catName || "GERAL"
+                        };
+                    }
+                }
+            }
+            if (!chosenScope) {
+                const hasAllowedStockGroup =
+                    !!acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId));
+                const fallbackGroupId = hasAllowedStockGroup ? acc.groupId : UNCLASSIFIED_GROUP_ID;
+                const groupFallback = hasAllowedStockGroup ? groupFallbackScopeById[normalizeScopeId(fallbackGroupId)] : null;
+                chosenScope = groupFallback
+                    ? { ...groupFallback }
+                    : {
+                        groupId: fallbackGroupId,
+                        groupName: hasAllowedStockGroup
+                            ? (GROUP_CONFIG_DEFAULTS[fallbackGroupId] || `Grupo ${fallbackGroupId}`)
+                            : UNCLASSIFIED_GROUP_NAME,
+                        deptId: '',
+                        deptName: UNCLASSIFIED_DEPT_NAME,
+                        catId: '',
+                        catName: UNCLASSIFIED_CAT_NAME
+                    };
+            }
+            const resolvedScope: ProductScope = { ...chosenScope };
+            const deptByReduced = deptReportByReduced[reduced] || (nameKey ? deptReportByName[nameKey] : undefined);
+            const catByReduced = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
+            if (deptByReduced) {
+                if (!resolvedScope.deptId && deptByReduced.deptId) {
+                    resolvedScope.deptId = deptByReduced.deptId;
+                }
+                if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS' || resolvedScope.deptName === UNCLASSIFIED_DEPT_NAME) && deptByReduced.deptName) {
+                    resolvedScope.deptName = deptByReduced.deptName;
+                }
+            }
+            if (catByReduced) {
+                if (!resolvedScope.catId && catByReduced.catId) {
+                    resolvedScope.catId = catByReduced.catId;
+                }
+                if ((!resolvedScope.catName || resolvedScope.catName === 'GERAL' || resolvedScope.catName === UNCLASSIFIED_CAT_NAME) && catByReduced.catName) {
+                    resolvedScope.catName = catByReduced.catName;
+                }
+                if (catByReduced.deptName) {
+                    if (!resolvedScope.deptId) {
+                        resolvedScope.deptId = resolveIdByDescription(catByReduced.deptName, deptIdByDescription, deptDescEntries);
+                    }
+                    if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS' || resolvedScope.deptName === UNCLASSIFIED_DEPT_NAME)) {
+                        const deptParsed = parseHierarchyCell(catByReduced.deptName, "OUTROS");
+                        resolvedScope.deptName = deptParsed.name || resolvedScope.deptName;
+                        if (!resolvedScope.deptId && deptParsed.numericId) {
+                            resolvedScope.deptId = deptParsed.numericId;
+                        }
+                    }
+                }
+            }
+            const hierarchyFallback = getHierarchyFallbackScope(resolvedScope);
+            if (hierarchyFallback && (isPlaceholderDeptName(resolvedScope.deptName) || isPlaceholderCatName(resolvedScope.catName))) {
+                if (isPlaceholderDeptName(resolvedScope.deptName)) {
+                    resolvedScope.deptId = hierarchyFallback.deptId;
+                    resolvedScope.deptName = hierarchyFallback.deptName;
+                }
+                if (isPlaceholderCatName(resolvedScope.catName)) {
+                    resolvedScope.catId = hierarchyFallback.catId;
+                    resolvedScope.catName = hierarchyFallback.catName;
+                }
+            }
+
+            const finalGroupId = resolvedScope.groupId;
+            const finalGroupName = resolvedScope.groupName;
+            const finalGroupKey = resolveGroupKey(finalGroupId, finalGroupName);
+            const finalDeptKey = resolveDeptKey(resolvedScope.deptId || resolvedScope.deptName, resolvedScope.deptName);
+            if (closedGroupKeys.has(finalGroupKey) || closedDeptKeys.has(`${finalGroupKey}|${finalDeptKey}`)) {
+                return;
+            }
+            if (!groupsMap[finalGroupId]) groupsMap[finalGroupId] = { id: finalGroupId, name: finalGroupName, departments: [] };
+
+            const deptIdentity = resolvedScope.deptId || resolvedScope.deptName;
+            let dept = groupsMap[finalGroupId].departments.find(d => d.id === deptIdentity || d.name === resolvedScope.deptName);
+            if (!dept) {
+                dept = {
+                    id: deptIdentity,
+                    numericId: resolvedScope.deptId || undefined,
+                    name: resolvedScope.deptName,
+                    categories: []
+                };
+                groupsMap[finalGroupId].departments.push(dept);
+            } else if (!dept.numericId && resolvedScope.deptId) {
+                dept.numericId = resolvedScope.deptId;
+            }
+
+            const catIdentity = resolvedScope.catId || resolvedScope.catName;
+            const catNodeId = `${finalGroupId}-${deptIdentity}-${catIdentity}`;
+            let cat = dept.categories.find(c => c.id === catNodeId || c.name === resolvedScope.catName);
+            if (!cat) {
+                cat = {
+                    id: catNodeId,
+                    numericId: resolvedScope.catId || undefined,
+                    name: resolvedScope.catName,
+                    itemsCount: 0,
+                    totalQuantity: 0,
+                    totalCost: 0,
+                    status: AuditStatus.TODO,
+                    products: []
+                };
+                dept.categories.push(cat);
+            } else if (!cat.numericId && resolvedScope.catId) {
+                cat.numericId = resolvedScope.catId;
+            }
+
+            cat.itemsCount++;
+            cat.totalQuantity += acc.q;
+            cat.totalCost += (acc.q * avgCost);
+            const allCadastroAliases = cadastroAliases[normalizeProductLookupCode(reduced)] || [];
+            const allBarcodeAliases = Array.from(new Set([...acc.barcodeAliases, ...allCadastroAliases]));
+            const primaryBarcode = allBarcodeAliases.find(code => code.length >= 8) || allBarcodeAliases[0] || '';
+            cat.products.push({
+                code: primaryBarcode || reduced,
+                reducedCode: reduced,
+                barcode: primaryBarcode || undefined,
+                barcodeAliases: allBarcodeAliases,
+                name: acc.name,
+                quantity: acc.q,
+                cost: avgCost
+            });
+        });
+
+        return {
+            groups: Object.values(groupsMap).sort((a, b) => parseInt(a.id.split('+')[0]) - parseInt(b.id.split('+')[0])),
+            empresa: selectedEmpresa,
+            filial: selectedFilial,
+            inventoryNumber: inventoryNumber.trim()
+        };
+    };
+
+    const reclassifyBranchWithStock = async (
+        targetBranch: string,
+        options?: {
+            stockFile?: File | null;
+            stockMeta?: DbGlobalBaseFile | null;
+            openSession?: DbAuditSession | null;
+            silentAlerts?: boolean;
+        }
+    ): Promise<{ success: boolean; ignoredSummary?: any; error?: string }> => {
+        const companyId = selectedCompany?.id;
+        if (!companyId) return { success: false, error: 'Empresa não selecionada' };
+        if (!targetBranch) return { success: false, error: 'Filial não especificada' };
+
+        // 1. Obter sessão aberta da filial
+        let targetOpenAudit = options?.openSession || null;
+        if (!targetOpenAudit || !targetOpenAudit.data) {
+            targetOpenAudit = await fetchLatestAudit(targetBranch);
+        }
+        if (!targetOpenAudit || targetOpenAudit.status !== 'open' || !targetOpenAudit.data) {
+            return { success: false, error: `Não existe inventário em aberto para a Filial ${targetBranch}` };
+        }
+
+        const openData = targetOpenAudit.data as AuditData;
+        const currentAuditNumber = Number(
+            getAuditNumberFromInventoryLabel((openData as any)?.inventoryNumber) ||
+            targetOpenAudit.audit_number ||
+            1
+        );
+
+        // 2. Obter arquivo de estoque decodificado
+        let targetStockFile = options?.stockFile || null;
+        let targetStockMeta = options?.stockMeta || null;
+
+        if (!targetStockFile) {
+            const stockModuleKey = buildSharedStockModuleKey(targetBranch);
+            if (!targetStockMeta) {
+                targetStockMeta = (await fetchGlobalBaseFileMeta(companyId, stockModuleKey, true)) as DbGlobalBaseFile | null;
+            }
+            if (!targetStockMeta) {
+                return { success: false, error: `Nenhum arquivo de estoque encontrado no Cadastro Base para a Filial ${targetBranch}` };
+            }
+            const fullStock = await CadastrosBaseService.getGlobalBaseFileCached(companyId, stockModuleKey, { preferRemote: true });
+            if (!fullStock) {
+                return { success: false, error: `Falha ao baixar arquivo de estoque da Filial ${targetBranch}` };
+            }
+            targetStockFile = await decodeGlobalFileToBrowserFile(fullStock as DbGlobalBaseFile);
+            targetStockMeta = fullStock as DbGlobalBaseFile;
+        }
+
+        if (!targetStockFile) {
+            return { success: false, error: `Arquivo de estoque vazio para a Filial ${targetBranch}` };
+        }
+
+        // 3. Obter bases estruturais globais
+        const structureGroupFiles = effectiveGroupFiles;
+        if (structureGroupFiles.length === 0) {
+            return { success: false, error: 'Bases de cadastro dos grupos não carregadas no Cadastro Base' };
+        }
+
+        // 4. Ler linhas do Excel
+        const rowsGroupsByFile = await Promise.all(structureGroupFiles.map(entry => readExcel(entry.file)));
+        const rowsStock = await readExcel(targetStockFile);
+        const rowsDept = effectiveDeptIdsFile ? await readExcel(effectiveDeptIdsFile) : null;
+        const rowsCat = effectiveCatIdsFile ? await readExcel(effectiveCatIdsFile) : null;
+
+        // 5. Construir árvore de grupos e produtos com saldos
+        const nextData = await buildAuditStructureFromExcelRows({
+            rowsGroupsByFile,
+            groupFilesList: structureGroupFiles,
+            rowsStock,
+            rowsDept,
+            rowsCat,
+            selectedEmpresa,
+            selectedFilial: targetBranch,
+            inventoryNumber: String((openData as any)?.inventoryNumber || `Inventário Filial ${targetBranch} Nº ${currentAuditNumber}`),
+            cadastroAliases: cadastroBarcodeAliasesByReduced,
+            existingOpenData: openData
+        });
+
+        // 6. Preservar o que já foi finalizado
+        const mergeResult = mergePreservingDone(openData, nextData);
+        const finalData = mergeResult.merged;
+
+        const safePartialStarts = compactPartialScopesForAuditData(
+            openData,
+            Array.isArray(openData.partialStarts) ? openData.partialStarts : []
+        );
+
+        const finalTermDrafts = composeTermDraftsForPersist(
+            ((openData as any).termDrafts || {}) as Record<string, TermForm>,
+            targetBranch === selectedFilial ? termDrafts : {}
+        ) as Record<string, any>;
+
+        const finalPostAuditAdjustments = normalizePostAuditAdjustments(
+            (openData as any).postAuditAdjustments
+        );
+
+        const basePersistedData = {
+            ...finalData,
+            postAuditAdjustments: finalPostAuditAdjustments,
+            termDrafts: finalTermDrafts,
+            sourceFiles: buildStructureSourceMeta({
+                stockSyncedAt: getGlobalStockTimestampRaw(targetStockMeta),
+                stockMeta: targetStockMeta,
+                stockFile: targetStockFile,
+                branch: targetBranch,
+                prevSourceFiles: (openData as any)?.sourceFiles
+            })
+        } as any;
+
+        const persistedData = applyPartialScopes(basePersistedData, safePartialStarts);
+        const progress = calculateProgress(persistedData as AuditData);
+
+        // 7. Persistir sessão no banco de dados
+        const savedSession = await persistAuditSession({
+            id: targetOpenAudit.id,
+            branch: targetBranch,
+            audit_number: currentAuditNumber,
+            status: 'open',
+            data: persistedData,
+            progress: progress,
+            user_email: userEmail
+        }, {
+            allowProgressRegression: true,
+            requireRemote: true
+        });
+
+        if (!savedSession) {
+            return { success: false, error: `Falha ao salvar a reclassificação da Filial ${targetBranch} no banco de dados.` };
+        }
+
+        invalidateAuditsHistoryCache(targetBranch);
+
+        // Se a filial reclassificada for a atualmente selecionada na tela, atualiza o state
+        if (targetBranch === selectedFilial) {
+            if (savedSession.id) setDbSessionId(savedSession.id);
+            setNextAuditNumber(savedSession.audit_number);
+            setAllowActiveAuditAutoOpen(true);
+            setTermDrafts(finalTermDrafts as any);
+            const savedData = (savedSession.data as AuditData) || (persistedData as AuditData);
+            setData(savedData);
+            setGroupFiles(createInitialGroupFiles());
+            setFileDeptIds(null);
+            setFileCatIds(null);
+            setFileStock(null);
+            setIsUpdatingStock(false);
+            onAuditSessionChanged?.(savedSession);
+        }
+
+        if (!options?.silentAlerts) {
+            alert(`Saldos reclassificados e sincronizados com sucesso para a Filial ${targetBranch}.`);
+            if (mergeResult && (mergeResult.ignored.closedGroups > 0 || mergeResult.ignored.closedDepartments > 0)) {
+                alert(
+                    `Reclassificação da Filial ${targetBranch} com bloqueio de escopo finalizado:\n\n` +
+                    `Grupos concluídos bloqueados: ${mergeResult.ignored.closedGroups}\n` +
+                    `Departamentos concluídos bloqueados: ${mergeResult.ignored.closedDepartments}\n` +
+                    `Categorias ignoradas: ${mergeResult.ignored.categories.toLocaleString('pt-BR')}\n` +
+                    `SKUs ignorados: ${mergeResult.ignored.skus.toLocaleString('pt-BR')}\n` +
+                    `Unidades ignoradas: ${Math.round(mergeResult.ignored.units).toLocaleString('pt-BR')}`
+                );
+            }
+        }
+
+        return { success: true, ignoredSummary: mergeResult.ignored };
+    };
+
+    const refreshAllBranchesStockStatus = useCallback(async () => {
+        const companyId = selectedCompany?.id;
+        if (!companyId || !canUseAuditMasterTools || allowedAuditBranches.length === 0) return;
+        cancelStockCheckRef.current = false;
+        setIsLoadingBranchesStock(true);
+        setHasCheckedBranchesStock(true);
+
+        try {
+            // Marca filiais permitidas em loading enquanto processa
+            setBranchesStockStatus(prev => {
+                const loadingMap: Record<string, BranchStockStatus> = {};
+                allowedAuditBranches.forEach(branch => {
+                    loadingMap[branch] = {
+                        branch,
+                        openAuditNumber: prev[branch]?.openAuditNumber ?? null,
+                        hasOpenAudit: prev[branch]?.hasOpenAudit ?? false,
+                        hasRemoteStock: prev[branch]?.hasRemoteStock ?? false,
+                        isPendingStock: prev[branch]?.isPendingStock ?? false,
+                        status: 'loading'
+                    };
+                });
+                return loadingMap;
+            });
+
+            const stockKeys = allowedAuditBranches.map(b => buildSharedStockModuleKey(b));
+
+            // Executa em lote apenas 2 consultas leves concorrentes
+            const [stockFilesRes, openAuditsRes] = await Promise.all([
+                supabase
+                    .from('global_base_files')
+                    .select('id, company_id, module_key, file_name, file_size, uploaded_by, uploaded_at, updated_at')
+                    .in('module_key', stockKeys),
+                supabase
+                    .from('audit_sessions')
+                    .select('id, branch, audit_number, status, updated_at, data')
+                    .in('branch', allowedAuditBranches)
+                    .eq('status', 'open')
+            ]);
+
+            if (cancelStockCheckRef.current) {
+                return;
+            }
+
+            const stockFiles = (stockFilesRes?.data || []) as DbGlobalBaseFile[];
+            const openAudits = (openAuditsRes?.data || []) as DbAuditSession[];
+
+            // Mapeia o arquivo de estoque mais recente por module_key
+            const stockByModuleKey = new Map<string, DbGlobalBaseFile>();
+            stockFiles.forEach(file => {
+                const key = String(file.module_key || '').trim();
+                if (!key) return;
+                const existing = stockByModuleKey.get(key);
+                if (!existing) {
+                    stockByModuleKey.set(key, file);
+                } else {
+                    const existingTs = getGlobalStockTimestampRaw(existing) || '';
+                    const currentTs = getGlobalStockTimestampRaw(file) || '';
+                    if (currentTs >= existingTs) {
+                        stockByModuleKey.set(key, file);
+                    }
+                }
+            });
+
+            // Mapeia inventários abertos por filial
+            const openAuditByBranch = new Map<string, DbAuditSession>();
+            openAudits.forEach(audit => {
+                const b = String(audit.branch || '').trim();
+                if (!b) return;
+                const existing = openAuditByBranch.get(b);
+                if (!existing || ((audit.audit_number || 0) > (existing.audit_number || 0))) {
+                    openAuditByBranch.set(b, audit);
+                }
+            });
+
+            const nextStatuses: Record<string, BranchStockStatus> = {};
+
+            allowedAuditBranches.forEach(branch => {
+                const stockModuleKey = buildSharedStockModuleKey(branch);
+                const remoteStockMeta = stockByModuleKey.get(stockModuleKey) || null;
+                const hasRemoteStock = !!remoteStockMeta;
+                const remoteStockUpdatedAt = remoteStockMeta ? getGlobalStockTimestampRaw(remoteStockMeta) : null;
+
+                // Se a filial aberta for a atual selecionada e já temos o data em memória, usamos ele
+                let openAuditSession = openAuditByBranch.get(branch) || null;
+                if (selectedFilial === branch && data) {
+                    openAuditSession = {
+                        id: dbSessionId || openAuditSession?.id || '',
+                        branch,
+                        audit_number: openAuditSession?.audit_number || 1,
+                        status: 'open',
+                        data: data
+                    } as any;
+                }
+
+                const hasOpenAudit = !!openAuditSession;
+                let appliedStockTs: string | null = null;
+                let isPendingStock = false;
+                let isPendingClassification = false;
+                let isPendingStructure = false;
+
+                if (hasOpenAudit && openAuditSession?.data) {
+                    const sourceFiles = (openAuditSession.data as any).sourceFiles || {};
+                    appliedStockTs = getAppliedStockTimestampRaw(sourceFiles);
+                    if (hasRemoteStock && remoteStockMeta) {
+                        isPendingStock = isGlobalStockDifferentFromApplied(sourceFiles, remoteStockMeta);
+                    }
+                    isPendingClassification = isAuditClassificationOutdated(sourceFiles, openAuditSession.data);
+                    isPendingStructure = isGlobalAuditStructureDifferentFromApplied(
+                        sourceFiles,
+                        globalBaseMetaRef.current.groups,
+                        globalBaseMetaRef.current.dept,
+                        globalBaseMetaRef.current.cat,
+                        openAuditSession.data
+                    );
+                }
+
+                const isPending = hasOpenAudit && hasRemoteStock && (isPendingStock || isPendingClassification || isPendingStructure);
+
+                let status: BranchStockStatus['status'] = 'up_to_date';
+                if (!hasOpenAudit) {
+                    status = 'no_open_audit';
+                } else if (!hasRemoteStock) {
+                    status = 'no_base_stock';
+                } else if (isPending) {
+                    status = 'pending';
+                } else {
+                    status = 'up_to_date';
+                }
+
+                nextStatuses[branch] = {
+                    branch,
+                    openAuditNumber: hasOpenAudit && openAuditSession ? openAuditSession.audit_number : null,
+                    openAuditSessionId: openAuditSession?.id,
+                    openAuditUpdatedAt: openAuditSession?.updated_at || null,
+                    openAuditSyncedStockAt: appliedStockTs,
+                    remoteStockMeta,
+                    remoteStockUpdatedAt,
+                    isPendingStock,
+                    isPendingClassification,
+                    isPendingStructure,
+                    hasOpenAudit,
+                    hasRemoteStock,
+                    status
+                };
+            });
+
+            if (!cancelStockCheckRef.current) {
+                setBranchesStockStatus(nextStatuses);
+            }
+        } catch (error) {
+            console.error('Erro ao verificar status dos estoques das filiais:', error);
+            if (!cancelStockCheckRef.current) {
+                setBranchesStockStatus(prev => {
+                    const fallback: Record<string, BranchStockStatus> = { ...prev };
+                    allowedAuditBranches.forEach(b => {
+                        if (fallback[b]?.status === 'loading') {
+                            fallback[b] = {
+                                ...fallback[b],
+                                status: 'error',
+                                errorMessage: 'Erro na verificação'
+                            };
+                        }
+                    });
+                    return fallback;
+                });
+            }
+        } finally {
+            setIsLoadingBranchesStock(false);
+        }
+    }, [selectedCompany?.id, canUseAuditMasterTools, allowedAuditBranches, selectedFilial, data, dbSessionId]);
+
+    const handleMassReclassify = async () => {
+        if (!canUseAuditMasterTools) {
+            alert("Acesso restrito: apenas usuários Master ou Administradores podem executar reclassificação em massa.");
+            return;
+        }
+
+        const pendingBranches = allowedAuditBranches.filter(b => branchesStockStatus[b]?.status === 'pending');
+        if (pendingBranches.length === 0) {
+            alert("Nenhuma filial possui novo estoque pendente para reclassificar.");
+            return;
+        }
+
+        const branchesListStr = pendingBranches.map(b => `Filial ${b}`).join(', ');
+        const confirmed = window.confirm(
+            `ATENÇÃO: Reclassificação em Massa de Estoques\n\n` +
+            `Foram detectadas ${pendingBranches.length} filiais com novo estoque carregado no Cadastro Base:\n` +
+            `${branchesListStr}\n\n` +
+            `Deseja atualizar os saldos e reclassificar essas ${pendingBranches.length} filiais agora?\n` +
+            `(Todos os itens e departamentos já finalizados serão preservados com segurança).`
+        );
+        if (!confirmed) return;
+
+        abortMassReclassifyRef.current = false;
+        setIsMassReclassifying(true);
+        let successCount = 0;
+        let failCount = 0;
+        let wasAborted = false;
+
+        for (let i = 0; i < pendingBranches.length; i++) {
+            if (abortMassReclassifyRef.current) {
+                wasAborted = true;
+                break;
+            }
+
+            const branch = pendingBranches[i];
+            setMassProgress({ current: i + 1, total: pendingBranches.length, currentBranch: branch });
+
+            setBranchesStockStatus(prev => ({
+                ...prev,
+                [branch]: { ...prev[branch], status: 'processing' }
+            }));
+
+            try {
+                const branchInfo = branchesStockStatus[branch];
+                const result = await reclassifyBranchWithStock(branch, {
+                    stockMeta: branchInfo?.remoteStockMeta,
+                    silentAlerts: true
+                });
+                if (result.success) {
+                    successCount++;
+                    setBranchesStockStatus(prev => ({
+                        ...prev,
+                        [branch]: { ...prev[branch], status: 'up_to_date', isPendingStock: false }
+                    }));
+                } else {
+                    failCount++;
+                    setBranchesStockStatus(prev => ({
+                        ...prev,
+                        [branch]: { ...prev[branch], status: 'error', errorMessage: result.error || 'Erro na reclassificação' }
+                    }));
+                }
+            } catch (err) {
+                failCount++;
+                console.error(`Erro ao reclassificar filial ${branch} em massa:`, err);
+                setBranchesStockStatus(prev => ({
+                    ...prev,
+                    [branch]: { ...prev[branch], status: 'error', errorMessage: 'Exceção ao reclassificar' }
+                }));
+            }
+            await yieldToBrowser();
+
+            if (abortMassReclassifyRef.current) {
+                wasAborted = true;
+                break;
+            }
+        }
+
+        setIsMassReclassifying(false);
+        setMassProgress(null);
+        if (!wasAborted) {
+            void refreshAllBranchesStockStatus();
+        }
+
+        if (wasAborted) {
+            alert(
+                `Sincronização interrompida!\n\n` +
+                `✅ Filiais concluídas com sucesso: ${successCount}\n` +
+                (failCount > 0 ? `⚠️ Filiais com falha: ${failCount}\n` : '') +
+                `\nO processo foi pausado a seu pedido e as filiais restantes foram mantidas como estavam.`
+            );
+        } else {
+            alert(
+                `Reclassificação em massa concluída!\n\n` +
+                `✅ Filiais reclassificadas com sucesso: ${successCount}\n` +
+                (failCount > 0 ? `⚠️ Filiais com falha: ${failCount}\n` : '') +
+                `\nOs saldos foram atualizados e sincronizados no banco de dados.`
+            );
+        }
+    };
+
+    const handleSingleBranchReclassify = async (branch: string) => {
+        if (!canUseAuditMasterTools) {
+            alert("Acesso restrito: apenas usuários Master ou Administradores podem reclassificar filiais.");
+            return;
+        }
+
+        const branchInfo = branchesStockStatus[branch];
+        if (!branchInfo?.hasOpenAudit) {
+            alert(`A Filial ${branch} não possui inventário em aberto.`);
+            return;
+        }
+
+        const confirmed = window.confirm(
+            `Deseja atualizar os saldos e reclassificar a Filial ${branch} com o arquivo de estoque do Cadastro Base?`
+        );
+        if (!confirmed) return;
+
+        setBranchesStockStatus(prev => ({
+            ...prev,
+            [branch]: { ...prev[branch], status: 'processing' }
+        }));
+
+        try {
+            const result = await reclassifyBranchWithStock(branch, {
+                stockMeta: branchInfo?.remoteStockMeta,
+                silentAlerts: false
+            });
+            if (result.success) {
+                setBranchesStockStatus(prev => ({
+                    ...prev,
+                    [branch]: { ...prev[branch], status: 'up_to_date', isPendingStock: false }
+                }));
+                void refreshAllBranchesStockStatus();
+            } else {
+                setBranchesStockStatus(prev => ({
+                    ...prev,
+                    [branch]: { ...prev[branch], status: 'error', errorMessage: result.error || 'Erro na reclassificação' }
+                }));
+                alert(`Falha ao reclassificar a Filial ${branch}: ${result.error || 'Erro desconhecido'}`);
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            setBranchesStockStatus(prev => ({
+                ...prev,
+                [branch]: { ...prev[branch], status: 'error', errorMessage: msg }
+            }));
+            alert(`Erro ao reclassificar a Filial ${branch}: ${msg}`);
+        }
+    };
+
     const handleStartAudit = async (options?: unknown) => {
         const automaticClassificationMigration = !!(
             options &&
@@ -6029,220 +7294,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             isGlobalStockDifferentFromApplied(sourceFiles, globalStockMeta) ||
             hasPendingGlobalStructure
         );
-        const mergePreservingDone = (
-            baseData: AuditData,
-            rebuiltData: AuditData
-        ): {
-            merged: AuditData;
-            ignored: {
-                closedGroups: number;
-                closedDepartments: number;
-                categories: number;
-                skus: number;
-                units: number;
-            };
-        } => {
-            const cloneCategory = (cat: Category): Category => ({ ...cat, products: [...(cat.products || [])] });
-            const cloneDepartment = (dept: Department): Department => ({
-                ...dept,
-                categories: (dept.categories || []).map(cloneCategory)
-            });
-            const cloneGroup = (group: Group): Group => ({
-                ...group,
-                departments: (group.departments || []).map(cloneDepartment)
-            });
-
-            const normalizeRawKey = (value: unknown) => String(value ?? '').trim();
-            const normalizeDigitsKey = (value: unknown) =>
-                normalizeRawKey(value).replace(/\D/g, '').replace(/^0+/, '');
-            const normalizeLabelKey = (value: unknown) => normalizeLookupText(String(value ?? ''));
-
-            const isSameGroup = (a: Group, b: Group) => {
-                const aIdRaw = normalizeRawKey(a.id);
-                const bIdRaw = normalizeRawKey(b.id);
-                const aIdDigits = normalizeDigitsKey(a.id);
-                const bIdDigits = normalizeDigitsKey(b.id);
-                const byRawId = !!aIdRaw && !!bIdRaw && aIdRaw === bIdRaw;
-                const byDigits = !!aIdDigits && !!bIdDigits && aIdDigits === bIdDigits;
-                if ((aIdRaw || aIdDigits) && (bIdRaw || bIdDigits)) {
-                    return byRawId || byDigits;
-                }
-                const byName = normalizeLabelKey(a.name) && normalizeLabelKey(a.name) === normalizeLabelKey(b.name);
-                return byRawId || byDigits || byName;
-            };
-
-            const isSameDept = (a: Department, b: Department) => {
-                const aIdRaw = normalizeRawKey(a.id);
-                const bIdRaw = normalizeRawKey(b.id);
-                const aNumRaw = normalizeRawKey((a as any).numericId);
-                const bNumRaw = normalizeRawKey((b as any).numericId);
-                const aNumDigits = normalizeDigitsKey(aNumRaw || aIdRaw);
-                const bNumDigits = normalizeDigitsKey(bNumRaw || bIdRaw);
-                const byRawId = !!aIdRaw && !!bIdRaw && aIdRaw === bIdRaw;
-                const byNumeric = !!aNumDigits && !!bNumDigits && aNumDigits === bNumDigits;
-                const byName = normalizeLabelKey(a.name) && normalizeLabelKey(a.name) === normalizeLabelKey(b.name);
-                return byRawId || byNumeric || byName;
-            };
-
-            const findBaseGroup = (group: Group) =>
-                (baseData.groups || []).find(bg => isSameGroup(bg, group));
-            const findBaseDept = (baseGroup: Group | undefined, dept: Department) =>
-                (baseGroup?.departments || []).find(bd => isSameDept(bd, dept));
-            const isDeptClosed = (dept?: Department) =>
-                !!dept && (dept.categories || []).length > 0 && (dept.categories || []).every(c => isDoneStatus(c.status));
-            const isGroupClosed = (group?: Group) => {
-                if (!group) return false;
-                const cats = (group.departments || []).flatMap(d => d.categories || []);
-                return cats.length > 0 && cats.every(c => isDoneStatus(c.status));
-            };
-            const summarizeCategories = (categories: Category[] = []) => categories.reduce((acc, cat) => {
-                acc.categories += 1;
-                acc.skus += Number(cat.itemsCount || 0);
-                acc.units += Number(cat.totalQuantity || 0);
-                return acc;
-            }, { categories: 0, skus: 0, units: 0 });
-            const summarizeDepartment = (dept?: Department) =>
-                summarizeCategories((dept?.categories || []) as Category[]);
-            const summarizeGroup = (group?: Group) => (group?.departments || []).reduce((acc, dept) => {
-                const current = summarizeDepartment(dept);
-                acc.categories += current.categories;
-                acc.skus += current.skus;
-                acc.units += current.units;
-                return acc;
-            }, { categories: 0, skus: 0, units: 0 });
-            const ignored = {
-                closedGroups: 0,
-                closedDepartments: 0,
-                categories: 0,
-                skus: 0,
-                units: 0
-            };
-
-            const rebuiltFilteredGroups = rebuiltData.groups.map(group => {
-                const baseGroup = findBaseGroup(group);
-                if (isGroupClosed(baseGroup)) {
-                    // Grupo concluído: congela a estrutura inteira como estava.
-                    const blockedGroup = summarizeGroup(group);
-                    ignored.closedGroups += 1;
-                    ignored.categories += blockedGroup.categories;
-                    ignored.skus += blockedGroup.skus;
-                    ignored.units += blockedGroup.units;
-                    return cloneGroup(baseGroup!);
-                }
-
-                const nextDepartments = group.departments.map(dept => {
-                    const baseDept = findBaseDept(baseGroup, dept);
-                    if (isDeptClosed(baseDept)) {
-                        // Departamento concluído: não aceita categoria nova.
-                        const blockedDept = summarizeDepartment(dept);
-                        ignored.closedDepartments += 1;
-                        ignored.categories += blockedDept.categories;
-                        ignored.skus += blockedDept.skus;
-                        ignored.units += blockedDept.units;
-                        return cloneDepartment(baseDept!);
-                    }
-                    return {
-                        ...dept,
-                        categories: (dept.categories || []).map(cloneCategory)
-                    };
-                });
-
-                // Garante manutenção de departamentos já concluídos que não vieram no rebuild.
-                (baseGroup?.departments || []).forEach(baseDept => {
-                    if (!isDeptClosed(baseDept)) return;
-                    const alreadyIncluded = nextDepartments.some(
-                        d => d.id === baseDept.id || d.name === baseDept.name
-                    );
-                    if (!alreadyIncluded) nextDepartments.push(cloneDepartment(baseDept));
-                });
-
-                return {
-                    ...group,
-                    departments: nextDepartments
-                };
-            });
-
-            const merged: AuditData = {
-                ...rebuiltData,
-                termDrafts: baseData.termDrafts,
-                postAuditAdjustments: normalizePostAuditAdjustments((baseData as any).postAuditAdjustments),
-                partialStarts: baseData.partialStarts,
-                partialCompleted: baseData.partialCompleted,
-                lastPartialBatchId: baseData.lastPartialBatchId,
-                groups: rebuiltFilteredGroups
-            };
-            const ensureGroup = (groupId: string, groupName: string) => {
-                const probe: Group = { id: groupId, name: groupName, departments: [] };
-                let g = merged.groups.find(x => isSameGroup(x, probe));
-                if (!g) {
-                    g = { id: groupId, name: groupName, departments: [] };
-                    merged.groups.push(g);
-                }
-                return g;
-            };
-            const ensureDept = (group: Group, dept: Department) => {
-                let d = group.departments.find(x => isSameDept(x, dept));
-                if (!d) {
-                    d = { ...dept, categories: [] };
-                    group.departments.push(d);
-                }
-                return d;
-            };
-
-            baseData.groups.forEach(oldGroup => {
-                oldGroup.departments.forEach(oldDept => {
-                    oldDept.categories.forEach(oldCat => {
-                        if (!isDoneStatus(oldCat.status)) return;
-                        const group = ensureGroup(String(oldGroup.id), oldGroup.name);
-                        const dept = ensureDept(group, oldDept);
-                        const catId = oldCat.id;
-                        const idx = dept.categories.findIndex(c => c.id === catId || c.name === oldCat.name);
-                        if (idx >= 0) dept.categories[idx] = { ...oldCat };
-                        else dept.categories.push({ ...oldCat });
-                    });
-                });
-            });
-            const dedupedGroups: Group[] = [];
-            merged.groups.forEach(group => {
-                let targetGroup = dedupedGroups.find(existing => isSameGroup(existing, group));
-                if (!targetGroup) {
-                    dedupedGroups.push(cloneGroup(group));
-                    return;
-                }
-
-                group.departments.forEach(dept => {
-                    let targetDept = targetGroup!.departments.find(existing => isSameDept(existing, dept));
-                    if (!targetDept) {
-                        targetGroup!.departments.push(cloneDepartment(dept));
-                        return;
-                    }
-
-                    (dept.categories || []).forEach(cat => {
-                        const catIdx = (targetDept!.categories || []).findIndex(existing =>
-                            existing.id === cat.id || existing.name === cat.name
-                        );
-                        if (catIdx >= 0) {
-                            const existingCat = targetDept!.categories[catIdx];
-                            const incomingStatus = normalizeAuditStatus(cat.status);
-                            const existingStatus = normalizeAuditStatus(existingCat.status);
-                            const statusRank = (s: AuditStatus) =>
-                                s === AuditStatus.DONE ? 3 : s === AuditStatus.IN_PROGRESS ? 2 : 1;
-                            const keepIncoming =
-                                statusRank(incomingStatus) > statusRank(existingStatus) ||
-                                (statusRank(incomingStatus) === statusRank(existingStatus) &&
-                                    (cat.products?.length || 0) > (existingCat.products?.length || 0));
-                            if (keepIncoming) {
-                                targetDept!.categories[catIdx] = cloneCategory(cat);
-                            }
-                        } else {
-                            targetDept!.categories.push(cloneCategory(cat));
-                        }
-                    });
-                });
-            });
-            merged.groups = dedupedGroups;
-            return { merged, ignored };
-        };
 
         if (!effectiveStockFile) {
             alert("Arquivo de estoque não encontrado no Cadastro Base. Carregue o estoque no Cadastro Base e tente novamente.");
@@ -6263,6 +7314,33 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             if (!automaticClassificationMigration && !window.confirm("Reclassificar a estrutura aberta com os novos arquivos carregados?")) {
                 return;
             }
+            setIsProcessing(true);
+            try {
+                const result = await reclassifyBranchWithStock(selectedFilial, {
+                    stockFile: effectiveStockFile,
+                    stockMeta: globalStockMeta,
+                    openSession: {
+                        id: dbSessionId || latestOpenAudit?.id,
+                        branch: selectedFilial,
+                        audit_number: Number(getAuditNumberFromInventoryLabel((data as any)?.inventoryNumber) || latestOpenAudit?.audit_number || effectiveNextAuditNumber),
+                        status: 'open',
+                        data: data
+                    } as any,
+                    silentAlerts: false
+                });
+                if (result.success) {
+                    setView({ level: 'groups' });
+                    void refreshAllBranchesStockStatus();
+                } else {
+                    alert(`Erro na reclassificação: ${result.error || 'Falha ao reclassificar'}`);
+                }
+            } catch (err) {
+                const detail = err instanceof Error ? err.message : String(err);
+                alert(`Erro ao processar/salvar arquivos da auditoria.\n\nDetalhe: ${detail}`);
+            } finally {
+                setIsProcessing(false);
+            }
+            return;
         } else if (!shouldMergeStockOnly) {
             if (!window.confirm(`ATENÇÃO: Você está prestes a criar um NOVO inventário (Nº ${effectiveNextAuditNumber}) para a Filial ${selectedFilial}.\n\nDeseja realmente prosseguir?`)) {
                 return;
@@ -6271,10 +7349,6 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
         setIsProcessing(true);
         try {
-            const safePartialStarts = data
-                ? compactPartialScopesForAuditData(data, Array.isArray(data.partialStarts) ? data.partialStarts : [])
-                : [];
-
             if (shouldMergeStockOnly && data && !shouldReclassifyOpen) {
                 const stockSource = globalStockMeta ? 'global_base' : 'local_upload';
                 const syncedAt = getGlobalStockTimestampRaw(globalStockMeta);
@@ -6293,523 +7367,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             const rowsGroupsByFile = await Promise.all(effectiveGroupFiles.map(entry => readExcel(entry.file)));
             const rowsStock = await readExcel(effectiveStockFile);
+            const rowsDept = effectiveDeptIdsFile ? await readExcel(effectiveDeptIdsFile) : null;
+            const rowsCat = effectiveCatIdsFile ? await readExcel(effectiveCatIdsFile) : null;
 
-            type ProductScope = { groupId: string; groupName: string; deptId: string; deptName: string; catId: string; catName: string };
-            const productsByReduced: Record<string, ProductScope[]> = {};
-            const productsByName: Record<string, ProductScope[]> = {};
-            const catReportByReduced: Record<string, { catId: string; catName: string; deptName: string }> = {};
-            const deptReportByReduced: Record<string, { deptId: string; deptName: string }> = {};
-            const deptReportByName: Record<string, { deptId: string; deptName: string }> = {};
-            const catReportByName: Record<string, { catId: string; catName: string; deptName: string }> = {};
-            const deptIdByDescription: Record<string, string> = {};
-            const catIdByDescription: Record<string, string> = {};
-            const deptDescEntries: Array<{ key: string; id: string }> = [];
-            const catDescEntries: Array<{ key: string; id: string }> = [];
-
-            const normalizeDescriptionKey = (value: unknown) =>
-                normalizeLookupText(cleanDescription(String(value ?? '')));
-
-            const superClean = (str: unknown) => 
-                normalizeDescriptionKey(str).replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
-
-            const fillIdByDescription = (
-                rows: any[][],
-                output: Record<string, string>,
-                entries: Array<{ key: string; id: string }>,
-                prefix: 'DEPARTAMENTO' | 'CATEGORIA'
-            ) => {
-                rows.forEach(row => {
-                    if (!row) return;
-                    const parsed = parseHierarchySectionHeader(row, prefix);
-                    if (!parsed) return;
-                    const descKey = normalizeDescriptionKey(parsed.name);
-                    if (!descKey) return;
-                    if (!output[descKey]) output[descKey] = parsed.id;
-                    entries.push({ key: descKey, id: parsed.id });
-                });
-            };
-
-            const resolveIdByDescription = (
-                rawDesc: unknown,
-                map: Record<string, string>,
-                entries: Array<{ key: string; id: string }>
-            ) => {
-                const key = normalizeDescriptionKey(rawDesc);
-                if (!key) return '';
-                if (map[key]) return map[key];
-                // Fallback tolerante para descricoes com sufixos/prefixos nos relatorios.
-                const candidates = entries.filter(e =>
-                    e.key === key ||
-                    e.key.includes(key) ||
-                    key.includes(e.key)
-                );
-                if (candidates.length === 1) return candidates[0].id;
-                return '';
-            };
-
-            if (effectiveDeptIdsFile) {
-                const rowsDept = await readExcel(effectiveDeptIdsFile);
-                fillIdByDescription(rowsDept, deptIdByDescription, deptDescEntries, 'DEPARTAMENTO');
-                const deptColumns = detectGroupCadastroColumns(rowsDept);
-                let lastDeptId = "";
-                let lastDeptName = "";
-                rowsDept.forEach(row => {
-                    if (!row) return;
-                    const section = parseHierarchySectionHeader(row, 'DEPARTAMENTO');
-                    if (section) {
-                        lastDeptId = section.id;
-                        lastDeptName = section.name;
-                    }
-
-                    let inlineDeptId = lastDeptId;
-                    let inlineDeptName = lastDeptName;
-
-                    const rowDeptName = String(row[deptColumns.deptCol] ?? '').trim();
-                    if (rowDeptName && !isHierarchyPlaceholderName(rowDeptName, ['OUTROS', 'GERAL'])) {
-                        inlineDeptName = rowDeptName;
-                    }
-
-                    if (inlineDeptName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineDeptName.toUpperCase().includes('SEM CATEGORIA') || inlineDeptName.toUpperCase() === 'OUTROS') {
-                        inlineDeptId = "";
-                    }
-
-                    const rowName = String(row[deptColumns.nameCol] ?? '').trim();
-                    const nameKey = superClean(rowName);
-
-                    const deptData = { deptId: inlineDeptId, deptName: inlineDeptName };
-
-                    [row[deptColumns.codeCol], row[deptColumns.barcodeCol]].forEach(value => {
-                        const code = normalizeBarcode(value);
-                        if (code) deptReportByReduced[code] = deptData;
-                    });
-
-                    if (nameKey) deptReportByName[nameKey] = deptData;
-                });
-            }
-
-            if (effectiveCatIdsFile) {
-                const rowsCat = await readExcel(effectiveCatIdsFile);
-                fillIdByDescription(rowsCat, catIdByDescription, catDescEntries, 'CATEGORIA');
-                const catColumns = detectGroupCadastroColumns(rowsCat);
-                let lastCatId = "";
-                let lastCatName = "";
-                rowsCat.forEach(row => {
-                    if (!row) return;
-                    const section = parseHierarchySectionHeader(row, 'CATEGORIA');
-                    if (section) {
-                        lastCatId = section.id;
-                        lastCatName = section.name;
-                    }
-
-                    let inlineCatId = lastCatId;
-                    let inlineCatName = lastCatName;
-
-                    const rowCatName = String(row[catColumns.catCol] ?? '').trim();
-                    if (rowCatName && !isHierarchyPlaceholderName(rowCatName, ['OUTROS', 'GERAL'])) {
-                        inlineCatName = rowCatName;
-                    }
-
-                    if (inlineCatName.toUpperCase().includes('SEM DEPARTAMENTO') || inlineCatName.toUpperCase().includes('SEM CATEGORIA') || inlineCatName.toUpperCase() === 'OUTROS' || inlineCatName.toUpperCase() === 'GERAL') {
-                        inlineCatId = "";
-                    }
-
-                    const rowName = String(row[catColumns.nameCol] ?? '').trim();
-                    const nameKey = superClean(rowName);
-
-                    const deptName = String(row[catColumns.deptCol] ?? '').trim();
-                    const catData = { catId: inlineCatId, catName: inlineCatName, deptName };
-
-                    [row[catColumns.codeCol], row[catColumns.barcodeCol]].forEach(value => {
-                        const code = normalizeBarcode(value);
-                        if (code) catReportByReduced[code] = catData;
-                    });
-
-                    if (nameKey) catReportByName[nameKey] = catData;
-                });
-            }
-
-            const addScope = (bucket: Record<string, ProductScope[]>, key: string, scope: ProductScope) => {
-                if (!key) return;
-                const deptKey = scope.deptId || scope.deptName;
-                const catKey = scope.catId || scope.catName;
-                const scopeKey = `${scope.groupId}|${deptKey}|${catKey}`;
-                const list = bucket[key] || [];
-                if (!list.some(s => {
-                    const existingDeptKey = s.deptId || s.deptName;
-                    const existingCatKey = s.catId || s.catName;
-                    return `${s.groupId}|${existingDeptKey}|${existingCatKey}` === scopeKey;
-                })) {
-                    list.push(scope);
-                    bucket[key] = list;
-                }
-            };
-
-            const normalizeHierarchyLabel = (value: unknown) =>
-                normalizeLookupText(String(value ?? ''));
-            const isPlaceholderDeptName = (value: unknown) => {
-                const label = normalizeHierarchyLabel(value);
-                return !label || label === 'outros' || label === 'geral' || isDiversosLabel(String(value ?? ''));
-            };
-            const isPlaceholderCatName = (value: unknown) => {
-                const label = normalizeHierarchyLabel(value);
-                return !label || label === 'geral' || label === 'outros' || isDiversosLabel(String(value ?? ''));
-            };
-            const scopeFallbackBuckets = new Map<string, { scope: ProductScope; count: number }>();
-            const deptFallbackBuckets = new Map<string, { scope: ProductScope; count: number }>();
-            const groupFallbackScopeById: Record<string, ProductScope> = {};
-            const deptFallbackScopeByKey: Record<string, ProductScope> = {};
-            const upsertFallbackBucket = (
-                bucket: Map<string, { scope: ProductScope; count: number }>,
-                key: string,
-                scope: ProductScope
-            ) => {
-                if (!key) return;
-                const current = bucket.get(key);
-                if (current) {
-                    current.count += 1;
-                } else {
-                    bucket.set(key, { scope, count: 1 });
-                }
-            };
-            const registerFallbackScope = (scope: ProductScope) => {
-                if (!scope.groupId || isPlaceholderDeptName(scope.deptName) || isPlaceholderCatName(scope.catName)) return;
-                const groupKey = normalizeScopeId(scope.groupId);
-                if (!groupKey || !ALLOWED_IDS.includes(Number(groupKey))) return;
-                const scopeKey = `${groupKey}|${normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName)}|${normalizeScopeId(scope.catId) || normalizeHierarchyLabel(scope.catName)}`;
-                upsertFallbackBucket(scopeFallbackBuckets, scopeKey, scope);
-                const deptKey = `${groupKey}|${normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName)}|${scopeKey}`;
-                upsertFallbackBucket(deptFallbackBuckets, deptKey, scope);
-            };
-            const rebuildFallbackScopes = () => {
-                const bestByGroup = new Map<string, { scope: ProductScope; count: number }>();
-                scopeFallbackBuckets.forEach(entry => {
-                    const groupKey = normalizeScopeId(entry.scope.groupId);
-                    const current = bestByGroup.get(groupKey);
-                    if (!current || entry.count > current.count) bestByGroup.set(groupKey, entry);
-                });
-                bestByGroup.forEach((entry, groupKey) => {
-                    groupFallbackScopeById[groupKey] = entry.scope;
-                });
-
-                const bestByDept = new Map<string, { scope: ProductScope; count: number }>();
-                deptFallbackBuckets.forEach((entry, key) => {
-                    const [groupKey, deptKey] = key.split('|');
-                    const bestKey = `${groupKey}|${deptKey}`;
-                    const current = bestByDept.get(bestKey);
-                    if (!current || entry.count > current.count) bestByDept.set(bestKey, entry);
-                });
-                bestByDept.forEach((entry, key) => {
-                    deptFallbackScopeByKey[key] = entry.scope;
-                });
-            };
-            const getHierarchyFallbackScope = (scope: ProductScope) => {
-                const groupKey = normalizeScopeId(scope.groupId);
-                if (!groupKey) return null;
-                const deptKey = normalizeScopeId(scope.deptId) || normalizeHierarchyLabel(scope.deptName);
-                if (deptKey) {
-                    const deptFallback = deptFallbackScopeByKey[`${groupKey}|${deptKey}`];
-                    if (deptFallback) return deptFallback;
-                }
-                return groupFallbackScopeById[groupKey] || null;
-            };
-
-            const groupFileRows = effectiveGroupFiles.map((entry, idx) => ({
-                groupId: entry.groupId,
-                rows: rowsGroupsByFile[idx] || []
-            }));
-
-            groupFileRows.forEach(({ groupId, rows }) => {
-                const groupName = GROUP_CONFIG_DEFAULTS[groupId] || `Grupo ${groupId}`;
-                const columns = detectGroupCadastroColumns(rows);
-                const firstProductRow = columns.headerRowIndex >= 0 ? columns.headerRowIndex + 2 : 0;
-
-                rows.slice(firstProductRow).forEach((row) => {
-                    if (!row || row.length < 4) return;
-
-                    const productCodeCandidates = Array.from(new Set([
-                        normalizeBarcode(row[columns.codeCol]),
-                        normalizeBarcode(row[columns.barcodeCol])
-                    ].filter(Boolean)));
-                    if (productCodeCandidates.length === 0) return;
-
-                    const productNameKeyStr = String(row[columns.nameCol] || '').trim();
-                    const productNameKey = superClean(productNameKeyStr);
-
-                    const deptCell = parseHierarchyCells(row[columns.deptCol], '', "OUTROS", ['GERAL']);
-                    const catCell = parseHierarchyCells(row[columns.catCol], '', "GERAL", ['GERAL']);
-                    const deptResolvedId = deptCell.numericId || resolveIdByDescription(deptCell.name, deptIdByDescription, deptDescEntries);
-                    const catResolvedId = catCell.numericId || resolveIdByDescription(catCell.name, catIdByDescription, catDescEntries);
-
-                    const scope: ProductScope = {
-                        groupId,
-                        groupName,
-                        deptId: deptResolvedId,
-                        deptName: deptCell.name,
-                        catId: catResolvedId,
-                        catName: catCell.name
-                    };
-
-                    productCodeCandidates.forEach(codeCandidate => addScope(productsByReduced, codeCandidate, scope));
-                    addScope(productsByName, productNameKey, scope);
-                    registerFallbackScope(scope);
-                });
+            const nextData = await buildAuditStructureFromExcelRows({
+                rowsGroupsByFile,
+                groupFilesList: effectiveGroupFiles,
+                rowsStock,
+                rowsDept,
+                rowsCat,
+                selectedEmpresa,
+                selectedFilial,
+                inventoryNumber: inventoryNumber.trim(),
+                cadastroAliases: cadastroBarcodeAliasesByReduced,
+                existingOpenData: null
             });
 
-            rebuildFallbackScopes();
-
-            const stockCols = detectStockColumns(rowsStock);
-            const stockAcc: Record<string, { q: number; costAmount: number; name: string; groupId: string; barcodeAliases: string[] }> = {};
-            const groupsMap: Record<string, Group> = {};
-            const startRow = stockCols.headerRowIndex >= 0 ? stockCols.headerRowIndex + 1 : 0;
-            for (let r = startRow; r < rowsStock.length; r++) {
-                const row = rowsStock[r];
-                if (!row) continue;
-                const reduced = normalizeBarcode(row[stockCols.codeCol]);
-                if (!reduced) continue;
-                const barcodeAliases = collectProductCodeCandidates(row, 12, stockCols.codeCol).filter(code => code && code !== reduced);
-                const productName = row[stockCols.nameCol]?.toString() || row[stockCols.nameCol + 2]?.toString() || "Sem Descrição";
-                const stockQty = parseStockNumber(row[stockCols.qtyCol]);
-                const stockCost = parseStockNumber(row[stockCols.costCol]);
-                const groupRaw = row[stockCols.groupCol] ?? row[stockCols.isNewFormat ? 3 : 4] ?? row[6];
-                const stockGroupNum = parseSheetNumericCode(groupRaw) ?? parseSheetNumericCode(row[6]);
-                const stockGroupId = stockGroupNum !== null ? String(stockGroupNum) : '';
-                if (stockQty <= 0) continue;
-
-                const prev = stockAcc[reduced] || { q: 0, costAmount: 0, name: productName, groupId: stockGroupId, barcodeAliases: [] };
-                stockAcc[reduced] = {
-                    q: prev.q + stockQty,
-                    costAmount: prev.costAmount + (stockQty * stockCost),
-                    name: prev.name || productName,
-                    groupId: prev.groupId || stockGroupId,
-                    barcodeAliases: Array.from(new Set([...prev.barcodeAliases, ...barcodeAliases]))
-                };
-            }
-
-            const UNCLASSIFIED_GROUP_ID = '99999';
-            const UNCLASSIFIED_GROUP_NAME = 'NAO CLASSIFICADO (SEM GRUPO)';
-            const UNCLASSIFIED_DEPT_NAME = 'NAO CLASSIFICADO (SEM DEPARTAMENTO)';
-            const UNCLASSIFIED_CAT_NAME = 'NAO CLASSIFICADO (SEM CATEGORIA)';
-            const normalizeKeyRaw = (value: unknown) => String(value ?? '').trim();
-            const normalizeKeyDigits = (value: unknown) =>
-                normalizeKeyRaw(value).replace(/\D/g, '').replace(/^0+/, '');
-            const normalizeKeyLabel = (value: unknown) => normalizeLookupText(String(value ?? ''));
-            const resolveGroupKey = (groupId: unknown, groupName: unknown) =>
-                normalizeKeyDigits(groupId) || normalizeKeyLabel(groupName) || normalizeKeyRaw(groupId);
-            const resolveDeptKey = (deptId: unknown, deptName: unknown) =>
-                normalizeKeyDigits(deptId) || normalizeKeyLabel(deptName) || normalizeKeyRaw(deptId);
-            const closedGroupKeys = new Set<string>();
-            const closedDeptKeys = new Set<string>();
-
-            if (shouldReclassifyOpen && data) {
-                (data.groups || []).forEach(oldGroup => {
-                    const oldGroupKey = resolveGroupKey(oldGroup.id, oldGroup.name);
-                    const oldGroupCats = (oldGroup.departments || []).flatMap(d => d.categories || []);
-                    const isOldGroupClosed = oldGroupCats.length > 0 && oldGroupCats.every(c => isDoneStatus(c.status));
-                    if (isOldGroupClosed) {
-                        closedGroupKeys.add(oldGroupKey);
-                    }
-
-                    (oldGroup.departments || []).forEach(oldDept => {
-                        const oldDeptCats = oldDept.categories || [];
-                        const isOldDeptClosed = oldDeptCats.length > 0 && oldDeptCats.every(c => isDoneStatus(c.status));
-                        if (!isOldDeptClosed) return;
-                        const oldDeptKey = resolveDeptKey((oldDept as any).numericId || oldDept.id, oldDept.name);
-                        closedDeptKeys.add(`${oldGroupKey}|${oldDeptKey}`);
-                    });
-                });
-            }
-
-            Object.entries(stockAcc).forEach(([reduced, acc]) => {
-                const avgCost = acc.q > 0 ? (acc.costAmount / acc.q) : 0;
-                const nameKey = superClean(acc.name || "");
-                const scopesByReduced = productsByReduced[reduced] || [];
-                const scopesByName = nameKey ? (productsByName[nameKey] || []) : [];
-                const scopes = scopesByReduced.length > 0 ? scopesByReduced : scopesByName;
-                const manualClassification = PRODUCT_CLASSIFICATION_FIXES_BY_CODE[reduced];
-
-                let chosenScope: ProductScope | null = manualClassification
-                    ? { ...manualClassification }
-                    : null;
-                if (!chosenScope) {
-                    if (scopes.length > 0) {
-                        chosenScope = scopes.find(s => String(s.groupId) === String(acc.groupId)) || scopes[0];
-                    } else {
-                        const catFallback = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
-                        if (catFallback && acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId))) {
-                            const deptFallback = parseHierarchyCell(catFallback.deptName, "OUTROS");
-                            chosenScope = {
-                                groupId: acc.groupId,
-                                groupName: GROUP_CONFIG_DEFAULTS[acc.groupId] || `Grupo ${acc.groupId}`,
-                                deptId: deptFallback.numericId,
-                                deptName: deptFallback.name || "OUTROS",
-                                catId: catFallback.catId || "",
-                                catName: catFallback.catName || "GERAL"
-                            };
-                        }
-                    }
-                }
-                if (!chosenScope) {
-                    const hasAllowedStockGroup =
-                        !!acc.groupId && ALLOWED_IDS.includes(Number(acc.groupId));
-                    const fallbackGroupId = hasAllowedStockGroup ? acc.groupId : UNCLASSIFIED_GROUP_ID;
-                    const groupFallback = hasAllowedStockGroup ? groupFallbackScopeById[normalizeScopeId(fallbackGroupId)] : null;
-                    chosenScope = groupFallback
-                        ? { ...groupFallback }
-                        : {
-                            groupId: fallbackGroupId,
-                            groupName: hasAllowedStockGroup
-                                ? (GROUP_CONFIG_DEFAULTS[fallbackGroupId] || `Grupo ${fallbackGroupId}`)
-                                : UNCLASSIFIED_GROUP_NAME,
-                            deptId: '',
-                            deptName: UNCLASSIFIED_DEPT_NAME,
-                            catId: '',
-                            catName: UNCLASSIFIED_CAT_NAME
-                        };
-                }
-                const resolvedScope: ProductScope = { ...chosenScope };
-                const deptByReduced = deptReportByReduced[reduced] || (nameKey ? deptReportByName[nameKey] : undefined);
-                const catByReduced = catReportByReduced[reduced] || (nameKey ? catReportByName[nameKey] : undefined);
-                if (deptByReduced) {
-                    if (!resolvedScope.deptId && deptByReduced.deptId) {
-                        resolvedScope.deptId = deptByReduced.deptId;
-                    }
-                    if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS' || resolvedScope.deptName === UNCLASSIFIED_DEPT_NAME) && deptByReduced.deptName) {
-                        resolvedScope.deptName = deptByReduced.deptName;
-                    }
-                }
-                if (catByReduced) {
-                    if (!resolvedScope.catId && catByReduced.catId) {
-                        resolvedScope.catId = catByReduced.catId;
-                    }
-                    if ((!resolvedScope.catName || resolvedScope.catName === 'GERAL' || resolvedScope.catName === UNCLASSIFIED_CAT_NAME) && catByReduced.catName) {
-                        resolvedScope.catName = catByReduced.catName;
-                    }
-                    if (catByReduced.deptName) {
-                        if (!resolvedScope.deptId) {
-                            resolvedScope.deptId = resolveIdByDescription(catByReduced.deptName, deptIdByDescription, deptDescEntries);
-                        }
-                        if ((!resolvedScope.deptName || resolvedScope.deptName === 'OUTROS' || resolvedScope.deptName === UNCLASSIFIED_DEPT_NAME)) {
-                            const deptParsed = parseHierarchyCell(catByReduced.deptName, "OUTROS");
-                            resolvedScope.deptName = deptParsed.name || resolvedScope.deptName;
-                            if (!resolvedScope.deptId && deptParsed.numericId) {
-                                resolvedScope.deptId = deptParsed.numericId;
-                            }
-                        }
-                    }
-                }
-                const hierarchyFallback = getHierarchyFallbackScope(resolvedScope);
-                if (hierarchyFallback && (isPlaceholderDeptName(resolvedScope.deptName) || isPlaceholderCatName(resolvedScope.catName))) {
-                    if (isPlaceholderDeptName(resolvedScope.deptName)) {
-                        resolvedScope.deptId = hierarchyFallback.deptId;
-                        resolvedScope.deptName = hierarchyFallback.deptName;
-                    }
-                    if (isPlaceholderCatName(resolvedScope.catName)) {
-                        resolvedScope.catId = hierarchyFallback.catId;
-                        resolvedScope.catName = hierarchyFallback.catName;
-                    }
-                }
-
-                const finalGroupId = resolvedScope.groupId;
-                const finalGroupName = resolvedScope.groupName;
-                const finalGroupKey = resolveGroupKey(finalGroupId, finalGroupName);
-                const finalDeptKey = resolveDeptKey(resolvedScope.deptId || resolvedScope.deptName, resolvedScope.deptName);
-                if (closedGroupKeys.has(finalGroupKey) || closedDeptKeys.has(`${finalGroupKey}|${finalDeptKey}`)) {
-                    return;
-                }
-                if (!groupsMap[finalGroupId]) groupsMap[finalGroupId] = { id: finalGroupId, name: finalGroupName, departments: [] };
-
-                const deptIdentity = resolvedScope.deptId || resolvedScope.deptName;
-                let dept = groupsMap[finalGroupId].departments.find(d => d.id === deptIdentity || d.name === resolvedScope.deptName);
-                if (!dept) {
-                    dept = {
-                        id: deptIdentity,
-                        numericId: resolvedScope.deptId || undefined,
-                        name: resolvedScope.deptName,
-                        categories: []
-                    };
-                    groupsMap[finalGroupId].departments.push(dept);
-                } else if (!dept.numericId && resolvedScope.deptId) {
-                    dept.numericId = resolvedScope.deptId;
-                }
-
-                const catIdentity = resolvedScope.catId || resolvedScope.catName;
-                const catNodeId = `${finalGroupId}-${deptIdentity}-${catIdentity}`;
-                let cat = dept.categories.find(c => c.id === catNodeId || c.name === resolvedScope.catName);
-                if (!cat) {
-                    cat = {
-                        id: catNodeId,
-                        numericId: resolvedScope.catId || undefined,
-                        name: resolvedScope.catName,
-                        itemsCount: 0,
-                        totalQuantity: 0,
-                        totalCost: 0,
-                        status: AuditStatus.TODO,
-                        products: []
-                    };
-                    dept.categories.push(cat);
-                } else if (!cat.numericId && resolvedScope.catId) {
-                    cat.numericId = resolvedScope.catId;
-                }
-
-                cat.itemsCount++;
-                cat.totalQuantity += acc.q;
-                cat.totalCost += (acc.q * avgCost);
-                const cadastroAliases = cadastroBarcodeAliasesByReduced[normalizeProductLookupCode(reduced)] || [];
-                const allBarcodeAliases = Array.from(new Set([...acc.barcodeAliases, ...cadastroAliases]));
-                const primaryBarcode = allBarcodeAliases.find(code => code.length >= 8) || allBarcodeAliases[0] || '';
-                cat.products.push({
-                    code: primaryBarcode || reduced,
-                    reducedCode: reduced,
-                    barcode: primaryBarcode || undefined,
-                    barcodeAliases: allBarcodeAliases,
-                    name: acc.name,
-                    quantity: acc.q,
-                    cost: avgCost
-                });
-            });
-
-            const nextData: AuditData = {
-                groups: Object.values(groupsMap).sort((a, b) => parseInt(a.id.split('+')[0]) - parseInt(b.id.split('+')[0])),
-                empresa: selectedEmpresa,
-                filial: selectedFilial,
-                inventoryNumber: inventoryNumber.trim()
-            };
-            const mergeResult = (shouldReclassifyOpen && data) ? mergePreservingDone(data, nextData) : null;
-            const finalData = mergeResult?.merged || nextData;
-            const finalTermDrafts = (shouldReclassifyOpen && data)
-                ? (composeTermDraftsForPersist(((data as any).termDrafts || {}) as Record<string, TermForm>, termDrafts) as Record<string, any>)
-                : {};
-            const finalPostAuditAdjustments = (shouldReclassifyOpen && data)
-                ? normalizePostAuditAdjustments((data as any).postAuditAdjustments)
-                : [];
             const basePersistedData = {
-                ...finalData,
-                postAuditAdjustments: finalPostAuditAdjustments,
-                termDrafts: finalTermDrafts,
+                ...nextData,
+                postAuditAdjustments: [],
+                termDrafts: {},
                 sourceFiles: buildStructureSourceMeta({ stockSyncedAt: getGlobalStockTimestampRaw(globalStockMeta) })
             } as any;
-            const persistedData = applyPartialScopes(
-                basePersistedData,
-                shouldReclassifyOpen ? safePartialStarts : []
-            );
+            const persistedData = applyPartialScopes(basePersistedData, []);
             const progress = calculateProgress(persistedData as AuditData);
-            const currentAuditNumber = data
-                ? getAuditNumberFromInventoryLabel((data as any)?.inventoryNumber)
-                : null;
-            const targetAuditNumber = Number(
-                (shouldReclassifyOpen
-                    ? (currentAuditNumber || latestOpenAudit?.audit_number)
-                    : effectiveNextAuditNumber) || 1
-            );
-            const targetSessionId = shouldReclassifyOpen
-                ? ((
-                    latestOpenAudit && Number(latestOpenAudit.audit_number || 0) === targetAuditNumber
-                        ? latestOpenAudit.id
-                        : undefined
-                ) || dbSessionId)
-                : dbSessionId;
+            const targetAuditNumber = Number(effectiveNextAuditNumber || 1);
+
             const savedSession = await persistAuditSession({
-                id: targetSessionId,
+                id: dbSessionId,
                 branch: selectedFilial,
                 audit_number: targetAuditNumber,
                 status: 'open',
@@ -6817,21 +7402,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 progress: progress,
                 user_email: userEmail
             }, {
-                allowProgressRegression: !!shouldReclassifyOpen,
-                allowCreate: !shouldReclassifyOpen,
+                allowProgressRegression: false,
+                allowCreate: true,
                 requireRemote: true
             });
             if (!savedSession) {
-                throw new Error(shouldReclassifyOpen
-                    ? "Falha ao salvar a reclassificação da auditoria aberta no Banco de Dados."
-                    : "Falha ao salvar auditoria inicial no Banco de Dados."
-                );
+                throw new Error("Falha ao salvar auditoria inicial no Banco de Dados.");
             }
 
             if (savedSession.id) setDbSessionId(savedSession.id);
             setNextAuditNumber(savedSession.audit_number);
             setAllowActiveAuditAutoOpen(true);
-            setTermDrafts(finalTermDrafts as any);
+            setTermDrafts({});
             const savedData = (savedSession.data as AuditData) || (persistedData as AuditData);
             setData(savedData);
             setGroupFiles(createInitialGroupFiles());
@@ -6841,19 +7423,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             setIsUpdatingStock(false);
             setView({ level: 'groups' });
             onAuditSessionChanged?.(savedSession);
-            if (shouldReclassifyOpen) {
-                alert("Saldos reclassificados e sincronizados com sucesso.");
-            }
-            if (mergeResult && (mergeResult.ignored.closedGroups > 0 || mergeResult.ignored.closedDepartments > 0)) {
-                alert(
-                    `Reclassificação concluída com bloqueio de escopo finalizado.\n\n` +
-                    `Grupos concluídos bloqueados: ${mergeResult.ignored.closedGroups}\n` +
-                    `Departamentos concluídos bloqueados: ${mergeResult.ignored.closedDepartments}\n` +
-                    `Categorias ignoradas: ${mergeResult.ignored.categories.toLocaleString('pt-BR')}\n` +
-                    `SKUs ignorados: ${mergeResult.ignored.skus.toLocaleString('pt-BR')}\n` +
-                    `Unidades ignoradas: ${Math.round(mergeResult.ignored.units).toLocaleString('pt-BR')}`
-                );
-            }
+            void refreshAllBranchesStockStatus();
         } catch (err) {
             const detail = err instanceof Error
                 ? err.message
@@ -12810,8 +13380,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const structureLocked = !!(data && data.groups && data.groups.length > 0);
         const updateOnlyMode = isUpdatingStock || structureLocked;
         return (
-            <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 font-sans">
-                <div className="max-w-2xl w-full bg-white rounded-[2rem] shadow-2xl overflow-hidden">
+            <div className="min-h-screen bg-slate-950 flex flex-col xl:flex-row items-center xl:items-start justify-center p-4 sm:p-6 gap-6 font-sans">
+                <div className="max-w-2xl w-full bg-white rounded-[2rem] shadow-2xl overflow-hidden shrink-0">
                     <div className="bg-indigo-600 p-10 text-center text-white">
                         <h1 className="text-4xl font-black italic tracking-tighter">AuditFlow</h1>
                         <p className="text-indigo-200 text-[10px] uppercase font-bold tracking-widest mt-1 italic">Sistema de Auditoria Master</p>
@@ -13121,6 +13691,328 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                         )}
                     </div>
                 </div>
+
+                {canUseAuditMasterTools && (
+                    <div className="w-full xl:w-[480px] bg-slate-900 border border-slate-800 rounded-[2rem] shadow-2xl overflow-hidden shrink-0 text-white flex flex-col">
+                        {/* Header do Painel */}
+                        <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 border-b border-slate-800 p-6 flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                                <div className="w-10 h-10 rounded-2xl bg-indigo-600/30 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                                    <Boxes className="w-5 h-5" />
+                                </div>
+                                <div>
+                                    <h2 className="text-base font-black text-white tracking-tight">
+                                        Status de Estoque por Loja
+                                    </h2>
+                                    <p className="text-[10px] uppercase font-bold tracking-widest text-indigo-300">
+                                        {isMaster ? 'Visão Master' : `Área ${userArea || ''}`} • Sincronização em Massa
+                                    </p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {(isLoadingBranchesStock || isMassReclassifying) && (
+                                    <button
+                                        type="button"
+                                        onClick={handleStopSync}
+                                        title="Parar sincronização em andamento"
+                                        className="px-2.5 py-1.5 rounded-xl border border-rose-500/50 bg-rose-950/70 text-rose-300 hover:text-white hover:bg-rose-900/80 flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider transition-all cursor-pointer shadow-md shadow-rose-950/50"
+                                    >
+                                        <Square className="w-3 h-3 fill-current text-rose-400" />
+                                        Parar
+                                    </button>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={() => void refreshAllBranchesStockStatus()}
+                                    disabled={isLoadingBranchesStock || isMassReclassifying}
+                                    title="Recarregar status das filiais"
+                                    className="w-9 h-9 rounded-xl border border-slate-700 bg-slate-800/80 text-slate-300 hover:text-white hover:bg-slate-700 flex items-center justify-center transition-all disabled:opacity-50"
+                                >
+                                    <RefreshCw className={`w-4 h-4 ${isLoadingBranchesStock ? 'animate-spin text-indigo-400' : ''}`} />
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Card de Resumo e Botão Geral por Área */}
+                        <div className="p-5 border-b border-slate-800/80 bg-slate-950/40 space-y-4">
+                            <div className="grid grid-cols-3 gap-2">
+                                <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-2.5 text-center">
+                                    <span className="text-[9px] font-black uppercase tracking-wider text-slate-400 block">Lojas</span>
+                                    <span className="text-base font-black text-white">{allowedAuditBranches.length}</span>
+                                </div>
+                                <div className="bg-amber-950/30 border border-amber-800/40 rounded-xl p-2.5 text-center">
+                                    <span className="text-[9px] font-black uppercase tracking-wider text-amber-400 block">Novo Estoque</span>
+                                    <span className="text-base font-black text-amber-400">
+                                        {hasCheckedBranchesStock
+                                            ? allowedAuditBranches.filter(b => branchesStockStatus[b]?.status === 'pending').length
+                                            : '—'}
+                                    </span>
+                                </div>
+                                <div className="bg-emerald-950/30 border border-emerald-800/40 rounded-xl p-2.5 text-center">
+                                    <span className="text-[9px] font-black uppercase tracking-wider text-emerald-400 block">Atualizadas</span>
+                                    <span className="text-base font-black text-emerald-400">
+                                        {hasCheckedBranchesStock
+                                            ? allowedAuditBranches.filter(b => branchesStockStatus[b]?.status === 'up_to_date').length
+                                            : '—'}
+                                    </span>
+                                </div>
+                            </div>
+
+                            {/* Progresso de Execução em Massa */}
+                            {isMassReclassifying && massProgress && (
+                                <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/40 p-3 space-y-2">
+                                    <div className="flex items-center justify-between text-[11px] font-bold text-indigo-200">
+                                        <span className="flex items-center gap-2">
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                                            Reclassificando Filial {massProgress.currentBranch}...
+                                        </span>
+                                        <span className="font-mono text-indigo-300">
+                                            {massProgress.current} / {massProgress.total}
+                                        </span>
+                                    </div>
+                                    <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                                        <div
+                                            className="h-full bg-gradient-to-r from-indigo-500 to-violet-500 transition-all duration-300"
+                                            style={{ width: `${(massProgress.current / massProgress.total) * 100}%` }}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Botão de Parar Sincronização em Destaque */}
+                            {(isLoadingBranchesStock || isMassReclassifying) && (
+                                <button
+                                    type="button"
+                                    onClick={handleStopSync}
+                                    className="w-full py-2.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider bg-rose-600/90 hover:bg-rose-500 active:scale-[0.98] text-white border border-rose-400/50 shadow-lg shadow-rose-950/40 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                                >
+                                    <Square className="w-3.5 h-3.5 fill-current text-white" />
+                                    Parar Sincronização
+                                </button>
+                            )}
+
+                            {/* Botão Geral por Área */}
+                            {(() => {
+                                if (!hasCheckedBranchesStock) {
+                                    return (
+                                        <div className="space-y-1.5">
+                                            <button
+                                                type="button"
+                                                onClick={() => void refreshAllBranchesStockStatus()}
+                                                disabled={isLoadingBranchesStock}
+                                                className="w-full py-3.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider shadow-xl transition-all flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 via-indigo-500 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white shadow-indigo-950/50 cursor-pointer active:scale-[0.98] disabled:opacity-50"
+                                            >
+                                                {isLoadingBranchesStock ? (
+                                                    <>
+                                                        <Loader2 className="w-4 h-4 animate-spin text-white" />
+                                                        Verificando estoques em lote...
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <Search className="w-4 h-4 text-indigo-200" />
+                                                        Verificar Estoques das Filiais
+                                                    </>
+                                                )}
+                                            </button>
+                                            <p className="text-[10px] text-center text-slate-400 font-medium">
+                                                Clique para verificar se há novos estoques carregados no Cadastro Base.
+                                            </p>
+                                        </div>
+                                    );
+                                }
+
+                                const pendingCount = allowedAuditBranches.filter(b => branchesStockStatus[b]?.status === 'pending').length;
+                                const isPending = pendingCount > 0;
+                                return (
+                                    <div className="space-y-1.5">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                if (isPending) {
+                                                    void handleMassReclassify();
+                                                } else {
+                                                    void refreshAllBranchesStockStatus();
+                                                }
+                                            }}
+                                            disabled={isMassReclassifying || isLoadingBranchesStock}
+                                            className={`w-full py-3.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider shadow-xl transition-all flex items-center justify-center gap-2 active:scale-[0.98] ${
+                                                isPending
+                                                    ? 'bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 hover:from-amber-400 hover:to-orange-500 text-white shadow-amber-950/50 cursor-pointer'
+                                                    : 'bg-emerald-950/40 border border-emerald-600/40 text-emerald-300 hover:bg-emerald-900/40 cursor-pointer'
+                                            } ${isMassReclassifying || isLoadingBranchesStock ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                        >
+                                            {isMassReclassifying ? (
+                                                <>
+                                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                                    Reclassificando em massa...
+                                                </>
+                                            ) : isLoadingBranchesStock ? (
+                                                <>
+                                                    <Loader2 className="w-4 h-4 animate-spin text-white" />
+                                                    Verificando filiais...
+                                                </>
+                                            ) : isPending ? (
+                                                <>
+                                                    <Activity className="w-4 h-4 text-amber-200" />
+                                                    Reclassificar Todas com Novo Estoque ({pendingCount})
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                                                    Todas as Lojas Estão Atualizadas
+                                                </>
+                                            )}
+                                        </button>
+                                        {!isPending && !isLoadingBranchesStock && !isMassReclassifying && (
+                                            <p className="text-[10px] text-center text-slate-400 font-medium">
+                                                Nenhum estoque pendente. Clique para verificar novamente se desejar.
+                                            </p>
+                                        )}
+                                    </div>
+                                );
+                            })()}
+                        </div>
+
+                        {/* Lista Loja a Loja */}
+                        <div className="p-4 flex-1 overflow-y-auto max-h-[480px] space-y-2.5">
+                            {allowedAuditBranches.length === 0 ? (
+                                <div className="py-12 text-center text-slate-500 text-xs">
+                                    Nenhuma filial permitida encontrada para esta área.
+                                </div>
+                            ) : (
+                                allowedAuditBranches.map(branch => {
+                                    const info = branchesStockStatus[branch];
+                                    const status = !hasCheckedBranchesStock ? 'idle' : (info?.status || 'loading');
+                                    const isBranchProcessing = status === 'processing';
+                                    const isPending = status === 'pending';
+                                    const isUpToDate = status === 'up_to_date';
+                                    const hasOpen = info?.hasOpenAudit;
+
+                                    return (
+                                        <div
+                                            key={`stock-status-${branch}`}
+                                            className={`rounded-2xl border p-3.5 transition-all ${
+                                                isPending
+                                                    ? 'bg-amber-950/20 border-amber-500/40 shadow-sm shadow-amber-950/20'
+                                                    : isUpToDate
+                                                    ? 'bg-slate-800/50 border-slate-700/60'
+                                                    : 'bg-slate-800/30 border-slate-800'
+                                            }`}
+                                        >
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-sm font-black text-white">Filial {branch}</span>
+                                                    {hasOpen ? (
+                                                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-indigo-950/80 border border-indigo-700/50 text-indigo-300">
+                                                            Inv. Nº {info.openAuditNumber}
+                                                        </span>
+                                                    ) : hasCheckedBranchesStock ? (
+                                                        <span className="text-[10px] font-semibold text-slate-400">
+                                                            Sem inv. aberto
+                                                        </span>
+                                                    ) : null}
+                                                </div>
+
+                                                {/* Status Badge */}
+                                                <div>
+                                                    {status === 'idle' && (
+                                                        <span className="text-[10px] font-semibold text-slate-400 flex items-center gap-1.5">
+                                                            <span className="w-1.5 h-1.5 rounded-full bg-slate-500 inline-block" /> Aguardando verificação
+                                                        </span>
+                                                    )}
+                                                    {status === 'loading' && (
+                                                        <span className="text-[10px] font-bold text-slate-400 flex items-center gap-1">
+                                                            <Loader2 className="w-3 h-3 animate-spin text-slate-400" /> Verificando...
+                                                        </span>
+                                                    )}
+                                                    {status === 'processing' && (
+                                                        <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 flex items-center gap-1 animate-pulse">
+                                                            <Loader2 className="w-3 h-3 animate-spin text-indigo-400" /> Reclassificando
+                                                        </span>
+                                                    )}
+                                                    {isPending && (
+                                                        <span className="text-[10px] font-black uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 flex items-center gap-1">
+                                                            <Activity className="w-3 h-3 text-amber-400" /> Novo Estoque
+                                                        </span>
+                                                    )}
+                                                    {isUpToDate && (
+                                                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 flex items-center gap-1">
+                                                            <Check className="w-3 h-3 text-emerald-400" /> Sincronizado
+                                                        </span>
+                                                    )}
+                                                    {status === 'no_open_audit' && (
+                                                        <span className="text-[10px] font-semibold text-slate-400">
+                                                            Sem inventário
+                                                        </span>
+                                                    )}
+                                                    {status === 'no_base_stock' && (
+                                                        <span className="text-[10px] font-semibold text-slate-400">
+                                                            Sem arquivo base
+                                                        </span>
+                                                    )}
+                                                    {status === 'error' && (
+                                                        <span className="text-[10px] font-bold text-red-400">
+                                                            Erro ao verificar
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* Informações de datas */}
+                                            <div className="mt-2 text-[11px] text-slate-400 space-y-0.5">
+                                                <div className="flex items-center justify-between text-[10px]">
+                                                    <span className="text-slate-400">Sincronizado na auditoria:</span>
+                                                    <span className="font-semibold text-slate-300">
+                                                        {hasCheckedBranchesStock && info?.openAuditSyncedStockAt ? formatGlobalTimestamp(info.openAuditSyncedStockAt) : (hasCheckedBranchesStock && hasOpen ? 'Não aplicado' : '—')}
+                                                    </span>
+                                                </div>
+                                                <div className="flex items-center justify-between text-[10px]">
+                                                    <span className="text-slate-400">Novo no Cadastro Base:</span>
+                                                    <span className="font-semibold text-slate-200">
+                                                        {hasCheckedBranchesStock && info?.remoteStockUpdatedAt ? formatGlobalTimestamp(info.remoteStockUpdatedAt) : (hasCheckedBranchesStock ? 'Não carregado' : '—')}
+                                                    </span>
+                                                </div>
+                                            </div>
+
+                                            {/* Botão de ação por loja */}
+                                            {hasOpen && (
+                                                <div className="mt-3 flex items-center justify-end gap-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => void handleSingleBranchReclassify(branch)}
+                                                        disabled={isBranchProcessing || isMassReclassifying}
+                                                        className={`px-3 py-1.5 rounded-xl font-black text-[10px] uppercase tracking-wider transition-all flex items-center gap-1.5 ${
+                                                            isPending
+                                                                ? 'bg-amber-500 hover:bg-amber-400 text-white shadow-md shadow-amber-950/30 cursor-pointer'
+                                                                : 'bg-slate-700/60 hover:bg-slate-700 text-slate-300 border border-slate-600/50 cursor-pointer'
+                                                        } disabled:opacity-50 disabled:cursor-not-allowed`}
+                                                    >
+                                                        {isBranchProcessing ? (
+                                                            <>
+                                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                                Processando...
+                                                            </>
+                                                        ) : isPending ? (
+                                                            <>
+                                                                <Activity className="w-3 h-3" />
+                                                                Reclassificar Loja
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                <RefreshCw className="w-3 h-3 text-slate-400" />
+                                                                Forçar Reclassificação
+                                                            </>
+                                                        )}
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })
+                            )}
+                        </div>
+                    </div>
+                )}
             </div>
         );
     }
