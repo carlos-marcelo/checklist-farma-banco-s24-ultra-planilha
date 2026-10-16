@@ -5147,9 +5147,9 @@ const App: React.FC = () => {
 
     const lastDraftUpdateRef = useRef<string | null>(null);
 
-    // Sincronização bidirecional - Puxa do Supabase apenas quando usuário está INATIVO
+    // Sincronização bidirecional - Puxa do Supabase apenas quando usuário está INATIVO e na tela de checklist
     useEffect(() => {
-        if (!currentUser || !draftLoaded) return;
+        if (!currentUser || !draftLoaded || currentView !== 'checklist') return;
 
         const syncRemoteDraft = async () => {
             if (draftRemoteSyncInFlightRef.current) return;
@@ -5158,7 +5158,6 @@ const App: React.FC = () => {
 
             // Pausar sync se usuário está digitando/editando (ativo nos últimos 5 segundos)
             if (timeSinceActivity < ACTIVITY_TIMEOUT) {
-                console.log('⏸️ Sync pausado - usuário está editando');
                 return;
             }
 
@@ -5172,6 +5171,7 @@ const App: React.FC = () => {
                     return;
                 }
 
+                lastDraftUpdateRef.current = meta.updated_at;
                 console.log('🔄 Mudança detectada no rascunho remoto, baixando...');
                 const remoteDraft = await CacheService.fetchWithCache(`draft_${currentUser.email}`, () => SupabaseService.fetchDraft(currentUser.email));
 

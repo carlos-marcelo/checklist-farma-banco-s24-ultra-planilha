@@ -1442,29 +1442,7 @@ export async function replaceAuditPostAdjustments(params: {
   if (!branch || !auditNumber) return null;
 
   try {
-    // Caminho atômico: a função bloqueia apenas a sessão alvo e aplica um patch
-    // por ID, sem regravar o restante do JSON da auditoria.
-    const { data: atomicData, error: atomicError } = await supabase.rpc('apply_audit_post_adjustments', {
-      p_branch: branch,
-      p_audit_number: auditNumber,
-      p_adjustments: normalizeAuditAdjustmentList(params.adjustments),
-      p_deleted_adjustment_ids: (params.deletedAdjustmentIds || []).map(String),
-      p_user_email: params.userEmail || null
-    });
-    if (!atomicError && atomicData) {
-      const atomicSession = (Array.isArray(atomicData) ? atomicData[0] : atomicData) as DbAuditSession | undefined;
-      if (atomicSession) return atomicSession;
-    }
-
-    const missingRpc = atomicError && (
-      atomicError.code === '42883' ||
-      atomicError.code === 'PGRST202' ||
-      /apply_audit_post_adjustments/i.test(String(atomicError.message || '')) &&
-      /not find|does not exist|schema cache/i.test(String(atomicError.message || ''))
-    );
-    if (atomicError && !missingRpc) throw atomicError;
-
-    // Compatibilidade temporária enquanto a migration ainda não foi aplicada.
+    // Carrega a sessão existente e atualiza os ajustes diretamente
     const existing = await fetchAuditSession(branch, auditNumber);
     if (!existing || existing.status === 'completed' || !existing.data) return null;
 

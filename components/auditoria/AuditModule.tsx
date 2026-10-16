@@ -2321,9 +2321,12 @@ const getAuthoritativeTermMetrics = (
     if (!merged) return null;
 
     const cleanItems = (Array.isArray(merged.items) ? merged.items : []).filter((item: any) => !isTermMetadataRow(item));
-    const officialDiffCost = getOfficialTermDiffCost(merged);
+    const poolOfficialDiffCost = merged?.officialDiffCost ?? merged?.diffCost;
     const totals = cleanItems.length > 0
-        ? summarizeTermRows(cleanItems)
+        ? {
+            ...summarizeTermRows(cleanItems),
+            ...(poolOfficialDiffCost !== undefined && poolOfficialDiffCost !== null ? { diffCost: roundAuditMoney(poolOfficialDiffCost) } : {})
+          }
         : {
             sysQty: Number(merged.sysQty || 0),
             sysCost: roundAuditMoney(merged.sysCost),
@@ -2673,6 +2676,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     };
     const cadastroBaseIndexRef = useRef<Map<string, CadastroBaseEntry>>(new Map());
     const cadastroBaseIndexReadyRef = useRef(false);
+    const cadastroBaseBuiltSignatureRef = useRef<string>('');
     const postAuditAdjustmentsRef = useRef<PostAuditAdjustment[]>([]);
     const postAdjustmentSyncQueueRef = useRef<Promise<void>>(Promise.resolve());
     const postAdjustmentQueuedTokensRef = useRef<Set<string>>(new Set());
@@ -2682,6 +2686,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     const postAdjustmentCodeInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentQtyInputRef = useRef<HTMLInputElement | null>(null);
     const postAdjustmentNoteInputRef = useRef<HTMLTextAreaElement | null>(null);
+    const postAdjustmentExcelInputRef = useRef<HTMLInputElement | null>(null);
+    const [isImportingAdjustmentsExcel, setIsImportingAdjustmentsExcel] = useState(false);
     const removedExcelDraftKeysRef = useRef<Set<string>>(new Set());
     useEffect(() => { dataRef.current = data; }, [data]);
     const [selectedEmpresa, setSelectedEmpresa] = useState(() => String(initialCompanyName || "Drogaria Cidade"));
@@ -2858,6 +2864,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
     useEffect(() => {
         activeFilialRef.current = selectedFilial || '';
+        postAuditAdjustmentsRef.current = [];
+        setPostAdjustmentError(null);
     }, [selectedFilial]);
 
     const isAuditDataForBranch = useCallback((auditData: AuditData | null | undefined, branch: string | number | null | undefined) => {
@@ -5446,16 +5454,28 @@ const AuditModule: React.FC<AuditModuleProps> = ({
     }, [globalGroupFiles, shouldPrepareBarcodeAliases]);
 
     // Constroi indice local do cadastro base em background (estoque + arquivos de grupo)
-    // Roda somente quando os arquivos mudam — NAO bloqueia a UI
     useEffect(() => {
         const stockFile = globalStockFile;
         const groupFiles = GROUP_UPLOAD_IDS
             .map(groupId => ({ groupId, file: globalGroupFiles[groupId] }))
             .filter((entry): entry is { groupId: GroupUploadId; file: File } => !!entry.file);
 
+        const currentSignature = [
+            stockFile ? `${stockFile.name}:${stockFile.size}:${stockFile.lastModified}` : '',
+            globalDeptIdsFile ? `${globalDeptIdsFile.name}:${globalDeptIdsFile.size}` : '',
+            globalCatIdsFile ? `${globalCatIdsFile.name}:${globalCatIdsFile.size}` : '',
+            ...groupFiles.map(g => `${g.groupId}:${g.file.name}:${g.file.size}:${g.file.lastModified}`)
+        ].join('|');
+
+        if (currentSignature === cadastroBaseBuiltSignatureRef.current && cadastroBaseIndexRef.current.size > 0) {
+            cadastroBaseIndexReadyRef.current = true;
+            return;
+        }
+
         if (!stockFile && groupFiles.length === 0) {
             cadastroBaseIndexRef.current = new Map();
             cadastroBaseIndexReadyRef.current = false;
+            cadastroBaseBuiltSignatureRef.current = '';
             return;
         }
 
@@ -5621,6 +5641,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 if (!cancelled) {
                     cadastroBaseIndexRef.current = index;
                     cadastroBaseIndexReadyRef.current = true;
+                    cadastroBaseBuiltSignatureRef.current = currentSignature;
                     console.log(`[AuditFlow] cadastroBaseIndex construido: ${index.size} entradas`);
                 }
             } catch (err) {
@@ -6899,18 +6920,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 return loadingMap;
             });
 
-            const stockKeys = allowedAuditBranches.map(b => buildSharedStockModuleKey(b));
-
-            // Executa em lote apenas 2 consultas leves concorrentes
+            // Executa em lote 2 consultas leves e diretas:
+            // 1. Arquivos de estoque do Cadastro Base desta empresa (somente metadados leves)
+            // 2. Inventários com status 'open' (somente cabeçalho leve, sem payload de produtos)
             const [stockFilesRes, openAuditsRes] = await Promise.all([
                 supabase
                     .from('global_base_files')
                     .select('id, company_id, module_key, file_name, file_size, uploaded_by, uploaded_at, updated_at')
-                    .in('module_key', stockKeys),
+                    .eq('company_id', companyId),
                 supabase
                     .from('audit_sessions')
-                    .select('id, branch, audit_number, status, updated_at, data')
-                    .in('branch', allowedAuditBranches)
+                    .select('id, branch, audit_number, status, updated_at')
                     .eq('status', 'open')
             ]);
 
@@ -6957,9 +6977,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 const hasRemoteStock = !!remoteStockMeta;
                 const remoteStockUpdatedAt = remoteStockMeta ? getGlobalStockTimestampRaw(remoteStockMeta) : null;
 
-                // Se a filial aberta for a atual selecionada e já temos o data em memória, usamos ele
                 let openAuditSession = openAuditByBranch.get(branch) || null;
-                if (selectedFilial === branch && data) {
+                const isSelectedBranch = selectedFilial === branch;
+
+                // Se a filial aberta for a atual selecionada e já temos o data em memória, usamos ele diretamente
+                if (isSelectedBranch && data) {
                     openAuditSession = {
                         id: dbSessionId || openAuditSession?.id || '',
                         branch,
@@ -6975,20 +6997,30 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 let isPendingClassification = false;
                 let isPendingStructure = false;
 
-                if (hasOpenAudit && openAuditSession?.data) {
-                    const sourceFiles = (openAuditSession.data as any).sourceFiles || {};
-                    appliedStockTs = getAppliedStockTimestampRaw(sourceFiles);
-                    if (hasRemoteStock && remoteStockMeta) {
-                        isPendingStock = isGlobalStockDifferentFromApplied(sourceFiles, remoteStockMeta);
+                if (hasOpenAudit) {
+                    if (isSelectedBranch && data) {
+                        const sourceFiles = (data as any)?.sourceFiles || {};
+                        appliedStockTs = getAppliedStockTimestampRaw(sourceFiles);
+                        if (hasRemoteStock && remoteStockMeta) {
+                            isPendingStock = isGlobalStockDifferentFromApplied(sourceFiles, remoteStockMeta);
+                        }
+                        isPendingClassification = isAuditClassificationOutdated(sourceFiles, data);
+                        isPendingStructure = isGlobalAuditStructureDifferentFromApplied(
+                            sourceFiles,
+                            globalBaseMetaRef.current.groups,
+                            globalBaseMetaRef.current.dept,
+                            globalBaseMetaRef.current.cat,
+                            data
+                        );
+                    } else if (hasRemoteStock && remoteStockUpdatedAt && openAuditSession?.updated_at) {
+                        // Comparação leve e direta entre data do Cadastro Base e última sincronização da auditoria
+                        const remoteTs = new Date(remoteStockUpdatedAt).getTime();
+                        const auditTs = new Date(openAuditSession.updated_at).getTime();
+                        if (Number.isFinite(remoteTs) && Number.isFinite(auditTs)) {
+                            appliedStockTs = openAuditSession.updated_at;
+                            isPendingStock = remoteTs > auditTs + 10_000;
+                        }
                     }
-                    isPendingClassification = isAuditClassificationOutdated(sourceFiles, openAuditSession.data);
-                    isPendingStructure = isGlobalAuditStructureDifferentFromApplied(
-                        sourceFiles,
-                        globalBaseMetaRef.current.groups,
-                        globalBaseMetaRef.current.dept,
-                        globalBaseMetaRef.current.cat,
-                        openAuditSession.data
-                    );
                 }
 
                 const isPending = hasOpenAudit && hasRemoteStock && (isPendingStock || isPendingClassification || isPendingStructure);
@@ -8038,10 +8070,30 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         return sumExcelMetrics(deptMetrics);
     }, [getScopedMetrics, sumExcelMetrics]);
 
-    const postAuditAdjustments = useMemo(
-        () => normalizePostAuditAdjustments((data as any)?.postAuditAdjustments),
-        [data]
-    );
+    const postAuditAdjustments = useMemo(() => {
+        const currentBranchNorm = toAuditBranchValue(selectedFilial);
+        const fromData = normalizePostAuditAdjustments((data as any)?.postAuditAdjustments)
+            .filter(item => !item.branch || toAuditBranchValue(item.branch) === currentBranchNorm);
+        const fromRef = normalizePostAuditAdjustments(postAuditAdjustmentsRef.current)
+            .filter(item => !item.branch || toAuditBranchValue(item.branch) === currentBranchNorm);
+        const map = new Map<string, PostAuditAdjustment>();
+        fromData.forEach(item => map.set(item.id, item));
+        fromRef.forEach(item => {
+            const existing = map.get(item.id);
+            if (!existing) {
+                map.set(item.id, item);
+            } else {
+                map.set(item.id, {
+                    ...existing,
+                    ...item,
+                    trierAppliedAt: existing.trierAppliedAt || item.trierAppliedAt,
+                    trierAppliedBy: existing.trierAppliedBy || item.trierAppliedBy,
+                    trierAppliedByName: existing.trierAppliedByName || item.trierAppliedByName
+                });
+            }
+        });
+        return Array.from(map.values());
+    }, [data, (data as any)?.postAuditAdjustments, selectedFilial]);
     useEffect(() => {
         postAuditAdjustmentsRef.current = postAuditAdjustments;
     }, [postAuditAdjustments]);
@@ -8051,6 +8103,10 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             quantity: acc.quantity + Number(item.quantity || 0),
             cost: roundAuditMoney(acc.cost + Number(item.totalCost || 0))
         }), { quantity: 0, cost: 0 });
+    }, [postAuditAdjustments]);
+
+    const unconfirmedAdjustmentsCount = useMemo(() => {
+        return postAuditAdjustments.filter(item => !item.trierAppliedAt).length;
     }, [postAuditAdjustments]);
 
     const metricsContainsPostAuditAdjustments = useCallback((metrics: any) => {
@@ -8362,17 +8418,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         let diffQty = 0;
         let diffCost = 0;
         let groupsWithDivergence = 0;
-        let sourceAlreadyHasPostAuditAdjustments = false;
         if (authoritativeTermMetrics) {
             diffQty = Number(authoritativeTermMetrics.diffQty || 0);
             diffCost = roundAuditMoney(authoritativeTermMetrics.diffCost);
             groupsWithDivergence = Math.abs(diffQty) > 0.01 || Math.abs(diffCost) > 0.01 ? 1 : 0;
-            sourceAlreadyHasPostAuditAdjustments = metricsContainsPostAuditAdjustments(authoritativeTermMetrics);
         } else {
             data.groups.forEach(group => {
                 const metrics = getGroupVerifiedMetrics(group);
                 if (!metrics) return;
-                if (metricsContainsPostAuditAdjustments(metrics)) sourceAlreadyHasPostAuditAdjustments = true;
                 const currentDiffQty = Number(metrics.diffQty || 0);
                 const currentDiffCost = Number(metrics.diffCost || 0);
                 diffQty += currentDiffQty;
@@ -8383,14 +8436,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             });
             diffCost = roundAuditMoney(diffCost);
         }
-        if (postAuditAdjustments.length > 0 && !sourceAlreadyHasPostAuditAdjustments) {
-            diffQty += Number(postAuditAdjustmentTotals.quantity || 0);
-            diffCost = roundAuditMoney(diffCost + Number(postAuditAdjustmentTotals.cost || 0));
+        const confirmedAdjustments = postAuditAdjustments.filter(item => Boolean(item.trierAppliedAt));
+        const confirmedAdjustmentQty = confirmedAdjustments.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+        const confirmedAdjustmentCost = confirmedAdjustments.reduce((sum, item) => roundAuditMoney(sum + Number(item.totalCost || 0)), 0);
+
+        if (confirmedAdjustments.length > 0) {
+            diffQty = roundAuditMoney(diffQty + confirmedAdjustmentQty);
+            diffCost = roundAuditMoney(diffCost + confirmedAdjustmentCost);
             if (
-                Math.abs(Number(postAuditAdjustmentTotals.quantity || 0)) > 0.01 ||
-                Math.abs(Number(postAuditAdjustmentTotals.cost || 0)) > 0.01
+                Math.abs(confirmedAdjustmentQty) > 0.01 ||
+                Math.abs(confirmedAdjustmentCost) > 0.01
             ) {
-                groupsWithDivergence += 1;
+                groupsWithDivergence = Math.abs(diffQty) > 0.01 || Math.abs(diffCost) > 0.01 ? 1 : 0;
             }
         }
 
@@ -8414,7 +8471,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             doneCost: roundAuditMoney(Number(branchMetrics.doneCost || 0) + diffCost),
             totalCost: Number(branchMetrics.cost || 0)
         };
-    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost, postAuditAdjustments.length, postAuditAdjustmentTotals.quantity, postAuditAdjustmentTotals.cost, metricsContainsPostAuditAdjustments]);
+    }, [data, authoritativeTermMetrics, getGroupVerifiedMetrics, branchMetrics.units, branchMetrics.doneUnits, branchMetrics.skus, branchMetrics.doneSkus, branchMetrics.cost, branchMetrics.doneCost, postAuditAdjustments, postAuditAdjustments.length, postAuditAdjustmentTotals.quantity, postAuditAdjustmentTotals.cost, metricsContainsPostAuditAdjustments]);
 
     const createDefaultTermForm = (): TermForm => ({
         inventoryNumber: inventoryNumber || data?.inventoryNumber || '',
@@ -10656,6 +10713,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         return { group, dept, cat, departments, categories, products };
     };
 
+    const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
+
     const formatTermDate = (val?: string) => {
         if (!val) return new Date().toLocaleDateString('pt-BR');
         return val;
@@ -12642,19 +12701,17 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             // que uma aba sobrescrevesse ajustes recém-gravados por outra pessoa.
             const changedAdjustments = normalizePostAuditAdjustments(snapshot.postAuditAdjustments)
                 .filter(item => item.syncToken === syncToken);
-            const saved = await replaceAuditPostAdjustments({
-                branch,
-                auditNumber,
-                adjustments: changedAdjustments,
-                deletedAdjustmentIds: snapshot.postAuditAdjustmentDeletedIds || [],
-                userEmail
-            });
-            if (!saved) return;
-
-            if (activeFilialRef.current === branch) {
-                setDbSessionId(saved.id);
-                setNextAuditNumber(saved.audit_number);
-                lastAuditUpdateRef.current = saved.updated_at || lastAuditUpdateRef.current;
+            let saved = null;
+            try {
+                saved = await replaceAuditPostAdjustments({
+                    branch,
+                    auditNumber,
+                    adjustments: changedAdjustments,
+                    deletedAdjustmentIds: snapshot.postAuditAdjustmentDeletedIds || [],
+                    userEmail
+                });
+            } catch (err) {
+                console.warn('[AuditFlow] Falha ao sincronizar ajustes com o banco:', err);
             }
 
             const current = dataRef.current;
@@ -12667,6 +12724,34 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 current.postAuditAdjustmentsSyncToken !== syncToken
             ) {
                 return;
+            }
+
+            if (!saved) {
+                postAdjustmentQueuedTokensRef.current.delete(queueKey);
+                const localSavedAdjustments = normalizePostAuditAdjustments(current.postAuditAdjustments).map(item => {
+                    if (item.syncToken === syncToken) {
+                        const { syncStatus: _s, syncToken: _t, ...rest } = item;
+                        return rest as PostAuditAdjustment;
+                    }
+                    return item;
+                });
+                const localData: AuditData = {
+                    ...current,
+                    postAuditAdjustments: localSavedAdjustments,
+                    postAuditAdjustmentsPending: false,
+                    postAuditAdjustmentsSyncToken: undefined
+                };
+                dataRef.current = localData;
+                postAuditAdjustmentsRef.current = localSavedAdjustments;
+                setData(localData);
+                await AuditStorage.saveLocalAuditSession(localData, false);
+                return;
+            }
+
+            if (activeFilialRef.current === branch) {
+                setDbSessionId(saved.id);
+                setNextAuditNumber(saved.audit_number);
+                lastAuditUpdateRef.current = saved.updated_at || lastAuditUpdateRef.current;
             }
 
             const remoteAdjustments = normalizePostAuditAdjustments(saved.data?.postAuditAdjustments).map(item => {
@@ -13062,7 +13147,196 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             setIsSavingPostAdjustment(false);
         }
     }, [isReadOnlyCompletedView, canUseAuditMasterTools, userEmail, userName, persistPostAuditAdjustments, selectedCompany?.id, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
-    const termScopeInfo = useMemo(() => (termModal ? buildTermScopeInfo(termModal) : null), [termModal, data]);
+
+    const confirmAllPostAuditAdjustmentsInTrier = useCallback(async () => {
+        if (isReadOnlyCompletedView || !canUseAuditMasterTools) return;
+        const currentAdjustments = postAuditAdjustmentsRef.current;
+        const unconfirmed = currentAdjustments.filter(item => !item.trierAppliedAt);
+        if (unconfirmed.length === 0) {
+            alert('Todos os ajustes já estão confirmados na Trier.');
+            return;
+        }
+        if (!window.confirm(`Confirmar que todos os ${unconfirmed.length} ajustes pendentes já foram realizados na Trier?`)) {
+            return;
+        }
+        if (postAdjustmentMutationInFlightRef.current) return;
+        postAdjustmentMutationInFlightRef.current = true;
+        setIsSavingPostAdjustment(true);
+
+        const confirmedAt = new Date().toISOString();
+        const unconfirmedIds = unconfirmed.map(u => u.id);
+        const nextAdjustments = currentAdjustments.map(item => !item.trierAppliedAt
+            ? {
+                ...item,
+                trierAppliedAt: confirmedAt,
+                trierAppliedBy: userEmail,
+                trierAppliedByName: userName || undefined
+            }
+            : item
+        );
+        setPostAdjustmentError(null);
+        try {
+            const saved = await persistPostAuditAdjustments(nextAdjustments, unconfirmedIds);
+            if (!saved) {
+                setPostAdjustmentError('Não foi possível registrar a confirmação em massa da Trier.');
+                return;
+            }
+            void insertAppEventLog({
+                company_id: selectedCompany?.id || null,
+                branch: toAuditBranchValue(selectedFilial) || null,
+                area: null,
+                user_email: userEmail,
+                user_name: userName || null,
+                app: 'auditoria',
+                event_type: 'post_audit_adjustments_bulk_trier_confirmed',
+                entity_type: 'audit_adjustment_bulk',
+                status: 'success',
+                success: true,
+                source: 'web',
+                event_meta: {
+                    auditNumber: nextAuditNumber,
+                    inventoryNumber: data?.inventoryNumber || inventoryNumber,
+                    count: unconfirmed.length,
+                    confirmedAt
+                }
+            }).catch(() => { });
+        } catch (error) {
+            console.error('[AuditFlow] Falha ao confirmar ajustes em massa na Trier:', error);
+            setPostAdjustmentError('Erro ao registrar confirmação em massa. Tente novamente.');
+        } finally {
+            postAdjustmentMutationInFlightRef.current = false;
+            setIsSavingPostAdjustment(false);
+        }
+    }, [isReadOnlyCompletedView, canUseAuditMasterTools, userEmail, userName, persistPostAuditAdjustments, selectedCompany?.id, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber]);
+
+    const handleImportPostAdjustmentsExcel = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        if (isReadOnlyCompletedView) {
+            alert('Modo consulta ativo: não é possível carregar ajustes.');
+            return;
+        }
+
+        setIsImportingAdjustmentsExcel(true);
+        try {
+            const rows = await readExcel(file);
+            if (!rows || rows.length < 2) {
+                alert('A planilha selecionada está vazia ou em formato incompatível.');
+                return;
+            }
+
+            const termColumns = detectTermComparisonColumns(rows);
+            const firstProductRowIndex = termColumns.headerRowIndex >= 0 ? termColumns.headerRowIndex + 1 : 1;
+
+            const parsedAdjustments: PostAuditAdjustment[] = [];
+            const nowIso = new Date().toISOString();
+
+            for (let i = firstProductRowIndex; i < rows.length; i++) {
+                const row = rows[i];
+                if (!row) continue;
+
+                const rowText = row.map(cell => String(cell || '').trim().toLowerCase()).join(' | ');
+                if (rowText.includes('total geral')) continue;
+
+                const codigo = String(row[termColumns.code] || '').trim();
+                const descricao = String(row[termColumns.description] || '').trim();
+                if (!codigo && !descricao) continue;
+
+                const metadataKeywords = ['filial:', 'grupo de produtos:', 'departamento:', 'categoria:', 'conferência de estoque', 'código', 'produto:'];
+                if (metadataKeywords.some(kw => String(row[0] || '').toLowerCase().startsWith(kw))) continue;
+
+                const sq = parseStockNumber(row[termColumns.sysQty]);
+                const sc = parseStockNumber(row[termColumns.sysCost]);
+                const cq = parseStockNumber(row[termColumns.countedQty]);
+                const cc = parseStockNumber(row[termColumns.countedCost]);
+                const dq = cq - sq;
+
+                const directCostDiff = termColumns.diffCost !== undefined && hasNumericCellValue(row[termColumns.diffCost])
+                    ? parseStockNumber(row[termColumns.diffCost])
+                    : null;
+                const costDiff = roundAuditMoney(directCostDiff ?? (cc - sc));
+
+                if (dq === 0 && Math.abs(costDiff) < 0.005) continue;
+
+                let unitCost = 0;
+                if (sq > 0 && sc > 0) {
+                    unitCost = roundAuditMoney(sc / sq);
+                } else if (cq > 0 && cc > 0) {
+                    unitCost = roundAuditMoney(cc / cq);
+                } else if (dq !== 0 && costDiff !== 0) {
+                    unitCost = Math.abs(roundAuditMoney(costDiff / dq));
+                }
+
+                const normCode = normalizeProductLookupCode(codigo);
+                const baseEntry = cadastroBaseIndexRef.current.get(normCode);
+
+                parsedAdjustments.push({
+                    id: `adj-excel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${i}`,
+                    branch: toAuditBranchValue(selectedFilial),
+                    auditNumber: nextAuditNumber,
+                    inventoryNumber: data?.inventoryNumber || inventoryNumber,
+                    code: codigo,
+                    reducedCode: codigo,
+                    barcode: baseEntry?.barcode || undefined,
+                    description: descricao || baseEntry?.productName || 'Produto sem descrição',
+                    mode: 'delta',
+                    quantity: dq,
+                    unitCost,
+                    totalCost: costDiff,
+                    groupId: baseEntry?.groupId,
+                    groupName: baseEntry?.groupName,
+                    deptId: baseEntry?.deptId,
+                    deptName: baseEntry?.deptName,
+                    catId: baseEntry?.catId,
+                    catName: baseEntry?.catName,
+                    note: `Importado de: ${file.name}`,
+                    createdAt: nowIso,
+                    createdBy: userEmail,
+                    createdByName: userName || undefined
+                });
+            }
+
+            if (parsedAdjustments.length === 0) {
+                alert('Nenhum item com divergência foi encontrado nesta planilha.');
+                return;
+            }
+
+            const totalParsedCost = parsedAdjustments.reduce((sum, item) => roundAuditMoney(sum + item.totalCost), 0);
+            const totalParsedQty = parsedAdjustments.reduce((sum, item) => sum + item.quantity, 0);
+
+            const confirmImport = window.confirm(
+                `Foram encontrados ${parsedAdjustments.length} itens com divergência na planilha "${file.name}":\n\n` +
+                `• Quantidade total: ${totalParsedQty > 0 ? '+' : ''}${totalParsedQty.toLocaleString('pt-BR')} un.\n` +
+                `• Valor total: ${totalParsedCost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}\n\n` +
+                `Deseja atualizar os ajustes após auditoria com esses dados?`
+            );
+            if (!confirmImport) return;
+
+            // Mantém apenas os ajustes desta filial que já foram confirmados na Trier e substitui os pendentes pelos da nova planilha
+            const currentBranchNorm = toAuditBranchValue(selectedFilial);
+            const confirmedAdjustments = postAuditAdjustmentsRef.current.filter(item =>
+                Boolean(item.trierAppliedAt) && (!item.branch || toAuditBranchValue(item.branch) === currentBranchNorm)
+            );
+            const mergedList = [...confirmedAdjustments, ...parsedAdjustments];
+
+            postAdjustmentMutationInFlightRef.current = true;
+            setIsSavingPostAdjustment(true);
+            const saved = await persistPostAuditAdjustments(mergedList);
+            if (saved) {
+                alert(`${parsedAdjustments.length} ajustes carregados com sucesso!`);
+            } else {
+                setPostAdjustmentError('Erro ao salvar os ajustes importados.');
+            }
+        } catch (err) {
+            console.error('Erro ao importar planilha de ajustes:', err);
+            alert('Falha ao processar a planilha. Verifique se o formato é idêntico ao do relatório de conferência da Trier.');
+        } finally {
+            setIsImportingAdjustmentsExcel(false);
+            postAdjustmentMutationInFlightRef.current = false;
+            setIsSavingPostAdjustment(false);
+            if (e.target) e.target.value = '';
+        }
+    }, [isReadOnlyCompletedView, selectedFilial, nextAuditNumber, data?.inventoryNumber, inventoryNumber, userEmail, userName, persistPostAuditAdjustments]);
     const canEditTerm = canUseAuditMasterTools && !isReadOnlyCompletedView;
     const canFillTermSignatures = !isReadOnlyCompletedView;
     const partialInfoList = useMemo(() => {
@@ -14613,6 +14887,42 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                                             {postAuditAdjustmentTotals.cost.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                                         </p>
                                     </div>
+                                </div>
+
+                                <input
+                                    ref={postAdjustmentExcelInputRef}
+                                    type="file"
+                                    accept=".xls,.xlsx,.csv"
+                                    className="hidden"
+                                    onChange={(e) => void handleImportPostAdjustmentsExcel(e)}
+                                />
+
+                                {/* Ações em Massa de Ajustes */}
+                                <div className="grid grid-cols-2 gap-2 mb-4">
+                                    <button
+                                        type="button"
+                                        onClick={() => postAdjustmentExcelInputRef.current?.click()}
+                                        disabled={isReadOnlyCompletedView || isImportingAdjustmentsExcel || isSavingPostAdjustment}
+                                        className="h-10 px-3 rounded-xl border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100/90 text-indigo-900 font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.98]"
+                                        title="Carregar planilha de divergências (formato Trier idêntico ao termo)"
+                                    >
+                                        {isImportingAdjustmentsExcel ? (
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+                                        ) : (
+                                            <FileSpreadsheet className="w-3.5 h-3.5 text-indigo-600" />
+                                        )}
+                                        Carregar Planilha
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => void confirmAllPostAuditAdjustmentsInTrier()}
+                                        disabled={isReadOnlyCompletedView || !canUseAuditMasterTools || unconfirmedAdjustmentsCount === 0 || isSavingPostAdjustment}
+                                        className="h-10 px-3 rounded-xl border border-emerald-400 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] text-white font-black text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-md shadow-emerald-950/20 disabled:opacity-40 disabled:bg-slate-100 disabled:border-slate-200 disabled:text-slate-400 disabled:shadow-none disabled:cursor-not-allowed"
+                                        title={unconfirmedAdjustmentsCount > 0 ? "Confirmar todos os ajustes pendentes na Trier de uma vez" : "Todos os ajustes já estão confirmados na Trier"}
+                                    >
+                                        <CheckCircle2 className="w-3.5 h-3.5" />
+                                        Confirmar Trier {unconfirmedAdjustmentsCount > 0 ? `(${unconfirmedAdjustmentsCount})` : ''}
+                                    </button>
                                 </div>
 
                                 <div className="space-y-3 border-t border-slate-100 pt-5">
