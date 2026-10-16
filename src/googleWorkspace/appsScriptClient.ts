@@ -67,7 +67,7 @@ const saveSession = (session: StoredSession | null) => {
  */
 class RequestConcurrencyQueue {
     private running = 0;
-    private readonly maxConcurrent = 2;
+    private readonly maxConcurrent = 3;
     private readonly queue: Array<() => void> = [];
 
     async run<T>(fn: () => Promise<T>): Promise<T> {
@@ -83,7 +83,7 @@ class RequestConcurrencyQueue {
             setTimeout(() => {
                 const next = this.queue.shift();
                 if (next) next();
-            }, 50);
+            }, 30);
         }
     }
 }
@@ -215,11 +215,12 @@ class GoogleAppsScriptClient {
         // Executa através da fila de concorrência controlada para nunca afogar o Google Apps Script
         return this.queue.run(async () => {
             let lastError: unknown = null;
-            const maxAttempts = 4;
+            const isWrite = action === 'query' && payload && typeof payload === 'object' && (payload as any).operation && (payload as any).operation !== 'select';
+            const maxAttempts = isWrite ? 4 : 2;
 
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-                const timeoutId = controller ? setTimeout(() => controller.abort(), 45_000) : null;
+                const timeoutId = controller ? setTimeout(() => controller.abort(), isWrite ? 40_000 : 18_000) : null;
 
                 try {
                     if (typeof navigator !== 'undefined' && !navigator.onLine) {

@@ -7018,7 +7018,9 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 const b = String(audit.branch || '').trim();
                 if (!b) return;
                 const existing = openAuditByBranch.get(b);
-                if (!existing || ((audit.audit_number || 0) > (existing.audit_number || 0))) {
+                if (!existing || ((audit.audit_number || 0) > (existing.audit_number || 0)) ||
+                    ((audit.audit_number || 0) === (existing.audit_number || 0) &&
+                     new Date(audit.updated_at || 0).getTime() > new Date(existing.updated_at || 0).getTime())) {
                     openAuditByBranch.set(b, audit);
                 }
             });

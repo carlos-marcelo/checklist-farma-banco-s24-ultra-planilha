@@ -1228,17 +1228,18 @@ export async function fetchLatestAudit(branch: string): Promise<DbAuditSession |
   // Uma sessão aberta tem prioridade, mesmo quando uma auditoria concluída possui
   // número maior (caso legítimo de reabertura de um inventário anterior).
   try {
-    const { data, error } = await supabase
+    const res = await supabase
       .from('audit_sessions')
       .select('*')
       .eq('branch', branch)
       .order('status', { ascending: false }) // "open" antes de "completed"
       .order('audit_number', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .order('updated_at', { ascending: false })
+      .limit(1);
 
-    if (error) throw error;
-    return data;
+    if (res.error && res.error.code !== 'PGRST116') throw res.error;
+    const items = Array.isArray(res.data) ? res.data : (res.data ? [res.data] : []);
+    return items[0] || null;
   } catch (error) {
     console.error('Error fetching latest audit:', error);
     return null;
@@ -1250,17 +1251,18 @@ export async function fetchLatestAudit(branch: string): Promise<DbAuditSession |
  */
 export async function fetchLatestAuditMetadata(branch: string): Promise<{ id: string, updated_at: string, audit_number: number, status: 'open' | 'completed' } | null> {
   try {
-    const { data, error } = await supabase
+    const res = await supabase
       .from('audit_sessions')
       .select('id, updated_at, audit_number, status')
       .eq('branch', branch)
       .order('status', { ascending: false })
       .order('audit_number', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .order('updated_at', { ascending: false })
+      .limit(1);
 
-    if (error) throw error;
-    return data;
+    if (res.error && res.error.code !== 'PGRST116') throw res.error;
+    const items = Array.isArray(res.data) ? res.data : (res.data ? [res.data] : []);
+    return items[0] || null;
   } catch (error) {
     console.error('Error fetching latest audit metadata:', error);
     return null;

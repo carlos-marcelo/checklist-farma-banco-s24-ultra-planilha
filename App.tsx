@@ -395,13 +395,18 @@ const normalizeAuditCategoryStatus = (status: unknown): 'done' | 'in_progress' |
 };
 
 const normalizeAuditScopeValue = (value: unknown) =>
-    String(value ?? '').trim().toLowerCase();
+    String(value ?? '')
+        .trim()
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
 
 const normalizeAuditScopeDigits = (value: unknown) =>
     String(value ?? '').replace(/\D/g, '').replace(/^0+/, '');
 
 const normalizeAuditScopeLastToken = (value: unknown) => {
-    const parts = String(value ?? '').trim().split(/[^0-9A-Za-z]+/).filter(Boolean);
+    const clean = String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const parts = clean.trim().split(/[^0-9A-Za-z]+/).filter(Boolean);
     const last = parts[parts.length - 1] || '';
     return {
         raw: last.toLowerCase(),
@@ -443,7 +448,7 @@ const formatAuditScopeSelectionWithNames = (
     if (selected.length === 0) return '';
     const resolveNode = (input: string) => entries.find(entry => {
         const node = level === 'group' ? entry.group : level === 'dept' ? entry.dept : entry.cat;
-        return auditScopeInputMatches(input, [node?.id, node?.numericId]);
+        return auditScopeInputMatches(input, [node?.id, node?.numericId, node?.name, node?.code, node?.label]);
     });
     const labels = selected.map(input => {
         const entry = resolveNode(input);
@@ -488,7 +493,7 @@ const buildAuditWhatsappTitle = (
         selected.forEach(input => {
             const entry = entries.find(item => {
                 const node = level === 'group' ? item.group : level === 'dept' ? item.dept : item.cat;
-                return auditScopeInputMatches(input, [node?.id, node?.numericId]);
+                return auditScopeInputMatches(input, [node?.id, node?.numericId, node?.name, node?.code, node?.label]);
             });
             const node = entry ? (level === 'group' ? entry.group : level === 'dept' ? entry.dept : entry.cat) : null;
             const name = String(node?.name || '').trim().toLowerCase();
@@ -519,7 +524,8 @@ const auditScopeInputMatches = (input: string | undefined, values: unknown[]) =>
                 (!!rawValue && rawValue === rawInput) ||
                 (!!digitInput && !!digitValue && digitValue === digitInput) ||
                 (!!lastInput.raw && !!lastValue.raw && lastValue.raw === lastInput.raw) ||
-                (!!lastInput.digits && !!lastValue.digits && lastValue.digits === lastInput.digits)
+                (!!lastInput.digits && !!lastValue.digits && lastValue.digits === lastInput.digits) ||
+                (!!rawValue && !!rawInput && (rawValue.includes(rawInput) || rawInput.includes(rawValue)))
             );
         });
     });
@@ -560,11 +566,11 @@ const getAuditDataScopeCategories = (
     const out: Array<{ group: any; dept: any; cat: any; key: string }> = [];
     const groups = Array.isArray(auditData?.groups) ? auditData.groups : [];
     groups.forEach((group: any) => {
-        if (!auditScopeInputMatches(scope.groupId, [group?.id, group?.numericId])) return;
+        if (!auditScopeInputMatches(scope.groupId, [group?.id, group?.numericId, group?.name, group?.label, group?.code])) return;
         (group?.departments || []).forEach((dept: any) => {
-            if (!auditScopeInputMatches(scope.deptId, [dept?.id, dept?.numericId])) return;
+            if (!auditScopeInputMatches(scope.deptId, [dept?.id, dept?.numericId, dept?.name, dept?.label, dept?.code])) return;
             (dept?.categories || []).forEach((cat: any) => {
-                if (!auditScopeInputMatches(scope.catId, [cat?.id, cat?.numericId])) return;
+                if (!auditScopeInputMatches(scope.catId, [cat?.id, cat?.numericId, cat?.name, cat?.label, cat?.code])) return;
                 out.push({
                     group,
                     dept,
@@ -8477,7 +8483,7 @@ const App: React.FC = () => {
 
             if (Array.isArray(cachedRows) && cachedRows.length > 0) {
                 startTransition(() => {
-                    setDashboardAuditSessions(previous => previous.length > 0 ? previous : cachedRows);
+                    setDashboardAuditSessions(cachedRows);
                 });
             }
 
@@ -8554,7 +8560,8 @@ const App: React.FC = () => {
 
             if (
                 cachedSignature === metadataSignature &&
-                effectiveCachedRows.length === latestMetadata.length
+                effectiveCachedRows.length === latestMetadata.length &&
+                effectiveCachedRows.every(row => Boolean(row?.data))
             ) {
                 startTransition(() => setDashboardAuditSessions(effectiveCachedRows));
                 dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
@@ -8592,7 +8599,12 @@ const App: React.FC = () => {
                 const cached = (meta.id ? cacheByBranchAndAudit.get(String(meta.id)) : null) || cacheByBranchAndAudit.get(bKey);
                 const cachedTs = Date.parse(String(cached?.updated_at || cached?.created_at || '')) || 0;
                 const metaTs = Date.parse(String(meta.updated_at || meta.created_at || '')) || 0;
-                const hasValidData = Boolean(cached?.data && typeof cached.data === 'object');
+                const hasValidData = Boolean(
+                    cached?.data && (
+                        (typeof cached.data === 'object' && Object.keys(cached.data).length > 0) ||
+                        (typeof cached.data === 'string' && cached.data.trim().length > 2)
+                    )
+                );
 
                 if (cached && hasValidData && cachedTs >= metaTs) {
                     freshFromCache.push(cached);
@@ -8655,7 +8667,15 @@ const App: React.FC = () => {
             const resolvedRows = latestMetadata.map(meta => {
                 const bKey = `${normalizeBranchLabel(meta.branch)}_${Number(meta.audit_number || 0)}`;
                 const match = (meta.id ? allAvailableMap.get(String(meta.id)) : null) || allAvailableMap.get(bKey);
+                if (match && match.data) return match;
+
+                const fallbackCached = (meta.id ? cacheByBranchAndAudit.get(String(meta.id)) : null) || cacheByBranchAndAudit.get(bKey);
+                if (fallbackCached && fallbackCached.data) {
+                    return fallbackCached;
+                }
+
                 if (match) return match;
+
                 return {
                     id: String(meta.id),
                     branch: meta.branch,
@@ -8744,7 +8764,7 @@ const App: React.FC = () => {
 
             if (Array.isArray(cachedRows) && cachedRows.length > 0) {
                 startTransition(() => {
-                    setDashboardCompletedAuditSessions(previous => previous.length > 0 ? previous : cachedRows);
+                    setDashboardCompletedAuditSessions(cachedRows);
                 });
             }
 
@@ -8822,7 +8842,8 @@ const App: React.FC = () => {
 
             if (
                 cachedSignature === metadataSignature &&
-                effectiveCachedRows.length === latestMetadata.length
+                effectiveCachedRows.length === latestMetadata.length &&
+                effectiveCachedRows.every(row => Boolean(row?.data))
             ) {
                 startTransition(() => setDashboardCompletedAuditSessions(effectiveCachedRows));
                 dashboardAuditBackoffRef.current = { failures: 0, retryAt: 0, lastLoggedAt: 0 };
@@ -8860,7 +8881,12 @@ const App: React.FC = () => {
                 const cached = (meta.id ? cacheByBranchAndAudit.get(String(meta.id)) : null) || cacheByBranchAndAudit.get(bKey);
                 const cachedTs = Date.parse(String(cached?.updated_at || cached?.created_at || '')) || 0;
                 const metaTs = Date.parse(String(meta.updated_at || meta.created_at || '')) || 0;
-                const hasValidData = Boolean(cached?.data && typeof cached.data === 'object');
+                const hasValidData = Boolean(
+                    cached?.data && (
+                        (typeof cached.data === 'object' && Object.keys(cached.data).length > 0) ||
+                        (typeof cached.data === 'string' && cached.data.trim().length > 2)
+                    )
+                );
 
                 if (cached && hasValidData && cachedTs >= metaTs) {
                     freshFromCache.push(cached);
@@ -8923,7 +8949,15 @@ const App: React.FC = () => {
             const resolvedRows = latestMetadata.map(meta => {
                 const bKey = `${normalizeBranchLabel(meta.branch)}_${Number(meta.audit_number || 0)}`;
                 const match = (meta.id ? allAvailableMap.get(String(meta.id)) : null) || allAvailableMap.get(bKey);
+                if (match && match.data) return match;
+
+                const fallbackCached = (meta.id ? cacheByBranchAndAudit.get(String(meta.id)) : null) || cacheByBranchAndAudit.get(bKey);
+                if (fallbackCached && fallbackCached.data) {
+                    return fallbackCached;
+                }
+
                 if (match) return match;
+
                 return {
                     id: String(meta.id),
                     branch: meta.branch,
