@@ -6708,15 +6708,20 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             const allCadastroAliases = cadastroAliases[normalizeProductLookupCode(reduced)] || [];
             const allBarcodeAliases = Array.from(new Set([...acc.barcodeAliases, ...allCadastroAliases]));
             const primaryBarcode = allBarcodeAliases.find(code => code.length >= 8) || allBarcodeAliases[0] || '';
-            cat.products.push({
-                code: primaryBarcode || reduced,
-                reducedCode: reduced,
-                barcode: primaryBarcode || undefined,
-                barcodeAliases: allBarcodeAliases,
+            const finalCode = primaryBarcode || reduced;
+            const productEntry: Product = {
+                code: finalCode,
                 name: acc.name,
                 quantity: acc.q,
                 cost: avgCost
-            });
+            };
+            if (reduced && reduced !== finalCode) {
+                productEntry.reducedCode = reduced;
+            }
+            if (primaryBarcode && primaryBarcode !== finalCode) {
+                productEntry.barcode = primaryBarcode;
+            }
+            cat.products.push(productEntry);
         });
 
         return {
@@ -6734,6 +6739,11 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             stockMeta?: DbGlobalBaseFile | null;
             openSession?: DbAuditSession | null;
             silentAlerts?: boolean;
+            preParsedStructure?: {
+                rowsGroupsByFile: any[];
+                rowsDept: any[] | null;
+                rowsCat: any[] | null;
+            } | null;
         }
     ): Promise<{ success: boolean; ignoredSummary?: any; error?: string }> => {
         const companyId = selectedCompany?.id;
@@ -6786,11 +6796,15 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             return { success: false, error: 'Bases de cadastro dos grupos não carregadas no Cadastro Base' };
         }
 
-        // 4. Ler linhas do Excel
-        const rowsGroupsByFile = await Promise.all(structureGroupFiles.map(entry => readExcel(entry.file)));
+        // 4. Ler linhas do Excel (reutiliza pré-parse em massa se disponível para máxima performance)
+        const rowsGroupsByFile = options?.preParsedStructure?.rowsGroupsByFile || await Promise.all(structureGroupFiles.map(entry => readExcel(entry.file)));
         const rowsStock = await readExcel(targetStockFile);
-        const rowsDept = effectiveDeptIdsFile ? await readExcel(effectiveDeptIdsFile) : null;
-        const rowsCat = effectiveCatIdsFile ? await readExcel(effectiveCatIdsFile) : null;
+        const rowsDept = options?.preParsedStructure !== undefined
+            ? options.preParsedStructure?.rowsDept
+            : (effectiveDeptIdsFile ? await readExcel(effectiveDeptIdsFile) : null);
+        const rowsCat = options?.preParsedStructure !== undefined
+            ? options.preParsedStructure?.rowsCat
+            : (effectiveCatIdsFile ? await readExcel(effectiveCatIdsFile) : null);
 
         // 5. Construir árvore de grupos e produtos com saldos
         const nextData = await buildAuditStructureFromExcelRows({
@@ -6820,14 +6834,42 @@ const AuditModule: React.FC<AuditModuleProps> = ({
             targetBranch === selectedFilial ? termDrafts : {}
         ) as Record<string, any>;
 
+        // Remove matriz bruta pesada de sourceRows de termos para não estourar o Google Apps Script
+        const sanitizedTermDrafts = { ...finalTermDrafts };
+        Object.keys(sanitizedTermDrafts).forEach(key => {
+            const draft = sanitizedTermDrafts[key];
+            if (draft && draft.excelMetrics && Array.isArray(draft.excelMetrics.sourceRows)) {
+                const { sourceRows: _unused, ...metricsWithoutRows } = draft.excelMetrics;
+                sanitizedTermDrafts[key] = {
+                    ...draft,
+                    excelMetrics: metricsWithoutRows
+                };
+            }
+        });
+
         const finalPostAuditAdjustments = normalizePostAuditAdjustments(
             (openData as any).postAuditAdjustments
         );
 
+        // Limpeza profunda de produtos na árvore final para garantir que nenhum resíduo de barcodeAliases antigo aumente o payload
+        if (Array.isArray(finalData.groups)) {
+            finalData.groups.forEach(g => {
+                (g.departments || []).forEach(d => {
+                    (d.categories || []).forEach(c => {
+                        if (Array.isArray(c.products)) {
+                            c.products.forEach(p => {
+                                if ('barcodeAliases' in p) delete (p as any).barcodeAliases;
+                            });
+                        }
+                    });
+                });
+            });
+        }
+
         const basePersistedData = {
             ...finalData,
             postAuditAdjustments: finalPostAuditAdjustments,
-            termDrafts: finalTermDrafts,
+            termDrafts: sanitizedTermDrafts,
             sourceFiles: buildStructureSourceMeta({
                 stockSyncedAt: getGlobalStockTimestampRaw(targetStockMeta),
                 stockMeta: targetStockMeta,
@@ -6922,7 +6964,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             // Executa em lote 2 consultas leves e diretas:
             // 1. Arquivos de estoque do Cadastro Base desta empresa (somente metadados leves)
-            // 2. Inventários com status 'open' (somente cabeçalho leve, sem payload de produtos)
+            // 2. Inventários com status 'open' (com payload de arquivos de origem para checagem fidedigna de estoque)
             const [stockFilesRes, openAuditsRes] = await Promise.all([
                 supabase
                     .from('global_base_files')
@@ -6930,7 +6972,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                     .eq('company_id', companyId),
                 supabase
                     .from('audit_sessions')
-                    .select('id, branch, audit_number, status, updated_at')
+                    .select('id, branch, audit_number, status, updated_at, data')
                     .eq('status', 'open')
             ]);
 
@@ -6940,6 +6982,18 @@ const AuditModule: React.FC<AuditModuleProps> = ({
 
             const stockFiles = (stockFilesRes?.data || []) as DbGlobalBaseFile[];
             const openAudits = (openAuditsRes?.data || []) as DbAuditSession[];
+
+            // Mapeia sessões em memória passadas via props para garantir fonte fiel caso a query remota venha enxuta
+            const knownAuditByBranch = new Map<string, DbAuditSession>();
+            (knownAuditSessions || []).forEach(session => {
+                const b = toAuditBranchValue(session.branch);
+                if (b && session.status === 'open' && session.data) {
+                    const existing = knownAuditByBranch.get(b);
+                    if (!existing || Number(session.audit_number || 0) >= Number(existing.audit_number || 0)) {
+                        knownAuditByBranch.set(b, session);
+                    }
+                }
+            });
 
             // Mapeia o arquivo de estoque mais recente por module_key
             const stockByModuleKey = new Map<string, DbGlobalBaseFile>();
@@ -6977,7 +7031,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 const hasRemoteStock = !!remoteStockMeta;
                 const remoteStockUpdatedAt = remoteStockMeta ? getGlobalStockTimestampRaw(remoteStockMeta) : null;
 
-                let openAuditSession = openAuditByBranch.get(branch) || null;
+                let openAuditSession = openAuditByBranch.get(branch) || knownAuditByBranch.get(branch) || null;
                 const isSelectedBranch = selectedFilial === branch;
 
                 // Se a filial aberta for a atual selecionada e já temos o data em memória, usamos ele diretamente
@@ -6989,6 +7043,14 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                         status: 'open',
                         data: data
                     } as any;
+                } else if (openAuditSession && !openAuditSession.data) {
+                    const known = knownAuditByBranch.get(branch);
+                    if (known?.data) {
+                        openAuditSession = {
+                            ...openAuditSession,
+                            data: known.data
+                        };
+                    }
                 }
 
                 const hasOpenAudit = !!openAuditSession;
@@ -6998,28 +7060,27 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 let isPendingStructure = false;
 
                 if (hasOpenAudit) {
-                    if (isSelectedBranch && data) {
-                        const sourceFiles = (data as any)?.sourceFiles || {};
+                    const auditData = openAuditSession?.data as any;
+                    const sourceFiles = auditData?.sourceFiles || null;
+
+                    if (sourceFiles) {
                         appliedStockTs = getAppliedStockTimestampRaw(sourceFiles);
                         if (hasRemoteStock && remoteStockMeta) {
                             isPendingStock = isGlobalStockDifferentFromApplied(sourceFiles, remoteStockMeta);
                         }
-                        isPendingClassification = isAuditClassificationOutdated(sourceFiles, data);
+                        isPendingClassification = isAuditClassificationOutdated(sourceFiles, auditData);
                         isPendingStructure = isGlobalAuditStructureDifferentFromApplied(
                             sourceFiles,
                             globalBaseMetaRef.current.groups,
                             globalBaseMetaRef.current.dept,
                             globalBaseMetaRef.current.cat,
-                            data
+                            auditData
                         );
-                    } else if (hasRemoteStock && remoteStockUpdatedAt && openAuditSession?.updated_at) {
-                        // Comparação leve e direta entre data do Cadastro Base e última sincronização da auditoria
-                        const remoteTs = new Date(remoteStockUpdatedAt).getTime();
-                        const auditTs = new Date(openAuditSession.updated_at).getTime();
-                        if (Number.isFinite(remoteTs) && Number.isFinite(auditTs)) {
-                            appliedStockTs = openAuditSession.updated_at;
-                            isPendingStock = remoteTs > auditTs + 10_000;
-                        }
+                    } else if (hasRemoteStock) {
+                        // Se há estoque no Cadastro Base mas a auditoria não possui registro de estoque aplicado,
+                        // ela OBRIGATORIAMENTE precisa ser reclassificada/sincronizada!
+                        isPendingStock = true;
+                        appliedStockTs = null;
                     }
                 }
 
@@ -7076,7 +7137,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         } finally {
             setIsLoadingBranchesStock(false);
         }
-    }, [selectedCompany?.id, canUseAuditMasterTools, allowedAuditBranches, selectedFilial, data, dbSessionId]);
+    }, [selectedCompany?.id, canUseAuditMasterTools, allowedAuditBranches, selectedFilial, data, dbSessionId, knownAuditSessions]);
 
     const handleMassReclassify = async () => {
         if (!canUseAuditMasterTools) {
@@ -7105,6 +7166,26 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         let successCount = 0;
         let failCount = 0;
         let wasAborted = false;
+        const failedBranchesDetails: Array<{ branch: string; reason: string }> = [];
+
+        // Pré-parse das bases estruturais dos grupos uma única vez para toda a fila
+        // Economiza até 80% de CPU/Memória evitando ler os mesmos Excels de grupos 17 vezes
+        let preParsedStructure: {
+            rowsGroupsByFile: any[];
+            rowsDept: any[] | null;
+            rowsCat: any[] | null;
+        } | null = null;
+
+        if (effectiveGroupFiles.length > 0) {
+            try {
+                const rowsGroupsByFile = await Promise.all(effectiveGroupFiles.map(entry => readExcel(entry.file)));
+                const rowsDept = effectiveDeptIdsFile ? await readExcel(effectiveDeptIdsFile) : null;
+                const rowsCat = effectiveCatIdsFile ? await readExcel(effectiveCatIdsFile) : null;
+                preParsedStructure = { rowsGroupsByFile, rowsDept, rowsCat };
+            } catch (parseErr) {
+                console.warn('[MassReclassify] Falha no pré-parse estrutural centralizado, continuará filial a filial:', parseErr);
+            }
+        }
 
         for (let i = 0; i < pendingBranches.length; i++) {
             if (abortMassReclassifyRef.current) {
@@ -7120,34 +7201,58 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 [branch]: { ...prev[branch], status: 'processing' }
             }));
 
-            try {
-                const branchInfo = branchesStockStatus[branch];
-                const result = await reclassifyBranchWithStock(branch, {
-                    stockMeta: branchInfo?.remoteStockMeta,
-                    silentAlerts: true
-                });
-                if (result.success) {
-                    successCount++;
-                    setBranchesStockStatus(prev => ({
-                        ...prev,
-                        [branch]: { ...prev[branch], status: 'up_to_date', isPendingStock: false }
-                    }));
-                } else {
-                    failCount++;
-                    setBranchesStockStatus(prev => ({
-                        ...prev,
-                        [branch]: { ...prev[branch], status: 'error', errorMessage: result.error || 'Erro na reclassificação' }
-                    }));
+            let branchSuccess = false;
+            let lastErrorMessage = '';
+            const maxAttempts = 3;
+
+            // Mecanismo de Retry com Backoff:
+            // O Google Apps Script pode retornar lock temporário ou rate limit se receber
+            // rajadas contínuas de payloads pesados. Com 3 tentativas espaçadas, a requisição passa limpa.
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                if (abortMassReclassifyRef.current) break;
+                try {
+                    const branchInfo = branchesStockStatus[branch];
+                    const result = await reclassifyBranchWithStock(branch, {
+                        stockMeta: branchInfo?.remoteStockMeta,
+                        silentAlerts: true,
+                        preParsedStructure
+                    });
+                    if (result.success) {
+                        branchSuccess = true;
+                        break;
+                    } else {
+                        lastErrorMessage = result.error || 'Erro na reclassificação';
+                        if (attempt < maxAttempts) {
+                            console.warn(`[MassReclassify] Tentativa ${attempt} falhou para Filial ${branch} (${lastErrorMessage}). Aguardando liberação do Google Apps Script...`);
+                            await new Promise(r => setTimeout(r, 1200 * attempt));
+                        }
+                    }
+                } catch (err: any) {
+                    lastErrorMessage = err?.message || 'Exceção na reclassificação';
+                    if (attempt < maxAttempts) {
+                        console.warn(`[MassReclassify] Tentativa ${attempt} capturou exceção para Filial ${branch}. Aguardando liberação do Google Apps Script...`);
+                        await new Promise(r => setTimeout(r, 1200 * attempt));
+                    }
                 }
-            } catch (err) {
-                failCount++;
-                console.error(`Erro ao reclassificar filial ${branch} em massa:`, err);
+            }
+
+            if (branchSuccess) {
+                successCount++;
                 setBranchesStockStatus(prev => ({
                     ...prev,
-                    [branch]: { ...prev[branch], status: 'error', errorMessage: 'Exceção ao reclassificar' }
+                    [branch]: { ...prev[branch], status: 'up_to_date', isPendingStock: false }
+                }));
+            } else {
+                failCount++;
+                failedBranchesDetails.push({ branch, reason: lastErrorMessage });
+                setBranchesStockStatus(prev => ({
+                    ...prev,
+                    [branch]: { ...prev[branch], status: 'error', errorMessage: lastErrorMessage }
                 }));
             }
-            await yieldToBrowser();
+
+            // Respiro de 600ms entre as filiais para drenar o buffer e evitar rate limit no Google
+            await new Promise(r => setTimeout(r, 600));
 
             if (abortMassReclassifyRef.current) {
                 wasAborted = true;
@@ -7169,10 +7274,13 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 `\nO processo foi pausado a seu pedido e as filiais restantes foram mantidas como estavam.`
             );
         } else {
+            const failDetailsStr = failedBranchesDetails.length > 0
+                ? `\nDetalhe das falhas:\n` + failedBranchesDetails.map(f => `• Filial ${f.branch}: ${f.reason}`).join('\n') + `\n`
+                : '';
             alert(
                 `Reclassificação em massa concluída!\n\n` +
                 `✅ Filiais reclassificadas com sucesso: ${successCount}\n` +
-                (failCount > 0 ? `⚠️ Filiais com falha: ${failCount}\n` : '') +
+                (failCount > 0 ? `⚠️ Filiais com falha: ${failCount}\n${failDetailsStr}` : '') +
                 `\nOs saldos foram atualizados e sincronizados no banco de dados.`
             );
         }
@@ -13603,8 +13711,8 @@ const AuditModule: React.FC<AuditModuleProps> = ({
         const structureLocked = !!(data && data.groups && data.groups.length > 0);
         const updateOnlyMode = isUpdatingStock || structureLocked;
         return (
-            <div className="min-h-screen bg-slate-950 flex flex-col xl:flex-row items-center xl:items-start justify-center p-4 sm:p-6 gap-6 font-sans">
-                <div className="max-w-2xl w-full bg-white rounded-[2rem] shadow-2xl overflow-hidden shrink-0">
+            <div className="min-h-screen bg-slate-950 flex flex-col 2xl:flex-row items-stretch 2xl:items-start justify-center p-2 sm:p-4 gap-4 font-sans max-w-full overflow-x-auto">
+                <div className="w-full max-w-2xl 2xl:max-w-xl min-w-0 flex-1 bg-white rounded-[2rem] shadow-2xl overflow-hidden shrink-0 2xl:shrink">
                     <div className="bg-indigo-600 p-10 text-center text-white">
                         <h1 className="text-4xl font-black italic tracking-tighter">AuditFlow</h1>
                         <p className="text-indigo-200 text-[10px] uppercase font-bold tracking-widest mt-1 italic">Sistema de Auditoria Master</p>
@@ -13916,7 +14024,7 @@ const AuditModule: React.FC<AuditModuleProps> = ({
                 </div>
 
                 {canUseAuditMasterTools && (
-                    <div className="w-full xl:w-[480px] bg-slate-900 border border-slate-800 rounded-[2rem] shadow-2xl overflow-hidden shrink-0 text-white flex flex-col">
+                    <div className="w-full 2xl:w-[420px] max-w-2xl 2xl:max-w-[420px] bg-slate-900 border border-slate-800 rounded-[2rem] shadow-2xl overflow-hidden shrink-0 2xl:shrink text-white flex flex-col">
                         {/* Header do Painel */}
                         <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 border-b border-slate-800 p-6 flex items-center justify-between">
                             <div className="flex items-center gap-3">

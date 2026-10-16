@@ -249,8 +249,10 @@ const PreVencidosManager = PRE_VENCIDOS_MODULE_ENABLED
 const AnaliseDashboard = React.lazy(() => import('./components/AnaliseResultados/AnaliseDashboard'));
 const loadAuditModule = () => import('./components/auditoria/AuditModule');
 const loadAuditCrossPanel = () => import('./components/auditoria/AuditCrossPanel');
+const loadAuditRankingPanel = () => import('./components/auditoria/AuditRankingPanel');
 const AuditModule = React.lazy(loadAuditModule);
 const AuditCrossPanel = React.lazy(loadAuditCrossPanel);
+const AuditRankingPanel = React.lazy(loadAuditRankingPanel);
 const StockConference = React.lazy(() =>
     import('./components/StockConference').then(module => ({ default: module.StockConference }))
 );
@@ -3292,17 +3294,19 @@ const App: React.FC = () => {
     }, [currentView]);
 
     const [isAuditCrossPanelExpanded, setIsAuditCrossPanelExpanded] = useState(false);
+    const [isAuditRankingExpanded, setIsAuditRankingExpanded] = useState(false);
 
     useEffect(() => {
         if (currentView === 'audit') {
             setIsAuditCrossPanelExpanded(false);
+            setIsAuditRankingExpanded(false);
         }
     }, [currentView]);
 
     useEffect(() => {
         if (!currentUser?.email) return;
         scheduleBackgroundTask(() => {
-            void Promise.allSettled([loadAuditModule(), loadAuditCrossPanel()]);
+            void Promise.allSettled([loadAuditModule(), loadAuditCrossPanel(), loadAuditRankingPanel()]);
         }, 2500);
     }, [currentUser?.email]);
     const [ignoredChecklists, setIgnoredChecklists] = useState<Set<string>>(new Set());
@@ -9027,18 +9031,19 @@ const App: React.FC = () => {
         const completedDataIsFresh = !!completedDashboardAuditsFetchedAt &&
             now - (Date.parse(completedDashboardAuditsFetchedAt) || 0) < AUDIT_DASHBOARD_REVALIDATE_MS;
         if (currentView === 'audit') {
-            if (openDataIsFresh && completedDataIsFresh) return;
+            const hasData = dashboardAuditSessions.length > 0 || dashboardCompletedAuditSessions.length > 0;
+            if (hasData) return;
             if (auditCrossLoadScheduledRef.current) return;
             auditCrossLoadScheduledRef.current = true;
             scheduleBackgroundTask(async () => {
                 try {
-                    if (!openDataIsFresh) await loadDashboardAuditSessions(!!dashboardAuditsFetchedAt);
+                    await loadDashboardAuditSessions(false);
                     await new Promise(r => setTimeout(r, 200));
-                    if (!completedDataIsFresh) await loadCompletedDashboardAuditSessions(!!completedDashboardAuditsFetchedAt);
+                    await loadCompletedDashboardAuditSessions(false);
                 } finally {
                     auditCrossLoadScheduledRef.current = false;
                 }
-            }, 1200);
+            }, 400);
             return;
         }
         if (currentView !== 'dashboard') return;
@@ -10694,30 +10699,38 @@ const App: React.FC = () => {
     }, [completedAuditAreaFilter, completedAuditAreaOptions, completedAuditNumberFilter, completedAuditNumberOptions]);
 
     const auditCrossRows = useMemo<AuditCrossRow[]>(() => {
-        const mapBranch = (branch: any, status: AuditCrossStatus): AuditCrossRow => ({
-            key: `${status}|${normalizeBranchLabel(branch.branch)}|${Number(branch.auditNumber || 0)}`,
-            status,
-            branch: normalizeBranchLabel(branch.branch),
-            area: String(branch.area || 'Sem Área').trim() || 'Sem Área',
-            city: branch.city ? String(branch.city).trim() : undefined,
-            auditNumber: Number(branch.auditNumber || 0),
-            progressPct: Number(branch.progressPct || 0),
-            countedUnits: Number(branch.countedUnits || 0),
-            diffQty: Number(branch.diffQty || 0),
-            countedCost: roundAuditMoney(branch.countedCost),
-            diffCost: roundAuditMoney(branch.diffCost),
-            divergencePct: Number(branch.divergencePct || 0),
-            updatedAt: String(branch.updatedAt || ''),
-            companyId: branch.companyId,
-            companyName: branch.companyName,
-            items: Array.isArray(branch.termItems) ? branch.termItems : []
-        });
+        const mapBranch = (branch: any, status: AuditCrossStatus): AuditCrossRow => {
+            const countedCost = roundAuditMoney(branch.countedCost || branch.auditedBaseCost || branch.totalCost || 0);
+            const diffCost = roundAuditMoney(branch.diffCost);
+            let divergencePct = Number(branch.divergencePct || 0);
+            if (divergencePct === 0 && Math.abs(countedCost) > 0.01 && Math.abs(diffCost) > 0.01) {
+                divergencePct = (diffCost / countedCost) * 100;
+            }
+            return {
+                key: `${status}|${normalizeBranchLabel(branch.branch)}|${Number(branch.auditNumber || 0)}`,
+                status,
+                branch: normalizeBranchLabel(branch.branch),
+                area: String(branch.area || 'Sem Área').trim() || 'Sem Área',
+                city: branch.city ? String(branch.city).trim() : undefined,
+                auditNumber: Number(branch.auditNumber || 0),
+                progressPct: Number(branch.progressPct || 0),
+                countedUnits: Number(branch.countedUnits || 0),
+                diffQty: Number(branch.diffQty || 0),
+                countedCost,
+                diffCost,
+                divergencePct,
+                updatedAt: String(branch.updatedAt || ''),
+                companyId: branch.companyId,
+                companyName: branch.companyName,
+                items: Array.isArray(branch.termItems) ? branch.termItems : []
+            };
+        };
 
         return [
-            ...dashboardAuditOverview.allBranches.map(branch => mapBranch(branch, 'open')),
-            ...dashboardCompletedAuditOverview.allBranches.map(branch => mapBranch(branch, 'completed'))
+            ...dashboardAuditOverviewBase.allBranches.map(branch => mapBranch(branch, 'open')),
+            ...dashboardCompletedAuditOverviewBase.allBranches.map(branch => mapBranch(branch, 'completed'))
         ];
-    }, [dashboardAuditOverview.allBranches, dashboardCompletedAuditOverview.allBranches]);
+    }, [dashboardAuditOverviewBase.allBranches, dashboardCompletedAuditOverviewBase.allBranches]);
 
 
     const handleOpenAreaPartialFromDashboard = useCallback((areaName: string) => {
@@ -11981,52 +11994,121 @@ const App: React.FC = () => {
                     )}
 
                     {currentView === 'audit' && (
-                        <div className="h-full animate-fade-in relative pb-24">
+                        <div className="h-full animate-fade-in relative pb-24 overflow-x-auto">
                             <Suspense fallback={<AuditWorkspaceFallback />}>
-                                <div className="flex flex-col xl:flex-row items-stretch gap-3">
-                                    <AuditCrossPanel
-                                        rows={auditCrossRows}
-                                        loading={isLoadingDashboardAudits || isLoadingCompletedDashboardAudits}
-                                        expanded={isAuditCrossPanelExpanded}
-                                        onToggleExpanded={setIsAuditCrossPanelExpanded}
-                                        onRefresh={() => {
-                                            void (async () => {
-                                                try {
-                                                    await loadDashboardAuditSessions(true);
-                                                    await new Promise(r => setTimeout(r, 200));
-                                                    await loadCompletedDashboardAuditSessions(true);
-                                                } catch {
-                                                    /* tratado internamente */
+                                <div className="flex flex-col 2xl:flex-row items-stretch gap-3 min-w-0">
+                                    {/* LATERAL DE AUDITORIA: CRUZAMENTO E RANKING DE DESEMPENHO CIENTÍFICO */}
+                                    {isAuditCrossPanelExpanded ? (
+                                        <AuditCrossPanel
+                                            rows={auditCrossRows}
+                                            loading={isLoadingDashboardAudits || isLoadingCompletedDashboardAudits}
+                                            expanded={isAuditCrossPanelExpanded}
+                                            onToggleExpanded={(val) => {
+                                                setIsAuditCrossPanelExpanded(val);
+                                                if (val) setIsAuditRankingExpanded(false);
+                                            }}
+                                            onRefresh={() => {
+                                                void (async () => {
+                                                    try {
+                                                        await loadDashboardAuditSessions(true);
+                                                        await new Promise(r => setTimeout(r, 200));
+                                                        await loadCompletedDashboardAuditSessions(true);
+                                                    } catch {
+                                                        /* tratado internamente */
+                                                    }
+                                                })();
+                                            }}
+                                            onExport={(status) => {
+                                                if (status === 'completed') {
+                                                    void handleExportNetworkAuditsExcel(
+                                                        dashboardCompletedAuditSessions,
+                                                        'completed',
+                                                        'all',
+                                                        'all'
+                                                    );
+                                                    return;
                                                 }
-                                            })();
-                                        }}
-                                        onExport={(status) => {
-                                            if (status === 'completed') {
                                                 void handleExportNetworkAuditsExcel(
-                                                    dashboardCompletedAuditSessions,
-                                                    'completed',
+                                                    dashboardAuditSessions,
+                                                    'open',
                                                     'all',
                                                     'all'
                                                 );
-                                                return;
-                                            }
-                                            void handleExportNetworkAuditsExcel(
-                                                dashboardAuditSessions,
-                                                'open',
-                                                'all',
-                                                'all'
-                                            );
-                                        }}
-                                        onOpenAudit={(row) => {
-                                            setIsAuditCrossPanelExpanded(false);
-                                            handleOpenAuditFromDashboardBranch(
-                                                row.branch,
-                                                row.area,
-                                                row.companyId,
-                                                row.companyName
-                                            );
-                                        }}
-                                    />
+                                            }}
+                                            onOpenAudit={(row) => {
+                                                setIsAuditCrossPanelExpanded(false);
+                                                handleOpenAuditFromDashboardBranch(
+                                                    row.branch,
+                                                    row.area,
+                                                    row.companyId,
+                                                    row.companyName
+                                                );
+                                            }}
+                                        />
+                                    ) : isAuditRankingExpanded ? (
+                                        <AuditRankingPanel
+                                            rows={auditCrossRows}
+                                            loading={isLoadingDashboardAudits || isLoadingCompletedDashboardAudits}
+                                            expanded={isAuditRankingExpanded}
+                                            onToggleExpanded={(val) => {
+                                                setIsAuditRankingExpanded(val);
+                                                if (val) setIsAuditCrossPanelExpanded(false);
+                                            }}
+                                            onRefresh={() => {
+                                                void (async () => {
+                                                    try {
+                                                        await loadDashboardAuditSessions(true);
+                                                        await new Promise(r => setTimeout(r, 200));
+                                                        await loadCompletedDashboardAuditSessions(true);
+                                                    } catch {
+                                                        /* tratado internamente */
+                                                    }
+                                                })();
+                                            }}
+                                            onOpenAudit={(row) => {
+                                                setIsAuditRankingExpanded(false);
+                                                handleOpenAuditFromDashboardBranch(
+                                                    row.branch,
+                                                    row.area,
+                                                    row.companyId,
+                                                    row.companyName
+                                                );
+                                            }}
+                                        />
+                                    ) : (
+                                        <aside className="w-full xl:w-12 shrink-0 self-start xl:sticky xl:top-3 flex flex-col gap-2">
+                                            {/* Botão 1: Cruzamento de Auditorias */}
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setIsAuditCrossPanelExpanded(true);
+                                                    setIsAuditRankingExpanded(false);
+                                                }}
+                                                className="group h-12 w-full inline-flex items-center justify-center gap-2 rounded-lg border border-slate-800 bg-slate-950 px-3 text-indigo-300 shadow-sm transition-colors hover:border-indigo-400/50 hover:bg-slate-900 hover:text-white cursor-pointer"
+                                                title="Abrir cruzamento de auditorias"
+                                            >
+                                                <LineChart className="h-5 w-5" />
+                                                <span className="text-[9px] font-black uppercase tracking-wider xl:hidden">Cruzamento de auditorias</span>
+                                            </button>
+
+                                            {/* Botão 2: Ranking de Desempenho e Acurácia Científica (Logo abaixo do cruzamento) */}
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setIsAuditRankingExpanded(true);
+                                                    setIsAuditCrossPanelExpanded(false);
+                                                }}
+                                                className="group relative h-12 w-full inline-flex items-center justify-center gap-2 rounded-lg border border-amber-500/30 bg-slate-950 px-3 text-amber-400 shadow-sm transition-all duration-200 hover:border-amber-400/70 hover:bg-amber-500/10 hover:text-amber-300 hover:scale-[1.03] cursor-pointer"
+                                                title="Abrir Ranking de Desempenho e Acurácia de Estoque"
+                                            >
+                                                <Trophy className="h-5 w-5 shrink-0 transition-transform group-hover:rotate-6 text-amber-400" />
+                                                <span className="text-[9px] font-black uppercase tracking-wider xl:hidden">Ranking de Desempenho</span>
+                                                <span className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[9px] font-black text-slate-950">
+                                                    %
+                                                </span>
+                                            </button>
+                                        </aside>
+                                    )}
                                     <div className="min-w-0 flex-1">
                                         {(() => {
                                             const isCurrentUserAdminOrMaster = currentUser?.role === 'MASTER' || currentUser?.role === 'ADMINISTRATIVO' || currentUser?.role === 'ADMIN' || (currentUser?.role as any) === 'ADMINISTRADOR';

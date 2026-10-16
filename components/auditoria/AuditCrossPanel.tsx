@@ -866,7 +866,7 @@ const AuditCrossPanel: React.FC<AuditCrossPanelProps> = ({
     }
 
     return (
-        <aside className="w-full xl:w-[420px] shrink-0 bg-slate-950 text-white border border-slate-800 xl:min-h-[720px]">
+        <aside className="w-full lg:w-[360px] xl:w-[390px] 2xl:w-[420px] shrink-0 bg-slate-950 text-white border border-slate-800 xl:min-h-[720px] max-w-full self-start">
             <div className="xl:sticky xl:top-3 max-h-none xl:max-h-[calc(100vh-24px)] overflow-y-auto p-4">
                 <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
                     <div>

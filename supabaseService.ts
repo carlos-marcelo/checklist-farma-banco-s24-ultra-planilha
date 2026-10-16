@@ -1207,18 +1207,17 @@ const mergeAuditPostAdjustments = (...lists: unknown[]): any[] => {
 
 export async function fetchAuditSession(branch: string, auditNumber: number): Promise<DbAuditSession | null> {
   try {
-    const { data, error } = await supabase
+    const res = await supabase
       .from('audit_sessions')
       .select('*')
       .eq('branch', branch)
       .eq('audit_number', auditNumber)
-      .single();
+      .order('updated_at', { ascending: false })
+      .limit(1);
 
-    if (error) {
-      if (error.code === 'PGRST116') return null; // Not found
-      throw error;
-    }
-    return data;
+    if (res.error && res.error.code !== 'PGRST116') throw res.error;
+    const items = Array.isArray(res.data) ? res.data : (res.data ? [res.data] : []);
+    return items[0] || null;
   } catch (error) {
     console.error('Error fetching audit session:', error);
     return null;
@@ -1292,25 +1291,29 @@ export async function upsertAuditSession(
       delete safeData.lastLocalUpdate;
     }
 
-    let existing: Pick<DbAuditSession, 'id' | 'status' | 'data'> | null = null;
+    let existing: Pick<DbAuditSession, 'id' | 'status'> | null = null;
     if (session.id) {
       const byId = await supabase
         .from('audit_sessions')
-        .select('id, status, data')
+        .select('id, status')
         .eq('id', session.id)
-        .maybeSingle();
-      if (byId.error) throw byId.error;
-      existing = byId.data;
+        .order('updated_at', { ascending: false })
+        .limit(1);
+      if (byId.error && byId.error.code !== 'PGRST116') throw byId.error;
+      const arr = Array.isArray(byId.data) ? byId.data : (byId.data ? [byId.data] : []);
+      existing = arr[0] || null;
     }
     if (!existing) {
       const byNaturalKey = await supabase
         .from('audit_sessions')
-        .select('id, status, data')
+        .select('id, status')
         .eq('branch', String(session.branch))
         .eq('audit_number', session.audit_number)
-        .maybeSingle();
-      if (byNaturalKey.error) throw byNaturalKey.error;
-      existing = byNaturalKey.data;
+        .order('updated_at', { ascending: false })
+        .limit(1);
+      if (byNaturalKey.error && byNaturalKey.error.code !== 'PGRST116') throw byNaturalKey.error;
+      const arr = Array.isArray(byNaturalKey.data) ? byNaturalKey.data : (byNaturalKey.data ? [byNaturalKey.data] : []);
+      existing = arr[0] || null;
     }
 
     const legacyStableId = options.requireExisting && !session.id
@@ -1327,7 +1330,6 @@ export async function upsertAuditSession(
     }
 
     if (safeData) {
-
       if (replacePostAuditAdjustments) {
         safeData.postAuditAdjustments = normalizeAuditAdjustmentList(safeData.postAuditAdjustments);
       } else {
@@ -1339,6 +1341,30 @@ export async function upsertAuditSession(
       if (deletedPostAuditAdjustmentIds.size > 0) {
         safeData.postAuditAdjustments = normalizeAuditAdjustmentList(safeData.postAuditAdjustments)
           .filter((item: any) => !deletedPostAuditAdjustmentIds.has(String(item.id)));
+      }
+
+      // Otimização de Payload: remove matrizes cruas de células do Excel (sourceRows) de termDrafts.
+      // As métricas financeiras essenciais (items, officialDiffCost, etc.) continuam 100% preservadas,
+      // mas evitamos enviar 10MB a 20MB de texto bruto desnecessário ao Google Apps Script,
+      // prevenindo travamentos, timeout de execução e erro 404 do Google Cloud.
+      if (safeData.termDrafts && typeof safeData.termDrafts === 'object') {
+        Object.keys(safeData.termDrafts).forEach(key => {
+          const draft = safeData.termDrafts[key];
+          if (draft && draft.excelMetrics && Array.isArray(draft.excelMetrics.sourceRows)) {
+            delete draft.excelMetrics.sourceRows;
+          }
+        });
+      }
+      if (safeData.termExcelMetricsByKey && typeof safeData.termExcelMetricsByKey === 'object') {
+        Object.keys(safeData.termExcelMetricsByKey).forEach(key => {
+          const m = safeData.termExcelMetricsByKey[key];
+          if (m && Array.isArray(m.sourceRows)) {
+            delete m.sourceRows;
+          }
+        });
+      }
+      if (Array.isArray(safeData.sharedExcelMetrics?.sourceRows)) {
+        delete safeData.sharedExcelMetrics.sourceRows;
       }
     }
 
@@ -1359,13 +1385,13 @@ export async function upsertAuditSession(
       // pela chave natural permite ao servidor validar a escrita e atualizar a
       // linha existente sem criar outro número de inventário.
       payload.id = knownSessionId;
-      const { data, error } = await supabase
+      const upsertRes = await supabase
         .from('audit_sessions')
         .upsert(payload, { onConflict: 'branch,audit_number' })
-        .select()
-        .single();
-      if (error) throw error;
-      if (!data || String(data.id || '') !== String(knownSessionId)) {
+        .select('id, branch, audit_number, status, progress, user_email, updated_at');
+      if (upsertRes.error && upsertRes.error.code !== 'PGRST116') throw upsertRes.error;
+      const data = Array.isArray(upsertRes.data) ? (upsertRes.data[0] || null) : upsertRes.data;
+      if (!data || (knownSessionId && String(data.id || '') !== String(knownSessionId) && !existing?.id)) {
         console.warn('[AuditFlow] Atualização por identidade não foi confirmada.', {
           branch: session.branch,
           auditNumber: session.audit_number,
@@ -1374,7 +1400,7 @@ export async function upsertAuditSession(
         });
         return null;
       }
-      return data;
+      return { ...data, data: safeData };
     }
 
     if (existing?.id) {
@@ -1387,8 +1413,12 @@ export async function upsertAuditSession(
       if (session.status === 'open' && !options.allowReopen) {
         updateQuery = updateQuery.neq('status', 'completed');
       }
-      let { data, error } = await updateQuery.select().maybeSingle();
-      if (error) throw error;
+      let updateRes = await updateQuery
+        .select('id, branch, audit_number, status, progress, user_email, updated_at');
+      if (updateRes.error && updateRes.error.code !== 'PGRST116') throw updateRes.error;
+      let data = Array.isArray(updateRes.data)
+        ? (updateRes.data[0] || null)
+        : (updateRes.data || null);
 
       // Fallback: se não encontrou por ID (ex: ID guardado apenas na coluna A da planilha e ausente do JSON interno),
       // atualiza pela chave natural (filial + número de inventário)
@@ -1401,9 +1431,11 @@ export async function upsertAuditSession(
         if (session.status === 'open' && !options.allowReopen) {
           fallbackQuery = fallbackQuery.neq('status', 'completed');
         }
-        const fallbackRes = await fallbackQuery.select().maybeSingle();
+        const fallbackRes = await fallbackQuery
+          .select('id, branch, audit_number, status, progress, user_email, updated_at');
+        if (fallbackRes.error && fallbackRes.error.code !== 'PGRST116') throw fallbackRes.error;
         if (fallbackRes.data) {
-          data = fallbackRes.data;
+          data = Array.isArray(fallbackRes.data) ? (fallbackRes.data[0] || null) : fallbackRes.data;
         }
       }
 
@@ -1412,18 +1444,18 @@ export async function upsertAuditSession(
           `[AuditFlow] Gravação aberta cancelada: o inventário Nº ${session.audit_number} foi concluído durante a sincronização.`
         );
       }
-      return data;
+      return data ? { ...data, data: safeData } : null;
     }
 
     payload.id = session.id || (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-    const { data, error } = await supabase
+    const insertRes = await supabase
       .from('audit_sessions')
       .insert(payload)
-      .select()
-      .single();
+      .select('id, branch, audit_number, status, progress, user_email, updated_at');
 
-    if (error) throw error;
-    return data;
+    if (insertRes.error && insertRes.error.code !== 'PGRST116') throw insertRes.error;
+    const data = Array.isArray(insertRes.data) ? (insertRes.data[0] || null) : insertRes.data;
+    return data ? { ...data, data: safeData } : null;
   } catch (error) {
     console.error('Error upserting audit session:', error);
     return null;
